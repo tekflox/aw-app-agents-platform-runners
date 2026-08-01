@@ -14,24 +14,20 @@ from fastapi.testclient import TestClient
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
-from agents_platform_runners_app.routes import build_routes  # noqa: E402
+from agents_platform_runners_app.routes import build_routes, RUNNERS  # noqa: E402
 
 
-def test_status_defaults():
+def test_status_reports_every_runner():
     client = TestClient(build_routes())
     resp = client.get("/status")
     assert resp.status_code == 200
     body = resp.json()
-    assert body["runner_source_repo"] == "tekflox/aw-app-code-agent-clis"
-    assert body["runners"] == ["claude", "codex", "copilot", "cursor-agent"]
+    assert set(body["runners"].keys()) == set(RUNNERS)
+    for info in body["runners"].values():
+        assert "installed" in info and "path" in info and "version" in info
 
 
 def test_status_reflects_config():
-    client = TestClient(build_routes({
-        "agents_platform_base": "http://example.test:9999",
-        "runner_source_ref": "v9.9.9",
-    }))
+    client = TestClient(build_routes({"agents_platform_base": "http://example.test:9999"}))
     resp = client.get("/status")
-    body = resp.json()
-    assert body["agents_platform_base"] == "http://example.test:9999"
-    assert body["runner_source_ref"] == "v9.9.9"
+    assert resp.json()["agents_platform_base"] == "http://example.test:9999"

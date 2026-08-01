@@ -12,27 +12,31 @@ two jobs:
    `agents_platform_base` (config — default the `agents-platform_multitenant`
    instance, not the legacy single-tenant `agents-platform`).
 
-2. **Documents the runner-CLI source of truth** `agents-platform_multitenant`'s
-   `agent-images/*/Dockerfile` (claude/codex/copilot/cursor) pull their
-   install scripts from — `runner_source_repo`/`runner_source_ref` (config,
-   default `tekflox/aw-app-code-agent-clis@v0.2.1`) — the SAME scripts this
-   workspace's own `code-agent-clis` app installs, so there's exactly one
-   place that knows how to install each CLI. `GET /api/apps/
-   agents-platform-runners/status` reports the current config back.
+2. **Reuses this workspace's own runner CLIs.** Depends on the
+   `code-agent-clis` app (`dependencies.apps`, required) instead of
+   installing claude/codex/copilot/cursor-agent a second way — one app owns
+   installing each CLI (`/usr/local/bin`), this one just depends on that
+   being done. `GET /api/apps/agents-platform-runners/status` checks each
+   binary actually resolves on PATH and reports its version — a live signal
+   the dependency did its job, not just that it's declared.
+   `agents-platform_multitenant`'s own `agent-images/*/Dockerfile` were
+   deliberately left untouched (Frederico decision 2026-08-01) rather than
+   forced into the same nvm-based install path — that's a separate,
+   independently-built image pipeline.
 
 ## Config
 
 | Key | Default | What |
 |---|---|---|
 | `agents_platform_base` | `http://127.0.0.1:10014` | Base URL of the agents-platform_multitenant instance the MCP tools control |
-| `runner_source_repo` | `tekflox/aw-app-code-agent-clis` | Repo the runner install scripts live in |
-| `runner_source_ref` | `v0.2.1` | Git ref (tag/branch) of that repo to use |
 
 ## Dependencies
 
-Depends on `mcp-gateway` (required) — it contributes `mcp.json` definitions
-the gateway discovers and merges; without it installed first, this app's
-MCP tools never surface anywhere.
+- `mcp-gateway` (required) — contributes `mcp.json` definitions the gateway
+  discovers and merges; without it installed first, this app's MCP tools
+  never surface anywhere.
+- `code-agent-clis` (required) — installs the actual claude/codex/copilot/
+  cursor-agent binaries this app's `/status` route checks for.
 
 ## Local dev
 

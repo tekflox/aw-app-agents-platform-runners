@@ -12,13 +12,14 @@ This app installs no CLI of its own — its two jobs are:
    URL from $AGENTS_BASE; this app points that at agents_platform_base
    (config, default the agents-platform_multitenant instance) via mcp.json's
    own env block, so no code in mcp_server.py needed changing.
-2. Register a tiny /status route (routes.py) reporting the runner-source
-   config agents-platform_multitenant's agent-images Dockerfiles were
-   updated to pull install scripts from directly (see that repo's
-   agent-images/*/Dockerfile — raw.githubusercontent.com/<runner_source_repo>
-   /<runner_source_ref>/scripts/install_<cli>.sh, the SAME scripts
-   aw-app-code-agent-clis installs into this workspace, single source of
-   truth either way).
+2. Register a tiny /status route (routes.py) that checks whether
+   claude/codex/copilot/cursor-agent actually resolve on PATH and reports
+   their version — a live signal that the code-agent-clis dependency
+   (aw-app.json dependencies.apps, required) actually did its job. This
+   app never installs those CLIs itself; depending on code-agent-clis is
+   the reused path (Frederico decision 2026-08-01) instead of duplicating
+   install logic in a second place (e.g. agents-platform_multitenant's own
+   agent-images Dockerfiles, which were deliberately left untouched).
 """
 
 from __future__ import annotations
@@ -79,10 +80,10 @@ class AgentsPlatformRunnersAppPlugin:
         )
 
     async def on_config_saved(self, ctx) -> None:
-        """Regenerate mcp.json from the newly-saved config (agents_platform_base,
-        runner_source_repo/ref) — aw-workspace's save_app_config calls this
-        BEFORE telling the MCP Gateway to /reload (contributes.mcp.reload_on_save),
-        so the gateway always scans the file this write just produced."""
+        """Regenerate mcp.json from the newly-saved config (agents_platform_base) —
+        aw-workspace's save_app_config calls this BEFORE telling the MCP
+        Gateway to /reload (contributes.mcp.reload_on_save), so the gateway
+        always scans the file this write just produced."""
         config = getattr(ctx, "config", {}) or {}
         mcp_doc = write_mcp_json(ctx.package_dir, config)
         log.info("aw-app-agents-platform-runners config saved: mcp.json servers=%s", list(mcp_doc["mcpServers"]))
