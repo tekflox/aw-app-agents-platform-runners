@@ -16,18 +16,15 @@ What this gives the model:
     ``graph.max_tokens`` — exceeding either stops the run gracefully with
     ``output.limit_reached`` set.
 
-If the backend isn't already running on ``$AGENTS_BASE`` (default
-``http://127.0.0.1:8765``) the first tool call starts it.
+``$AGENTS_BASE`` (default ``http://127.0.0.1:8765``) points at a separately
+managed agents-platform_multitenant instance — this client never spawns or
+owns that process.
 """
 from __future__ import annotations
 
 import asyncio
 import json
 import os
-import subprocess
-import sys
-import time
-from pathlib import Path
 from typing import Any
 
 import httpx
@@ -163,24 +160,11 @@ def _running() -> bool:
 
 
 def _ensure_running() -> bool:
-    if _running():
-        return True
-    repo = Path(__file__).resolve().parents[1]
-    log = repo / "data" / "server.log"
-    log.parent.mkdir(parents=True, exist_ok=True)
-    venv_py = repo / ".venv" / "bin" / "python"
-    py = str(venv_py) if venv_py.exists() else sys.executable
-    subprocess.Popen(
-        [py, "-m", "uvicorn", "backend.app.main:app", "--host", "127.0.0.1",
-         "--port", str(BASE.rsplit(":", 1)[-1].rstrip("/")), "--log-level", "warning"],
-        cwd=str(repo), stdout=open(log, "ab"), stderr=subprocess.STDOUT,
-        start_new_session=True,
-    )
-    for _ in range(50):
-        if _running():
-            return True
-        time.sleep(0.2)
-    return False
+    """agents-platform_multitenant is a separately managed service (BASE) —
+    this app is a thin MCP client for it, not its process owner, so unlike
+    the original agents-platform mcp_server.py this never self-spawns a
+    backend. Just a best-effort reachability check the caller can log."""
+    return _running()
 
 
 server = _NoopServer("agent-mcp", instructions=INSTRUCTIONS)
