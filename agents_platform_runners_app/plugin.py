@@ -51,6 +51,13 @@ def build_mcp_servers(config: dict) -> dict:
             "command": "python3",
             "args": ["-m", "agents_platform_runners_app.mcp_server"],
             "env": {"AGENTS_BASE": str(base)},
+            # aw-mcp-gateway spawns stdio upstreams with cwd defaulting to its
+            # own BASE_DIR (/app), which doesn't have this app's package on
+            # sys.path — explicit cwd is required so `python3 -m
+            # agents_platform_runners_app.mcp_server` resolves. AW_APP_SCAN_ROOTS
+            # mounts every installed app at this same path inside the gateway
+            # container.
+            "cwd": "/workspace/apps/agents-platform-runners",
         }
     }
 
