@@ -2,7 +2,7 @@
   "manifest_version": 1,
   "id": "agents-platform-runners",
   "name": "Agents Platform Runners",
-  "version": "0.3.4",
+  "version": "0.3.5",
   "description": "Depends on the code-agent-clis app (claude/codex/copilot/cursor-agent already installed at /usr/local/bin, single source of truth) so this workspace's agent-CLI runners are what agents-platform_multitenant's agent sessions use, and contributes the ported \"aw-agents\" MCP (agent_mcp.py) so agents-platform is controllable as MCP tools from this workspace.",
   "tier": "inprocess",
   "requires_ui_refresh": false,
@@ -45,7 +45,7 @@
       "agents_platform_base": {
         "type": "string",
         "default": "http://172.18.0.1:10014",
-        "description": "Base URL of the agents-platform_multitenant instance this app's MCP tools control. 172.18.0.1 is the agentic-workspace_default bridge gateway (== the real host) — the only address reachable from aw-app-mcp-gateway's nested podman namespace; override if your workspace's network subnet differs."
+        "description": "Base URL of the agents-platform_multitenant instance this app's MCP tools control. 172.18.0.1 is the agentic-workspace_default bridge gateway (== the real host) \u2014 the only address reachable from aw-app-mcp-gateway's nested podman namespace; override if your workspace's network subnet differs."
       }
     },
     "required": []
