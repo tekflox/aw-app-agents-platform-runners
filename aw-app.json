@@ -1,0 +1,68 @@
+{
+  "manifest_version": 1,
+  "id": "hello",
+  "name": "Hello World (App Template)",
+  "version": "0.4.0",
+  "description": "TEMPLATE \u2014 a minimal, fully working decoupled app: installs one trivial CLI (`hello`, prints a configurable greeting) through the gated commands:install facade, contributes a backend sub-app (GET /hello + app-local WS /ws/echo under the app namespace) and a component-mode frontend bundle, and runs standalone too (ADR Decision 4/6). Tests and CI/marketplace release already wired. Rename everything marked TEMPLATE/hello before this becomes a real app \u2014 see README.md.",
+  "tier": "inprocess",
+  "requires_ui_refresh": true,
+  "publisher": "TekFlox",
+  "resource_estimate": {
+    "cpu": "low",
+    "memory": "low",
+    "disk": "low"
+  },
+  "runtime": {
+    "python": ">=3.11",
+    "entrypoint": "template_app.plugin:HelloAppPlugin",
+    "pip_requires": [],
+    "standalone": {
+      "module": "template_app",
+      "default_port": 9400
+    }
+  },
+  "permissions": [
+    "commands:install",
+    "fs:workspace-data",
+    "routes:register",
+    "ui:code",
+    "ui:slots:core.nav"
+  ],
+  "contributes": {
+    "system_clis": [
+      {
+        "name": "hello",
+        "installer": "scripts/install_hello.sh"
+      }
+    ],
+    "routes": [
+      {
+        "prefix": "/api/apps/hello"
+      }
+    ],
+    "frontend": {
+      "mode": "component",
+      "bundle": "ui/dist/template.js"
+    },
+    "skills": [
+      {
+        "id": "aw-create-app",
+        "path": "skills/aw-create-app/SKILL.md",
+        "description": "How to author a decoupled aw-workspace app from this template \u2014 manifest, tiers, capabilities, contributes, backend routes (HTTP+WS), frontend code, standalone mode, window widgets, install + marketplace release."
+      }
+    ]
+  },
+  "config_schema": {
+    "type": "object",
+    "properties": {
+      "greeting": {
+        "type": "string",
+        "default": "Hello",
+        "description": "Word the installed `hello` command prints before the target name, e.g. \"Hello, world!\"."
+      }
+    },
+    "required": []
+  },
+  "dependencies": {},
+  "migrations": {}
+}

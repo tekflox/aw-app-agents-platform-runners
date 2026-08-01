@@ -1,0 +1,16 @@
+{
+  "name": "template-app-ui",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "TEMPLATE — mode-agnostic frontend for aw-app-template (ADR Decision 3/4/6, docs/knowledge_base/docs/architecture/adr-app-front-back-routes-dual-mode.md). src/client.js is the framework-free core; src/plugin.js is the integrated-mode entry (register(host), built as a Vite lib-mode bundle); src/standalone.js + index.html is the standalone page. `npm run build` produces ui/dist/, consumed by BOTH __main__.py (standalone) and aw-app.json's contributes.frontend.bundle (integrated).",
+  "scripts": {
+    "dev": "vite",
+    "build": "npm run build:plugin && npm run build:standalone",
+    "build:plugin": "vite build --mode plugin",
+    "build:standalone": "vite build --mode standalone"
+  },
+  "devDependencies": {
+    "vite": "^5.4.0"
+  }
+}
