@@ -2,8 +2,8 @@
   "manifest_version": 1,
   "id": "agents-platform-runners",
   "name": "Agents Platform Runners",
-  "version": "0.1.0",
-  "description": "Serves agent-CLI runner install scripts (claude/codex/copilot/cursor-agent — reused from the code-agent-clis app, single source of truth) over HTTP for agents-platform_multitenant's agent-images build to consume, and contributes the ported \"aw-agents\" MCP (agent_mcp.py) so agents-platform is controllable as MCP tools from this workspace.",
+  "version": "0.2.0",
+  "description": "Serves agent-CLI runner install scripts (claude/codex/copilot/cursor-agent \u2014 reused from the code-agent-clis app, single source of truth) over HTTP for agents-platform_multitenant's agent-images build to consume, and contributes the ported \"aw-agents\" MCP (agent_mcp.py) so agents-platform is controllable as MCP tools from this workspace.",
   "tier": "inprocess",
   "requires_ui_refresh": false,
   "category": "dev-tools",
@@ -46,7 +46,7 @@
       "runner_source_repo": {
         "type": "string",
         "default": "tekflox/aw-app-code-agent-clis",
-        "description": "Repo this app fetches claude/codex/copilot/cursor install scripts from — single source of truth, also used by this workspace's own code-agent-clis app."
+        "description": "Repo this app fetches claude/codex/copilot/cursor install scripts from \u2014 single source of truth, also used by this workspace's own code-agent-clis app."
       },
       "runner_source_ref": {
         "type": "string",
@@ -70,7 +70,7 @@
         "reason": "This app contributes mcp.json definitions the MCP Gateway discovers and merges."
       }
     ],
-    "note": "Does NOT depend on code-agent-clis — it re-serves that app's install scripts fetched live from GitHub (runner_source_repo/ref), not a local install, so it works even on a workspace that never installed code-agent-clis itself."
+    "note": "Does NOT depend on code-agent-clis \u2014 it re-serves that app's install scripts fetched live from GitHub (runner_source_repo/ref), not a local install, so it works even on a workspace that never installed code-agent-clis itself."
   },
   "migrations": {}
 }
