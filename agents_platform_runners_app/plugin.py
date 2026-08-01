@@ -33,7 +33,18 @@ from . import routes as routes_mod
 
 log = logging.getLogger("aw_apps.agents_platform_runners")
 
-DEFAULT_AGENTS_PLATFORM_BASE = "http://127.0.0.1:10014"
+# agents-platform_multitenant now runs as its own docker-compose stack
+# (repos/agents-platform_multitenant/docker-compose.yml), attached to the
+# `agentic-workspace_default` bridge network and publishing :10014 on the
+# real host — decoupled from ./aw (2026-08-02). This app's MCP server runs
+# inside aw-app-mcp-gateway, itself nested one level deeper (podman inside
+# the aw-remote-host container), so `127.0.0.1` / `localhost` and even
+# Docker DNS names on that bridge network (e.g. `agents-platform-multitenant`)
+# don't resolve there — only the bridge's gateway IP is reachable from that
+# deep. 172.18.0.1 is `agentic-workspace_default`'s gateway (== the real
+# host's own address on that network) — verified reachable end-to-end from
+# inside aw-app-mcp-gateway, 2026-08-02.
+DEFAULT_AGENTS_PLATFORM_BASE = "http://172.18.0.1:10014"
 
 
 def build_mcp_servers(config: dict) -> dict:

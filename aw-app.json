@@ -44,8 +44,8 @@
     "properties": {
       "agents_platform_base": {
         "type": "string",
-        "default": "http://127.0.0.1:10014",
-        "description": "Base URL of the agents-platform_multitenant instance this app's MCP tools control."
+        "default": "http://172.18.0.1:10014",
+        "description": "Base URL of the agents-platform_multitenant instance this app's MCP tools control. 172.18.0.1 is the agentic-workspace_default bridge gateway (== the real host) — the only address reachable from aw-app-mcp-gateway's nested podman namespace; override if your workspace's network subnet differs."
       }
     },
     "required": []
