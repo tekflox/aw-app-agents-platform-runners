@@ -32,9 +32,49 @@ from typing import Any
 
 import httpx
 
-from mcp.server import Server
-from mcp.server.stdio import stdio_server
-from mcp.types import TextContent, Tool
+# Hand-rolled JSON-RPC stdio, not the `mcp` SDK: this module is spawned by
+# aw-mcp-gateway (aw-app-mcp-gateway) as a stdio upstream, whose own
+# container has no `mcp` package installed — every other src/mcp/*.py
+# server in this project already avoids the SDK for the same reason (see
+# aw_lifestyle.py's docstring). `Server`/`stdio_server`/`Tool`/`TextContent`
+# below are minimal drop-in stand-ins for just the surface this file
+# actually uses, so porting from the original agents-platform/mcp_server/
+# agent_mcp.py (SDK-based) needed zero changes below this point — every
+# `@server.list_tools()`/`@server.call_tool()` decorator, every
+# `Tool(...)`/`TextContent(...)` construction, is the SDK's exact
+# constructor shape, just backed by a plain class instead of a real
+# `mcp.types` model.
+
+
+class Tool:
+    def __init__(self, name: str, description: str, inputSchema: dict):
+        self.name = name
+        self.description = description
+        self.inputSchema = inputSchema
+
+
+class TextContent:
+    def __init__(self, type: str, text: str):
+        self.type = type
+        self.text = text
+
+
+class _NoopServer:
+    """Stand-in for mcp.server.Server — its decorators just register a
+    handler in the real SDK; here they're identity (no-ops), so
+    `_list_tools`/`_call_tool` below stay plain, directly-callable
+    functions that main() below calls straight instead of going through
+    a Server/stdio_server transport loop."""
+
+    def __init__(self, *_a, **_kw):
+        pass
+
+    def list_tools(self):
+        return lambda f: f
+
+    def call_tool(self):
+        return lambda f: f
+
 
 BASE = os.environ.get("AGENTS_BASE", "http://127.0.0.1:8765")
 
@@ -143,7 +183,7 @@ def _ensure_running() -> bool:
     return False
 
 
-server = Server("agent-mcp", instructions=INSTRUCTIONS)
+server = _NoopServer("agent-mcp", instructions=INSTRUCTIONS)
 
 
 # ---------------------------------------------------------------------------
@@ -1973,9 +2013,92 @@ async def _call_tool(name: str, arguments: dict[str, Any] | None) -> list[TextCo
         return _err(404, f"unknown tool: {name}")
 
 
+# ---------------------------------------------------------------------------
+# Hand-rolled stdio JSON-RPC transport (see the Tool/TextContent/_NoopServer
+# note near the top) — same shape as every other src/mcp/*.py server in
+# this project. Calls the SDK-decorated-but-plain _list_tools()/_call_tool()
+# functions above directly instead of going through mcp.server.Server.
+# ---------------------------------------------------------------------------
+
+def _tool_result(req_id, contents: list[TextContent]) -> dict:
+    text = contents[0].text if contents else ""
+    is_error = False
+    try:
+        parsed = json.loads(text)
+        is_error = isinstance(parsed, dict) and parsed.get("error") is True
+    except (json.JSONDecodeError, TypeError):
+        pass
+    return {
+        "jsonrpc": "2.0",
+        "id": req_id,
+        "result": {
+            "content": [{"type": "text", "text": text}],
+            "isError": is_error,
+        },
+    }
+
+
+async def handle_request(request: dict) -> dict | None:
+    method = request.get("method")
+    req_id = request.get("id")
+
+    if method == "initialize":
+        return {
+            "jsonrpc": "2.0",
+            "id": req_id,
+            "result": {
+                "protocolVersion": "2024-11-05",
+                "capabilities": {"tools": {}},
+                "serverInfo": {"name": "agents-platform-runners", "version": "1.0.0"},
+            },
+        }
+
+    if method == "notifications/initialized":
+        return None
+
+    if method == "tools/list":
+        tools = await _list_tools()
+        return {
+            "jsonrpc": "2.0",
+            "id": req_id,
+            "result": {
+                "tools": [
+                    {"name": t.name, "description": t.description, "inputSchema": t.inputSchema}
+                    for t in tools
+                ]
+            },
+        }
+
+    if method == "tools/call":
+        params = request.get("params") or {}
+        name = params.get("name")
+        arguments = params.get("arguments") or {}
+        try:
+            contents = await _call_tool(name, arguments)
+        except Exception as exc:  # noqa: BLE001 — surface as a tool error, not a crash
+            return _tool_result(req_id, [TextContent(type="text", text=f"{type(exc).__name__}: {exc}")])
+        return _tool_result(req_id, contents)
+
+    return None
+
+
 async def _async_main() -> None:
-    async with stdio_server() as (read, write):
-        await server.run(read, write, server.create_initialization_options())
+    loop = asyncio.get_running_loop()
+    while True:
+        line = await loop.run_in_executor(None, sys.stdin.readline)
+        if not line:
+            break
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            request = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        response = await handle_request(request)
+        if response is not None:
+            sys.stdout.write(json.dumps(response) + "\n")
+            sys.stdout.flush()
 
 
 def main() -> None:

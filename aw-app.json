@@ -17,8 +17,7 @@
     "python": ">=3.11",
     "entrypoint": "agents_platform_runners_app.plugin:AgentsPlatformRunnersAppPlugin",
     "pip_requires": [
-      "httpx",
-      "mcp>=1.0"
+      "httpx"
     ],
     "standalone": {
       "module": "agents_platform_runners_app",
