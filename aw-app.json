@@ -1,11 +1,12 @@
 {
   "manifest_version": 1,
-  "id": "hello",
-  "name": "Hello World (App Template)",
-  "version": "0.4.0",
-  "description": "TEMPLATE \u2014 a minimal, fully working decoupled app: installs one trivial CLI (`hello`, prints a configurable greeting) through the gated commands:install facade, contributes a backend sub-app (GET /hello + app-local WS /ws/echo under the app namespace) and a component-mode frontend bundle, and runs standalone too (ADR Decision 4/6). Tests and CI/marketplace release already wired. Rename everything marked TEMPLATE/hello before this becomes a real app \u2014 see README.md.",
+  "id": "agents-platform-runners",
+  "name": "Agents Platform Runners",
+  "version": "0.1.0",
+  "description": "Serves agent-CLI runner install scripts (claude/codex/copilot/cursor-agent — reused from the code-agent-clis app, single source of truth) over HTTP for agents-platform_multitenant's agent-images build to consume, and contributes the ported \"aw-agents\" MCP (agent_mcp.py) so agents-platform is controllable as MCP tools from this workspace.",
   "tier": "inprocess",
-  "requires_ui_refresh": true,
+  "requires_ui_refresh": false,
+  "category": "dev-tools",
   "publisher": "TekFlox",
   "resource_estimate": {
     "cpu": "low",
@@ -14,55 +15,62 @@
   },
   "runtime": {
     "python": ">=3.11",
-    "entrypoint": "template_app.plugin:HelloAppPlugin",
-    "pip_requires": [],
+    "entrypoint": "agents_platform_runners_app.plugin:AgentsPlatformRunnersAppPlugin",
+    "pip_requires": [
+      "httpx",
+      "mcp>=1.0"
+    ],
     "standalone": {
-      "module": "template_app",
-      "default_port": 9400
+      "module": "agents_platform_runners_app",
+      "default_port": 9407
     }
   },
   "permissions": [
-    "commands:install",
     "fs:workspace-data",
     "routes:register",
-    "ui:code",
-    "ui:slots:core.nav"
+    "net:outbound"
   ],
   "contributes": {
-    "system_clis": [
-      {
-        "name": "hello",
-        "installer": "scripts/install_hello.sh"
-      }
-    ],
     "routes": [
       {
-        "prefix": "/api/apps/hello"
+        "prefix": "/api/apps/agents-platform-runners"
       }
     ],
-    "frontend": {
-      "mode": "component",
-      "bundle": "ui/dist/template.js"
-    },
-    "skills": [
-      {
-        "id": "aw-create-app",
-        "path": "skills/aw-create-app/SKILL.md",
-        "description": "How to author a decoupled aw-workspace app from this template \u2014 manifest, tiers, capabilities, contributes, backend routes (HTTP+WS), frontend code, standalone mode, window widgets, install + marketplace release."
-      }
-    ]
+    "mcp": {
+      "reload_on_save": true
+    }
   },
   "config_schema": {
     "type": "object",
     "properties": {
-      "greeting": {
+      "runner_source_repo": {
         "type": "string",
-        "default": "Hello",
-        "description": "Word the installed `hello` command prints before the target name, e.g. \"Hello, world!\"."
+        "default": "tekflox/aw-app-code-agent-clis",
+        "description": "Repo this app fetches claude/codex/copilot/cursor install scripts from — single source of truth, also used by this workspace's own code-agent-clis app."
+      },
+      "runner_source_ref": {
+        "type": "string",
+        "default": "v0.2.1",
+        "description": "Git ref (tag/branch) of runner_source_repo to serve scripts from."
+      },
+      "agents_platform_base": {
+        "type": "string",
+        "default": "http://127.0.0.1:10014",
+        "description": "Base URL of the agents-platform_multitenant instance this app's MCP tools control."
       }
     },
     "required": []
   },
-  "dependencies": {},
+  "dependencies": {
+    "apps": [
+      {
+        "id": "mcp-gateway",
+        "version": ">=0.1.0",
+        "required": true,
+        "reason": "This app contributes mcp.json definitions the MCP Gateway discovers and merges."
+      }
+    ],
+    "note": "Does NOT depend on code-agent-clis — it re-serves that app's install scripts fetched live from GitHub (runner_source_repo/ref), not a local install, so it works even on a workspace that never installed code-agent-clis itself."
+  },
   "migrations": {}
 }
