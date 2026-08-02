@@ -203,6 +203,22 @@ def _build_container_kwargs(job: dict) -> tuple[str, list[str], dict]:
     # Isolated run cwd (rw — the CLI writes its own session/project state here)
     _mount(isolated_rel, isolated_container_path, ro=False)
 
+    # Legacy skills library (docs/knowledge_base/skills/*, ~1.5MB) — found live
+    # 2026-08-02: the aw-agent-telegram bootstrap system prompt (and others)
+    # hardcode `cat /opt/agentic-workspace/skills/<name>/SKILL.md`, a path
+    # that only exists in the legacy monolith's tree, never mounted here on
+    # purpose (the whole point of this app is NOT mounting /opt/agentic-
+    # workspace). Claude correctly refused to proceed when that path 404'd,
+    # reading it as a prompt-injection mismatch rather than executing blind.
+    # Fix: a one-time copy of skills/ lives on this workspace's own host
+    # tree (shared/agentic-workspace-skills/, kept in sync manually for
+    # now — see the KB note from today) and gets bind-mounted at the exact
+    # absolute path every existing skill-loading prompt already expects, ro
+    # (this app never needs to write to it).
+    _skills_host_rel = "shared/agentic-workspace-skills"
+    if (Path(WORKSPACE_CONTAINER_DIR) / _skills_host_rel).is_dir():
+        _mount(_skills_host_rel, "/opt/agentic-workspace/skills", ro=True)
+
     argv = [spec["bin"]]
     if spec.get("subcmd"):
         argv.append(spec["subcmd"])
