@@ -256,7 +256,32 @@ def _build_container_kwargs(job: dict) -> tuple[str, list[str], dict]:
         # exits with "Not logged in" despite creds being correctly mounted,
         # because uid 1000 (image default) can't read a 0600 file owned by
         # uid 1001 (this workspace's real uid).
+        #
+        # SECOND bug found 2026-08-02 (same symptom, deeper cause): even
+        # with --user set to the correct uid, reads still failed with a bare
+        # "Permission denied" on *every* file under the mount, regardless of
+        # that file's own mode bits (644, 600, tried both) — because the
+        # image bakes `/home/ubuntu` itself as `drwxr-x--- ubuntu:ubuntu`
+        # (0750). A process whose uid/gid don't match "ubuntu" (1000) has NO
+        # bits at all on that directory ("other" is `---`), so it can't even
+        # *traverse into* /home/ubuntu to reach .claude/.credentials.json —
+        # this fails before the kernel ever looks at the target file's own
+        # permissions. Confirmed via `stat` returning "Permission denied" on
+        # `/home/ubuntu` itself (not just the file) when run as the
+        # workspace's real uid. Root (uid 0) "worked" only because root
+        # bypasses DAC checks entirely, which is why every earlier
+        # --privileged / --security-opt / --userns=host experiment showed no
+        # effect — none of those touch a plain DAC directory-traversal
+        # check. Fix: keep the real uid (so the credential FILE's own
+        # owner-match still applies) but add gid 1000 ("ubuntu", the group
+        # that owns /home/ubuntu) as a supplementary group — the directory's
+        # group bits (`r-x`) then grant traversal. Verified live: `stat`/
+        # `cat` on the mounted credentials file both succeed with
+        # `--user <uid>:<gid> --group-add 1000`, and fail identically
+        # without it even on a fresh tmpfs-backed (/dev/shm) source file —
+        # ruling out any storage-driver/overlay explanation.
         "user": f"{os.getuid()}:{os.getgid()}",
+        "group_add": [1000],
     }
     if CONTAINER_NETWORK:
         kwargs["network"] = CONTAINER_NETWORK
@@ -281,11 +306,18 @@ def _run_job_blocking(job: dict, redis_url: str) -> None:
     try:
         image, argv, kwargs = _build_container_kwargs(job)
         client = docker_sdk.DockerClient(base_url="unix://" + CONTAINER_SOCKET)
+        # Always attempt a pull, not just when the tag is missing locally —
+        # a `:latest`-pinned image that already exists locally otherwise
+        # never gets refreshed after an upstream rebuild, silently running a
+        # stale agent-CLI version indefinitely (bit us once already,
+        # 2026-08-02). Best-effort: fall back to whatever is cached locally
+        # if the registry is unreachable rather than failing the run outright.
         try:
-            client.images.get(image)
-        except docker_sdk.errors.ImageNotFound:
             log.info("execute: pulling %s for run=%s", image, run_id)
             client.images.pull(image)
+        except docker_sdk.errors.APIError:
+            log.warning("execute: pull failed for %s (run=%s), falling back to local cache", image, run_id, exc_info=True)
+            client.images.get(image)  # raises ImageNotFound if truly absent — surfaces as spawn_error below
 
         log.info("execute: spawning run=%s image=%s argv=%s", run_id, image, argv)
         container = client.containers.run(image, **kwargs)
