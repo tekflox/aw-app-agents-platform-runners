@@ -2,7 +2,7 @@
   "manifest_version": 1,
   "id": "agents-platform-runners",
   "name": "Agents Platform Runners",
-  "version": "0.3.5",
+  "version": "0.3.6",
   "description": "Depends on the code-agent-clis app (claude/codex/copilot/cursor-agent already installed at /usr/local/bin, single source of truth) so this workspace's agent-CLI runners are what agents-platform_multitenant's agent sessions use, and contributes the ported \"aw-agents\" MCP (agent_mcp.py) so agents-platform is controllable as MCP tools from this workspace.",
   "tier": "inprocess",
   "requires_ui_refresh": false,
@@ -46,12 +46,12 @@
       "agents_platform_base": {
         "type": "string",
         "default": "http://172.18.0.1:10014",
-        "description": "Base URL of the agents-platform_multitenant instance this app's MCP tools control. 172.18.0.1 is the agentic-workspace_default bridge gateway (== the real host) — the only address reachable from aw-app-mcp-gateway's nested podman namespace; override if your workspace's network subnet differs."
+        "description": "Base URL of the agents-platform_multitenant instance this app's MCP tools control. 172.18.0.1 is the agentic-workspace_default bridge gateway (== the real host) \u2014 the only address reachable from aw-app-mcp-gateway's nested podman namespace; override if your workspace's network subnet differs."
       },
       "agents_platform_token": {
         "type": "string",
         "x-secret": true,
-        "description": "aw-backend identity JWT sent as Authorization: Bearer on every call to agents_platform_base — required, agents-platform_multitenant's require_identity() rejects unauthenticated requests with 401. Mint one inside the aw-backend container: python -c \"from src.api.identity_auth import create_identity_jwt; print(create_identity_jwt(<user_id>, [{'workspace': 'aw', 'role': 'owner'}], expiry_seconds=<seconds>))\""
+        "description": "aw-backend identity JWT sent as Authorization: Bearer on every call to agents_platform_base \u2014 required, agents-platform_multitenant's require_identity() rejects unauthenticated requests with 401. Mint one inside the aw-backend container: python -c \"from src.api.identity_auth import create_identity_jwt; print(create_identity_jwt(<user_id>, [{'workspace': 'aw', 'role': 'owner'}], expiry_seconds=<seconds>))\""
       }
     },
     "required": []
@@ -68,7 +68,7 @@
         "id": "code-agent-clis",
         "version": ">=0.2.1",
         "required": true,
-        "reason": "This app doesn't install the CLIs itself — it depends on code-agent-clis having already put claude/codex/copilot/cursor-agent on /usr/local/bin, same path aw-workspace installs already reuse: one app owns installing each runner, this app just depends on that instead of re-implementing it."
+        "reason": "This app doesn't install the CLIs itself \u2014 it depends on code-agent-clis having already put claude/codex/copilot/cursor-agent on /usr/local/bin, same path aw-workspace installs already reuse: one app owns installing each runner, this app just depends on that instead of re-implementing it."
       }
     ]
   },
