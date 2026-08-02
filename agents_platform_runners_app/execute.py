@@ -203,6 +203,18 @@ def _build_container_kwargs(job: dict) -> tuple[str, list[str], dict]:
     # Isolated run cwd (rw — the CLI writes its own session/project state here)
     _mount(isolated_rel, isolated_container_path, ro=False)
 
+    # Visible proof-of-scoping mount — found live 2026-08-02: nothing above
+    # actually mounts anything AT a container path named "aw-workspace" (creds
+    # go to ~/.claude, skills to /opt/agentic-workspace/skills), so `ls /opt`
+    # inside a spawned container never showed the real workspace root even
+    # though every functional mount (creds, sessions) was already correctly
+    # scoped there — Frederico's own sanity check ("ls /opt should show
+    # aw-workspace") was a fair ask this didn't satisfy. Mount the workspace
+    # root itself (ro) at the exact path its name promises, purely so this is
+    # directly verifiable, not just true-but-invisible.
+    if WORKSPACE_HOST_DIR:
+        volumes[WORKSPACE_HOST_DIR.rstrip("/")] = {"bind": "/opt/aw-workspace", "mode": "ro"}
+
     # Legacy skills library (docs/knowledge_base/skills/*, ~1.5MB) — found live
     # 2026-08-02: the aw-agent-telegram bootstrap system prompt (and others)
     # hardcode `cat /opt/agentic-workspace/skills/<name>/SKILL.md`, a path
