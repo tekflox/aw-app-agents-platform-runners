@@ -2,7 +2,7 @@
   "manifest_version": 1,
   "id": "agents-platform-runners",
   "name": "Agents Platform Runners",
-  "version": "0.6.0",
+  "version": "0.6.1",
   "description": "Depends on the code-agent-clis app (claude/codex/copilot/cursor-agent already installed at /usr/local/bin, single source of truth) so this workspace's agent-CLI runners are what agents-platform_multitenant's agent sessions use, and contributes the ported \"aw-agents\" MCP (agent_mcp.py) so agents-platform is controllable as MCP tools from this workspace.",
   "tier": "inprocess",
   "requires_ui_refresh": false,
@@ -74,7 +74,7 @@
       },
       "own_base_url": {
         "type": "string",
-        "description": "Override for this app's own reachable base URL, sent to agents-platform_multitenant on POST /register as the Runner row's base_url. Defaults to https://api.<workspace>.workspace.aw.tekflox.com/api/apps/agents-platform-runners (the verified-reachable public BYOD tunnel path) \u2014 only override if this workspace's public domain differs."
+        "description": "Override for this app's own reachable base URL, sent to agents-platform_multitenant on POST /register as the Runner row's base_url. Defaults to https://agents-platform-runners.app.<workspace>.workspace.aw.tekflox.com (the per-app subdomain shape, bare host/path \u2014 verified-reachable via the same public BYOD tunnel edge) \u2014 only override if this workspace's public domain differs."
       },
       "shared_redis_url": {
         "type": "string",

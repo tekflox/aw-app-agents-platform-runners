@@ -74,9 +74,15 @@ def build_routes(config: dict | None = None) -> FastAPI:
         # why this is the only proven-reachable path from
         # agents-platform_multitenant, a sibling docker container that
         # cannot reach this workspace's nested-podman container directly).
-        # Override via config if a workspace's public domain differs.
+        # Uses the per-app subdomain shape (bare host, no /api/apps/<slug>
+        # prefix — RunnerLLM appends /execute itself) rather than the
+        # workspace-wide api.<ws> + path-prefixed shape; both hit the same
+        # guarded ASGI sub-app (see aw-app-template/external-client/
+        # app-api-client.js's header comment for the generic two-hostname
+        # pattern every app on this platform gets). Override via config if a
+        # workspace's public domain differs.
         own_base_url = cfg.get("own_base_url") or (
-            f"https://api.{workspace}.workspace.aw.tekflox.com/api/apps/agents-platform-runners"
+            f"https://agents-platform-runners.app.{workspace}.workspace.aw.tekflox.com"
         )
         payload = {
             "workspace": workspace,
