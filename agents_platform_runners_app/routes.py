@@ -14,9 +14,11 @@ that the dependency actually did its job, not just that it's declared.
 """
 from __future__ import annotations
 
+import os
 import shutil
 import subprocess
 
+import httpx
 from fastapi import FastAPI
 
 RUNNERS = ["claude", "codex", "copilot", "cursor-agent"]
@@ -48,5 +50,40 @@ def build_routes(config: dict | None = None) -> FastAPI:
             "agents_platform_base": cfg.get("agents_platform_base", "http://127.0.0.1:10014"),
             "runners": {name: _runner_status(name) for name in RUNNERS},
         }
+
+    @app.post("/register")
+    async def register() -> dict:
+        """Register this workspace's local CLI runners with
+        agents-platform_multitenant (POST /api/runners/register), so the
+        platform's Runners registry reflects what's actually installed here.
+        Upsert is server-side (workspace, cli) — safe to click repeatedly,
+        never creates duplicates."""
+        token = cfg.get("agents_platform_token")
+        if not token:
+            return {
+                "error": "agents_platform_token is not configured — set it in this app's "
+                "Settings before registering (see aw-app.json config_schema for how to mint one).",
+            }
+        base = cfg.get("agents_platform_base", "http://127.0.0.1:10014")
+        workspace = os.environ.get("AW_WORKSPACE", "aw")
+        payload = {
+            "workspace": workspace,
+            "runners": [
+                {"cli": name, "name": name, **_runner_status(name)}
+                for name in RUNNERS
+            ],
+        }
+        url = f"{base.rstrip('/')}/api/runners/register"
+        try:
+            async with httpx.AsyncClient(timeout=20) as client:
+                resp = await client.post(
+                    url, json=payload, headers={"Authorization": f"Bearer {token}"},
+                )
+            resp.raise_for_status()
+            return {"registered": resp.json()}
+        except httpx.HTTPStatusError as exc:
+            return {"error": f"agents-platform responded {exc.response.status_code}: {exc.response.text[:500]}"}
+        except Exception as exc:  # noqa: BLE001 — surfaced as-is to the caller
+            return {"error": f"could not reach {url}: {exc}"}
 
     return app

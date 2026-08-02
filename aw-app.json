@@ -38,7 +38,18 @@
     ],
     "mcp": {
       "reload_on_save": true
-    }
+    },
+    "windows": [
+      {
+        "id": "agents-platform-runners.settings",
+        "title": "Agents Platform Runners",
+        "icon": "server",
+        "body": {
+          "type": "declarative",
+          "spec": "windows/main.json"
+        }
+      }
+    ]
   },
   "config_schema": {
     "type": "object",

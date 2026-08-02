@@ -1,0 +1,33 @@
+{
+  "title": "Agents Platform Runners",
+  "layout": "single",
+  "regions": [
+    {
+      "id": "body",
+      "widgets": [
+        {
+          "type": "markdown",
+          "value": "# Agents Platform Runners\nReports which CLI runners (`claude`, `codex`, `copilot`, `cursor-agent`) are installed on this workspace, and registers them with `agents-platform_multitenant`'s Runners registry so agent model configs can reference this workspace's runners.\n\nRegistration is **idempotent** — clicking it again updates the existing entries instead of creating duplicates (dedup key: workspace + CLI)."
+        },
+        {
+          "type": "button",
+          "label": "Check local status",
+          "action": { "call": "GET /api/apps/agents-platform-runners/status" }
+        },
+        {
+          "type": "button",
+          "label": "Register Runners",
+          "action": { "call": "POST /api/apps/agents-platform-runners/register" }
+        },
+        {
+          "type": "list",
+          "title": "Requirements",
+          "items": [
+            "agents_platform_token must be set in this app's config (Settings) — a valid aw-backend identity JWT",
+            "agents_platform_base defaults to the agentic-workspace bridge gateway reaching agents-platform_multitenant :10014"
+          ]
+        }
+      ]
+    }
+  ]
+}
