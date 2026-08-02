@@ -76,6 +76,15 @@ class _NoopServer:
 
 BASE = os.environ.get("AGENTS_BASE", "http://127.0.0.1:8765")
 
+# agents-platform_multitenant's require_identity() rejects every request
+# without an aw-backend-issued identity JWT (401 unauthorized) — this token
+# is that credential, provided via config (AGENTS_PLATFORM_TOKEN) so every
+# httpx.AsyncClient below authenticates the same way a logged-in browser
+# session would (Authorization: Bearer, same as the cookie fallback
+# require_identity() already accepts).
+_TOKEN = os.environ.get("AGENTS_PLATFORM_TOKEN", "")
+AUTH_HEADERS = {"Authorization": f"Bearer {_TOKEN}"} if _TOKEN else {}
+
 INSTRUCTIONS = """\
 You are connected to the **Agents Platform** — a local control plane for
 defining, running and observing AI agents + multi-agent workflows.
@@ -289,7 +298,7 @@ def _target_patch_schema() -> dict:
 @server.list_tools()
 async def _list_tools() -> list[Tool]:
     _ensure_running()
-    async with httpx.AsyncClient(timeout=10) as c:
+    async with httpx.AsyncClient(timeout=10, headers=AUTH_HEADERS) as c:
         agents = (await c.get(f"{BASE}/api/agents")).json()
         workflows = (await c.get(f"{BASE}/api/workflows")).json()
 
@@ -1455,7 +1464,7 @@ async def _poll_run(c: httpx.AsyncClient, run_id: str, *, timeout_s: int = 900) 
 @server.call_tool()
 async def _call_tool(name: str, arguments: dict[str, Any] | None) -> list[TextContent]:
     args = arguments or {}
-    async with httpx.AsyncClient(timeout=120) as c:
+    async with httpx.AsyncClient(timeout=120, headers=AUTH_HEADERS) as c:
         # --- discovery ---
         if name == "list_agents":
             params: dict[str, Any] = {}
@@ -1731,7 +1740,7 @@ async def _call_tool(name: str, arguments: dict[str, Any] | None) -> list[TextCo
                 params["max_cost_usd"] = str(args["max_cost_usd"])
             if args.get("summary"):
                 params["summary"] = "true"
-            async with httpx.AsyncClient(timeout=timeout_s + 30) as wc:
+            async with httpx.AsyncClient(timeout=timeout_s + 30, headers=AUTH_HEADERS) as wc:
                 r = await wc.get(f"{BASE}/api/runs/{args['run_id']}/wait", params=params)
             return _err(r.status_code, r.text) if r.status_code != 200 else _ok(r.json())
         if name == "peek_run_output":

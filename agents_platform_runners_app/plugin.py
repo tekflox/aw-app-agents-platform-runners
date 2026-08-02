@@ -55,13 +55,19 @@ def build_mcp_servers(config: dict) -> dict:
     uses)."""
     config = config or {}
     base = config.get("agents_platform_base") or DEFAULT_AGENTS_PLATFORM_BASE
+    token = config.get("agents_platform_token") or ""
     return {
         "agents-platform-runners": {
             "enabled": True,
             "type": "stdio",
             "command": "python3",
             "args": ["-m", "agents_platform_runners_app.mcp_server"],
-            "env": {"AGENTS_BASE": str(base)},
+            # agents-platform_multitenant's require_identity() rejects every
+            # request without an aw-backend identity JWT (401) — this is
+            # that credential (mcp_server.py sends it as Authorization:
+            # Bearer on every call). Mint one with aw-backend's
+            # create_identity_jwt(); see this app's README for the command.
+            "env": {"AGENTS_BASE": str(base), "AGENTS_PLATFORM_TOKEN": str(token)},
             # aw-mcp-gateway spawns stdio upstreams with cwd defaulting to its
             # own BASE_DIR (/app), which doesn't have this app's package on
             # sys.path — explicit cwd is required so `python3 -m
