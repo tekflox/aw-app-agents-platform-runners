@@ -17,9 +17,12 @@ from __future__ import annotations
 import os
 import shutil
 import subprocess
+import uuid
 
 import httpx
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException, Request
+
+from . import execute as execute_mod
 
 RUNNERS = ["claude", "codex", "copilot", "cursor-agent"]
 
@@ -66,8 +69,18 @@ def build_routes(config: dict | None = None) -> FastAPI:
             }
         base = cfg.get("agents_platform_base", "http://127.0.0.1:10014")
         workspace = os.environ.get("AW_WORKSPACE", "aw")
+        # This app's OWN reachable base URL (the "Runner" execute endpoint) —
+        # the public BYOD tunnel edge (see execute.py's module docstring for
+        # why this is the only proven-reachable path from
+        # agents-platform_multitenant, a sibling docker container that
+        # cannot reach this workspace's nested-podman container directly).
+        # Override via config if a workspace's public domain differs.
+        own_base_url = cfg.get("own_base_url") or (
+            f"https://api.{workspace}.workspace.aw.tekflox.com/api/apps/agents-platform-runners"
+        )
         payload = {
             "workspace": workspace,
+            "base_url": own_base_url,
             "runners": [
                 {"cli": name, "name": name, **_runner_status(name)}
                 for name in RUNNERS
@@ -85,5 +98,55 @@ def build_routes(config: dict | None = None) -> FastAPI:
             return {"error": f"agents-platform responded {exc.response.status_code}: {exc.response.text[:500]}"}
         except Exception as exc:  # noqa: BLE001 — surfaced as-is to the caller
             return {"error": f"could not reach {url}: {exc}"}
+
+    @app.post("/execute")
+    async def execute_job(request: Request) -> dict:
+        """Spawn an agent CLI container in THIS workspace's own container
+        engine and stream its output back over the shared Redis Stream (see
+        execute.py's module docstring for the full design + the reachability/
+        auth investigation that shaped it).
+
+        Auth: this app is registered as a PUBLIC app in aw-backend's registry
+        (AppInstall.config.public=true) so the tunnel edge's usual aw_id_jwt
+        + workspace-membership check is skipped for it — aw-workspace's own
+        per-app IdentityGuard still requires a validly-SIGNED identity JWT
+        (Authorization: Bearer), and this route additionally requires the
+        shared X-Runner-Secret header to match config["execute_secret"].
+        Both gates must pass; neither alone is sufficient.
+        """
+        secret = cfg.get("execute_secret")
+        if not secret:
+            raise HTTPException(500, "execute_secret is not configured on this app's Settings")
+        presented = request.headers.get("x-runner-secret", "")
+        if presented != secret:
+            raise HTTPException(401, "invalid or missing X-Runner-Secret")
+
+        redis_url = cfg.get("shared_redis_url")
+        if not redis_url:
+            raise HTTPException(500, "shared_redis_url is not configured on this app's Settings")
+
+        if not execute_mod.CONTAINER_SOCKET:
+            raise HTTPException(
+                503, "AW_CONTAINER_SOCKET is not set — this workspace has no container "
+                     "engine available to spawn agent CLIs (containers:manage capability "
+                     "unmet at runtime, even though granted in aw-app.json)")
+
+        body = await request.json()
+        run_id = body.get("run_id") or uuid.uuid4().hex
+        job = {
+            "run_id": run_id,
+            "cli": body.get("cli", "claude"),
+            "model": body.get("model"),
+            "prompt": body.get("prompt", ""),
+            "session_id": body.get("session_id"),
+            "allowed_tools": body.get("allowed_tools"),
+            "disallowed_tools": body.get("disallowed_tools"),
+            "append_system_prompt": body.get("append_system_prompt"),
+            "extra_args": body.get("extra_args"),
+            "notion_task_id": body.get("notion_task_id"),
+            "source_device": body.get("source_device"),
+        }
+        execute_mod.start_job(job, redis_url)
+        return {"run_id": run_id, "status": "started"}
 
     return app
