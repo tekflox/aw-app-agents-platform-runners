@@ -230,6 +230,10 @@ def _build_container_kwargs(job: dict) -> tuple[str, list[str], dict]:
         env["AW_SOURCE_DEVICE"] = job["source_device"]
     env["AW_SESSION_ID"] = job.get("session_id") or ""
     env["AW_RUN_ID"] = run_id
+    # Running as a numeric uid that has no /etc/passwd entry inside the
+    # image (see the "user" kwarg below) means the container never gets an
+    # implicit $HOME — the CLI would otherwise look in / for its config.
+    env["HOME"] = "/home/ubuntu"
 
     kwargs: dict[str, Any] = {
         "name": f"aw-runner-run-{run_id}",
@@ -242,6 +246,17 @@ def _build_container_kwargs(job: dict) -> tuple[str, list[str], dict]:
         "privileged": False,
         "stdin_open": False,
         "tty": False,
+        # The agent-CLI images run as a baked-in "ubuntu" user (uid 1000),
+        # but the CLI credential files mounted above are owned by THIS
+        # workspace process's own uid (os.getuid(), 1001 in the verified
+        # live deploy — not guaranteed 1000 everywhere depending on how the
+        # workspace container itself was built). --user here overrides the
+        # image's default so the mounted (often 0600) credential files are
+        # actually readable — found live 2026-08-02: without this, claude
+        # exits with "Not logged in" despite creds being correctly mounted,
+        # because uid 1000 (image default) can't read a 0600 file owned by
+        # uid 1001 (this workspace's real uid).
+        "user": f"{os.getuid()}:{os.getgid()}",
     }
     if CONTAINER_NETWORK:
         kwargs["network"] = CONTAINER_NETWORK
