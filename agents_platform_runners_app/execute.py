@@ -184,12 +184,21 @@ def _build_container_kwargs(job: dict) -> tuple[str, list[str], dict]:
     # by the code-agent-clis app's login flow, NOT the legacy monolith's
     # data/home/ tree. This is the entire point of the fix: creds + cwd are
     # scoped to /opt/aw-workspace, never /opt/agentic-workspace.
+    #
+    # rw, not ro (found live 2026-08-02, same day as the /home/ubuntu DAC
+    # traversal fix above): once auth actually succeeded, the CLI still
+    # failed with a read-only-filesystem error creating a session
+    # directory — claude writes session/shell-snapshot state under
+    # ~/.claude/ at runtime (not just reads credentials from it), so
+    # mounting the whole dir ro broke every real run past the login check.
+    # rw here matches what a real interactive claude session on this host
+    # already has.
     creds_dir = spec["creds_dir"]
     if (Path(WORKSPACE_CONTAINER_DIR) / creds_dir).is_dir():
-        _mount(creds_dir, f"/home/ubuntu/{creds_dir}", ro=True)
+        _mount(creds_dir, f"/home/ubuntu/{creds_dir}", ro=False)
     creds_file = spec.get("creds_file")
     if creds_file and (Path(WORKSPACE_CONTAINER_DIR) / creds_file).is_file():
-        _mount(creds_file, f"/home/ubuntu/{creds_file}", ro=True)
+        _mount(creds_file, f"/home/ubuntu/{creds_file}", ro=False)
 
     # Isolated run cwd (rw — the CLI writes its own session/project state here)
     _mount(isolated_rel, isolated_container_path, ro=False)
