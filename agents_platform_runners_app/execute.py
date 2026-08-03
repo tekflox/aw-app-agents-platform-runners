@@ -365,14 +365,30 @@ def _run_job_blocking(job: dict, redis_url: str) -> None:
         return
 
     returncode = 1
+    # `container.logs(stream=True)` yields raw byte chunks exactly as
+    # delivered by the daemon's log API — these do NOT align with the
+    # underlying process's newline-terminated lines (unlike the OLD local
+    # path's `asyncio.StreamReader.readline()` in agents-platform_multitenant's
+    # cli.py, which buffers until a full line is available). A single
+    # `claude --output-format stream-json` JSON line (e.g. a big tool_result)
+    # can arrive split across two or more chunks. Publishing each raw chunk
+    # as if it were a complete line ships PARTIAL JSON fragments into the
+    # Redis Stream; the consumer's `json.loads` then fails on each half and
+    # falls back to treating the fragment as plain assistant text — leaking
+    # raw stream-json (e.g. `{"type":"user","message":{...,"tool_result"...}`)
+    # straight into the delivered Telegram message. Fix: buffer chunks and
+    # only publish on complete '\n'-terminated lines, carrying any trailing
+    # partial segment over to the next chunk (flushed at stream end).
+    buf = ""
     try:
         for raw in container.logs(stream=True, follow=True):
-            line = raw.decode("utf-8", errors="replace").rstrip("\n")
-            if not line:
-                continue
-            for sub in line.splitlines():
-                if sub.strip():
-                    _publish_line(r, run_id, sub)
+            buf += raw.decode("utf-8", errors="replace")
+            while "\n" in buf:
+                line, buf = buf.split("\n", 1)
+                if line.strip():
+                    _publish_line(r, run_id, line)
+        if buf.strip():
+            _publish_line(r, run_id, buf)
         try:
             status = container.wait()
             returncode = int(status.get("StatusCode", 1)) if isinstance(status, dict) else int(status)
