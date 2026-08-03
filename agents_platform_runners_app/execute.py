@@ -155,10 +155,18 @@ def _build_container_kwargs(job: dict) -> tuple[str, list[str], dict]:
 
     Mirrors agents-platform's ``build_docker_argv`` narrowed to what a single
     stateless job needs — no warm-pool, no WS/legacy modes (this app always
-    speaks the Redis-publish path itself), no resume/session persistence yet
-    (v1 — a real limitation, not an oversight: each ``/execute`` call is a
-    fresh isolated run dir; multi-turn sessions against a Runner-backed model
-    are a follow-up).
+    speaks the Redis-publish path itself).
+
+    Session persistence (fixed 2026-08-03 — root cause of "every Runner turn
+    starts a fresh conversation"): the isolated project dir used to be keyed
+    by ``run_id`` alone, which is unique PER TURN — a brand new cwd every
+    call means claude's own cwd-derived ``~/.claude/projects/<encoded-cwd>/``
+    session-file lookup can never find a prior turn's session file even when
+    ``--resume <session_id>`` is passed correctly, because the encoded-cwd
+    differs every single time. Fixed by keying the isolated dir off
+    ``session_id`` when the caller has one (RunnerLLM/CliLLM's
+    ``TelegramSession.session_id`` — stable per bot/chat pair across turns),
+    falling back to ``run_id`` only for a genuinely sessionless/first call.
     """
     cli = job.get("cli") or "claude"
     if cli not in CLI_SPECS:
@@ -167,10 +175,14 @@ def _build_container_kwargs(job: dict) -> tuple[str, list[str], dict]:
     image = f"{REGISTRY}/{IMAGE_PREFIX}-{cli}:{DEFAULT_TAG}"
 
     run_id = job["run_id"]
-    # Isolated per-run project dir — created via THIS process's own view of
-    # the same directory tree the podman host mounts from
-    # (WORKSPACE_CONTAINER_DIR == WORKSPACE_HOST_DIR on disk).
-    isolated_rel = f".claude/isolated/{run_id}"
+    session_id = job.get("session_id")
+    # Isolated per-SESSION (not per-run) project dir — created via THIS
+    # process's own view of the same directory tree the podman host mounts
+    # from (WORKSPACE_CONTAINER_DIR == WORKSPACE_HOST_DIR on disk). Keying by
+    # session_id (falling back to run_id when there isn't one) is what makes
+    # claude's --resume actually work turn-over-turn — see the docstring above.
+    isolated_key = session_id or run_id
+    isolated_rel = f".claude/isolated/{isolated_key}"
     (Path(WORKSPACE_CONTAINER_DIR) / isolated_rel).mkdir(parents=True, exist_ok=True)
     isolated_container_path = f"/home/ubuntu/{isolated_rel}"
 
@@ -226,6 +238,15 @@ def _build_container_kwargs(job: dict) -> tuple[str, list[str], dict]:
     argv = [spec["bin"]]
     if spec.get("subcmd"):
         argv.append(spec["subcmd"])
+
+    # Resume flag must come before the prompt flag (claude) / as a subcommand
+    # (codex) — same convention as agents-platform's docker_agent.py. Only
+    # emitted when the caller actually has a prior session_id for this
+    # bot/chat; a first turn has none and starts a fresh conversation.
+    if session_id and cli == "claude":
+        argv.extend(["--resume", session_id])
+    elif session_id and cli == "codex":
+        argv.extend(["resume", session_id])
 
     prompt = job.get("prompt") or ""
     if spec.get("prompt_flag"):
