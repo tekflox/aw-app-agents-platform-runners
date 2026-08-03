@@ -158,15 +158,22 @@ def _build_container_kwargs(job: dict) -> tuple[str, list[str], dict]:
     speaks the Redis-publish path itself).
 
     Session persistence (fixed 2026-08-03 — root cause of "every Runner turn
-    starts a fresh conversation"): the isolated project dir used to be keyed
-    by ``run_id`` alone, which is unique PER TURN — a brand new cwd every
-    call means claude's own cwd-derived ``~/.claude/projects/<encoded-cwd>/``
-    session-file lookup can never find a prior turn's session file even when
-    ``--resume <session_id>`` is passed correctly, because the encoded-cwd
-    differs every single time. Fixed by keying the isolated dir off
-    ``session_id`` when the caller has one (RunnerLLM/CliLLM's
-    ``TelegramSession.session_id`` — stable per bot/chat pair across turns),
-    falling back to ``run_id`` only for a genuinely sessionless/first call.
+    starts a fresh conversation"): the ACTUAL container cwd for the spawned
+    CLI is the stable ``working_dir="/opt/aw-workspace"`` kwarg below (set by
+    the 2026-08-02 ``a8db328`` change) — NOT this isolated dir, which is only
+    mounted, never cd'd into (confirmed live: ``.claude/projects/-opt-aw-
+    workspace/`` is the one actually being written to turn over turn). So
+    claude's cwd-derived project-file lookup was ALREADY stable; keying this
+    isolated scratch dir by run_id (matching agents-platform's own
+    ``docker_agent.py`` line ~317-326 exactly — "Each run gets its own
+    project dir... so the claude CLI never auto-loads sessions from a
+    sibling run") is correct and deliberately NOT session_id-keyed, to avoid
+    two queued turns of the same session racing on one directory. The real
+    (and only) defect was that ``job.get("session_id")`` was captured into
+    ``AW_SESSION_ID`` env but never turned into a ``--resume`` argv flag —
+    fixed below, mirroring docker_agent.py's own ``--resume <session_id>`` /
+    ``resume <session_id>`` (codex) convention, which resolves by session ID
+    globally across ``~/.claude/projects/**`` regardless of cwd.
     """
     cli = job.get("cli") or "claude"
     if cli not in CLI_SPECS:
@@ -176,13 +183,9 @@ def _build_container_kwargs(job: dict) -> tuple[str, list[str], dict]:
 
     run_id = job["run_id"]
     session_id = job.get("session_id")
-    # Isolated per-SESSION (not per-run) project dir — created via THIS
-    # process's own view of the same directory tree the podman host mounts
-    # from (WORKSPACE_CONTAINER_DIR == WORKSPACE_HOST_DIR on disk). Keying by
-    # session_id (falling back to run_id when there isn't one) is what makes
-    # claude's --resume actually work turn-over-turn — see the docstring above.
-    isolated_key = session_id or run_id
-    isolated_rel = f".claude/isolated/{isolated_key}"
+    # Isolated per-RUN (not per-session) scratch dir — matches legacy exactly
+    # (docker_agent.py always keys by agent_id/run_id, never session_id).
+    isolated_rel = f".claude/isolated/{run_id}"
     (Path(WORKSPACE_CONTAINER_DIR) / isolated_rel).mkdir(parents=True, exist_ok=True)
     isolated_container_path = f"/home/ubuntu/{isolated_rel}"
 
