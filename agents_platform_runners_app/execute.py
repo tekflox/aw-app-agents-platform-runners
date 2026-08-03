@@ -203,17 +203,16 @@ def _build_container_kwargs(job: dict) -> tuple[str, list[str], dict]:
     # Isolated run cwd (rw — the CLI writes its own session/project state here)
     _mount(isolated_rel, isolated_container_path, ro=False)
 
-    # Visible proof-of-scoping mount — found live 2026-08-02: nothing above
-    # actually mounts anything AT a container path named "aw-workspace" (creds
-    # go to ~/.claude, skills to /opt/agentic-workspace/skills), so `ls /opt`
+    # Workspace root mount — found live 2026-08-02: nothing above actually
+    # mounted anything AT a container path named "aw-workspace" (creds go to
+    # ~/.claude, skills to /opt/agentic-workspace/skills), so `ls /opt`
     # inside a spawned container never showed the real workspace root even
     # though every functional mount (creds, sessions) was already correctly
-    # scoped there — Frederico's own sanity check ("ls /opt should show
-    # aw-workspace") was a fair ask this didn't satisfy. Mount the workspace
-    # root itself (ro) at the exact path its name promises, purely so this is
-    # directly verifiable, not just true-but-invisible.
+    # scoped there. rw (Frederico, 2026-08-02): this IS the agent's real
+    # working tree now, not just a visibility check — the CLI needs to
+    # write here, not only read.
     if WORKSPACE_HOST_DIR:
-        volumes[WORKSPACE_HOST_DIR.rstrip("/")] = {"bind": "/opt/aw-workspace", "mode": "ro"}
+        volumes[WORKSPACE_HOST_DIR.rstrip("/")] = {"bind": "/opt/aw-workspace", "mode": "rw"}
 
     # Legacy skills mount intentionally REMOVED 2026-08-02 (Frederico): the
     # agent's real cwd is /opt/aw-workspace now — skills for this runner
@@ -268,7 +267,12 @@ def _build_container_kwargs(job: dict) -> tuple[str, list[str], dict]:
     kwargs: dict[str, Any] = {
         "name": f"aw-runner-run-{run_id}",
         "command": argv,
-        "working_dir": isolated_container_path,
+        # Frederico, 2026-08-02: /opt/aw-workspace (rw, mounted above) is the
+        # agent's real working tree now — not the per-run isolated dir under
+        # ~/.claude/isolated/. That dir is still mounted (rw) so the CLI's
+        # own session/project state under ~/.claude keeps working, but the
+        # process's actual cwd defaults to the workspace root itself.
+        "working_dir": "/opt/aw-workspace",
         "environment": env,
         "volumes": volumes,
         "detach": True,
