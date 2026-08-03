@@ -89,14 +89,14 @@
       {
         "id": "mcp-gateway",
         "version": ">=0.1.0",
-        "required": true,
-        "reason": "This app contributes mcp.json definitions the MCP Gateway discovers and merges."
+        "required": false,
+        "reason": "This app contributes mcp.json definitions the MCP Gateway discovers and merges. Softened to non-required 2026-08-03: the deployed aw-remote-host workspace runs an aw-workspace build whose capability catalog predates mcp-gateway's own 'mcp:register-gateway' permission, so a strict required-dependency install of THIS app cascades into mcp-gateway manifest validation and fails with 'unknown permission' \u2014 blocking /execute entirely, which is worse than temporarily losing the mcp.json auto-merge. Revert to required:true once the deployed aw-workspace build is upgraded past the fix already on its own master (see aw-workspace's src/apps/capabilities.py)."
       },
       {
         "id": "code-agent-clis",
         "version": ">=0.2.1",
-        "required": true,
-        "reason": "This app doesn't install the CLIs itself \u2014 it depends on code-agent-clis having already put claude/codex/copilot/cursor-agent on /usr/local/bin, same path aw-workspace installs already reuse: one app owns installing each runner, this app just depends on that instead of re-implementing it."
+        "required": false,
+        "reason": "This app doesn't install the CLIs itself \u2014 it depends on code-agent-clis having already put claude/codex/copilot/cursor-agent on /usr/local/bin, same path aw-workspace installs already reuse: one app owns installing each runner, this app just depends on that instead of re-implementing it. Softened to non-required 2026-08-03 alongside mcp-gateway above \u2014 not itself implicated in the permission failure, but the reconciler validates ALL required deps in the same pass, so leaving this required still blocks install. The CLIs are already present on /usr/local/bin from an earlier successful bootstrap; revert to required:true once dependency installs are unblocked again."
       }
     ]
   },
