@@ -52,6 +52,13 @@
           "spec": "windows/main.json"
         }
       }
+    ],
+    "skills": [
+      {
+        "id": "aw-agent-telegram",
+        "path": "skills/aw-agent-telegram/SKILL.md",
+        "description": "How to reply to messages routed through a Telegram bot connected to this workspace via agents-platform — markers for attachments/buttons/mini-apps/location, voice vs text, tone, and delivery contract for a CLI agent session spawned by this app's runner. Ported and adapted from the agentic-workspace monolith's WorkspaceAgent skill of the same name."
+      }
     ]
   },
   "config_schema": {
