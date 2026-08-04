@@ -65,6 +65,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import shutil
 import threading
 import time
 import uuid
@@ -150,6 +151,25 @@ def _publish_done(r, run_id: str, returncode: int) -> None:
         log.exception("execute: publish_done failed run=%s", run_id)
 
 
+def _sync_home_creds_into_workspace(real_home: Path, spec: dict) -> None:
+    """Best-effort ``cp -a``-equivalent of this CLI's creds_dir/creds_file
+    from the process's real ``$HOME`` into ``WORKSPACE_CONTAINER_DIR`` — see
+    the call site's comment for why this exists. Never raises: a stale or
+    missing source just means the NEXT spawn falls back to whatever was
+    already synced (or mounts nothing, same as before this existed)."""
+    for rel in filter(None, [spec.get("creds_dir"), spec.get("creds_file")]):
+        src = real_home / rel
+        dst = Path(WORKSPACE_CONTAINER_DIR) / rel
+        try:
+            if src.is_dir():
+                shutil.copytree(src, dst, dirs_exist_ok=True)
+            elif src.is_file():
+                dst.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(src, dst)
+        except Exception:
+            log.warning("execute: creds resync %s -> %s failed", src, dst, exc_info=True)
+
+
 def _build_container_kwargs(job: dict) -> tuple[str, list[str], dict]:
     """Return (image, command_argv, docker-SDK run kwargs) for this job.
 
@@ -208,6 +228,22 @@ def _build_container_kwargs(job: dict) -> tuple[str, list[str], dict]:
     # mounting the whole dir ro broke every real run past the login check.
     # rw here matches what a real interactive claude session on this host
     # already has.
+    # Mount SOURCES must live under WORKSPACE_CONTAINER_DIR (the bind-mounted
+    # tree shared with the podman host, hence shareable into sibling
+    # containers) — but the LIVE, current credentials are wherever $HOME
+    # actually resolves to for this process, which is NOT guaranteed to be
+    # WORKSPACE_CONTAINER_DIR (found live 2026-08-03: Frederico set this
+    # workspace's own $HOME back to /home/ubuntu, a plain container-layer
+    # path with no host bind-mount at all — un-shareable with sibling
+    # containers by construction, no matter what). So: resync a copy of
+    # whatever's under real $HOME into the bind-mounted tree before every
+    # spawn, then mount from there as always. Cheap (small files, `cp -a`
+    # -pu keeps it near-instant when nothing changed) and self-healing
+    # across future credential refreshes/logins that only touch $HOME.
+    _real_home = Path(os.environ.get("HOME") or "/home/ubuntu")
+    if _real_home.resolve() != Path(WORKSPACE_CONTAINER_DIR).resolve():
+        _sync_home_creds_into_workspace(_real_home, spec)
+
     creds_dir = spec["creds_dir"]
     if (Path(WORKSPACE_CONTAINER_DIR) / creds_dir).is_dir():
         _mount(creds_dir, f"/home/ubuntu/{creds_dir}", ro=False)
