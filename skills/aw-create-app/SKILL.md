@@ -25,8 +25,9 @@ fully-wired "hello" example). Copy it, rename everything marked `TEMPLATE`/
 ## 1. What an app is
 
 A decoupled app is a self-contained repo (`aw-app-<name>`) with a manifest
-(`aw-app.json`) at its root. The aw-workspace runtime loads installed apps
-from `~/agentic-workspace/apps/<id>/` and serves them under `/api/apps/<id>`.
+(`aw-app.json`) at its root. The aw-workspace runtime fetches installed apps
+into `/opt/aw-workspace/apps/<slug>/` (`AW_APPS_ROOT`, see `src/apps/fetch.py`)
+and serves them under `/api/apps/<id>`.
 Two tiers:
 
 - **Tier-1 (`"tier": "inprocess"`)** — a Python plugin loaded into the
@@ -373,9 +374,10 @@ required dependency for exactly this reason — see that repo's manifest.
 
 ## 10. How it shows up + install
 
-- Installed apps live in `~/agentic-workspace/apps/<id>/`; the runtime loads
-  their manifests and serves `GET /api/apps` (list) + `GET /api/apps/-/contributions`
-  (live-refetched nav/windows) + `GET /api/apps/-/catalog` (marketplace).
+- Installed apps live in `/opt/aw-workspace/apps/<slug>/` (`AW_APPS_ROOT`);
+  the runtime loads their manifests and serves `GET /api/apps` (list) +
+  `GET /api/apps/-/contributions` (live-refetched nav/windows) +
+  `GET /api/apps/-/catalog` (marketplace).
 - The SPA "Apps" launcher lists them as cards; clicking opens the default window.
 - Install paths: `POST /api/apps/install` (fetch repo + reconcile), the
   reconciler's "Install My Apps", or a hand-sync of the app dir + workspace reload.
