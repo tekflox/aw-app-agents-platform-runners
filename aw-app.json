@@ -57,7 +57,37 @@
       {
         "id": "aw-agent-telegram",
         "path": "skills/aw-agent-telegram/SKILL.md",
-        "description": "How to reply to messages routed through a Telegram bot connected to this workspace via agents-platform \u2014 markers for attachments/buttons/mini-apps/location, voice vs text, tone, and delivery contract for a CLI agent session spawned by this app's runner. Ported and adapted from the agentic-workspace monolith's WorkspaceAgent skill of the same name."
+        "description": "How to reply to messages routed through a Telegram bot connected to this workspace via agents-platform — markers for attachments/buttons/mini-apps/location, voice vs text, tone, and delivery contract for a CLI agent session spawned by this app's runner. Ported and adapted from the agentic-workspace monolith's WorkspaceAgent skill of the same name."
+      },
+      {
+        "id": "aw-supervisor-tool",
+        "path": "skills/aw-supervisor-tool/SKILL.md",
+        "description": "The Supervisor tool — 3 MCP tools (supervise/stop_supervisor/supervisor_status) any Agents Platform agent can call to watch another session's whole run chain and get woken up exactly once when it goes idle."
+      },
+      {
+        "id": "aw-agent-coder",
+        "path": "skills/aw-agent-coder/SKILL.md",
+        "description": "Generic coding-specialist contract for the \"Coder\" Agents Platform agent — orients it to what Agents Platform is, makes a knowledge-base search mandatory before starting any task, and sets baseline engineering conduct."
+      },
+      {
+        "id": "aw-agent-doc-writer",
+        "path": "skills/aw-agent-doc-writer/SKILL.md",
+        "description": "Generic documentation-writer contract for the \"Doc Writer\" Agents Platform agent — writes README/ADR/module/API docs grounded in the actual code."
+      },
+      {
+        "id": "aw-agent-qa",
+        "path": "skills/aw-agent-qa/SKILL.md",
+        "description": "Generic QA-review contract for the \"QA\" Agents Platform agents — validates a finished task's delivery and decides the outcome (Kanban status if a card system is wired up, otherwise a plain verdict)."
+      },
+      {
+        "id": "aw-agent-ux-coder",
+        "path": "skills/aw-agent-ux-coder/SKILL.md",
+        "description": "Contract for the \"UX Coder\" Agents Platform agent — owns end-to-end delivery of a UX-Proto prototype, with a strong mandate for usability."
+      },
+      {
+        "id": "aw-agents",
+        "path": "skills/aw-agents/SKILL.md",
+        "description": "Guided agent/workflow execution via the agent-mcp server — the conductor is a MANAGER who delegates to platform agents through discovery → exploration → decomposition → plan approval → execution → validation → iteration → final report, never executing the work itself."
       }
     ]
   },
