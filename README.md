@@ -1,47 +1,22 @@
-# aw-app-agents-platform-runners
+# Agents Platform Runners
 
-AW workspace app (`aw-app.json` manifest schema v1, `tier: inprocess`) with
-two jobs:
+Agents Platform Runners connects an AW Workspace to hosted agent sessions. It lets the workspace start, supervise, and reuse coding-agent runners from the same place where the work is happening.
 
-1. **Contributes the ported "aw-agents" MCP.** `agents_platform_runners_app/
-   mcp_server.py` is a straight copy of `agents-platform`'s
-   `mcp_server/agent_mcp.py` — the same stdio MCP server this workspace's
-   `.mcp.json` used to run directly as the `agents-platform` upstream.
-   Installing this app writes an `mcp.json` (`contributes.mcp.reload_on_save`)
-   that aw-mcp-gateway discovers and reloads automatically, pointed at
-   `agents_platform_base` (config — default the `agents-platform_multitenant`
-   instance, not the legacy single-tenant `agents-platform`).
+## What It Does
 
-2. **Reuses this workspace's own runner CLIs.** Depends on the
-   `code-agent-clis` app (`dependencies.apps`, required) instead of
-   installing claude/codex/copilot/cursor-agent a second way — one app owns
-   installing each CLI (`/usr/local/bin`), this one just depends on that
-   being done. `GET /api/apps/agents-platform-runners/status` checks each
-   binary actually resolves on PATH and reports its version — a live signal
-   the dependency did its job, not just that it's declared.
-   `agents-platform_multitenant`'s own `agent-images/*/Dockerfile` were
-   deliberately left untouched (Frederico decision 2026-08-01) rather than
-   forced into the same nvm-based install path — that's a separate,
-   independently-built image pipeline.
+- Registers this workspace as a runner target for Agents Platform.
+- Starts agent sessions that can work inside the workspace.
+- Streams run output back to the platform so progress is visible.
+- Adds agent-focused tools and skills for Telegram replies, supervision, coding work, documentation work, QA, and coordinated multi-agent runs.
 
-## Config
+## Why Use It
 
-| Key | Default | What |
-|---|---|---|
-| `agents_platform_base` | `http://127.0.0.1:10014` | Base URL of the agents-platform_multitenant instance the MCP tools control |
+Use this app when an AW Workspace should be able to receive agent jobs from Agents Platform and run them against the workspace environment. It is useful for delegated coding tasks, documentation work, QA passes, and long-running workflows that need a reusable runner.
 
-## Dependencies
+## How To Use It
 
-- `mcp-gateway` (required) — contributes `mcp.json` definitions the gateway
-  discovers and merges; without it installed first, this app's MCP tools
-  never surface anywhere.
-- `code-agent-clis` (required) — installs the actual claude/codex/copilot/
-  cursor-agent binaries this app's `/status` route checks for.
+Install the app in the workspace, open its settings, and connect it to the Agents Platform instance that should dispatch work here. Once configured, the platform can launch runs through this workspace and agents can use the contributed tools from their normal sessions.
 
-## Local dev
+## What It Delivers
 
-```bash
-.venv/aw/bin/python -m pytest tests/
-.venv/aw/bin/python tests/validate_manifest.py
-python -m agents_platform_runners_app   # standalone, binds 127.0.0.1:9407
-```
+The app turns the workspace into an active execution target for agent work. Instead of treating the workspace as only a place to store code and data, it makes the workspace available as a controlled runner that can accept tasks, expose progress, and keep agent workflows close to the files and services they need.
