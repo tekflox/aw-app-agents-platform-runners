@@ -2,7 +2,7 @@
   "manifest_version": 1,
   "id": "agents-platform-runners",
   "name": "Agents Platform Runners",
-  "version": "0.19.0",
+  "version": "0.20.0",
   "description": "Depends on the code-agent-clis app (claude/codex/copilot/cursor-agent already installed at /usr/local/bin, single source of truth) so this workspace's agent-CLI runners are what agents-platform_multitenant's agent sessions use, and contributes the ported \"aw-agents\" MCP (agent_mcp.py) so agents-platform is controllable as MCP tools from this workspace.",
   "tier": "inprocess",
   "requires_ui_refresh": false,
@@ -57,37 +57,37 @@
       {
         "id": "aw-agent-telegram",
         "path": "skills/aw-agent-telegram/SKILL.md",
-        "description": "How to reply to messages routed through a Telegram bot connected to this workspace via agents-platform — markers for attachments/buttons/mini-apps/location, voice vs text, tone, and delivery contract for a CLI agent session spawned by this app's runner. Ported and adapted from the agentic-workspace monolith's WorkspaceAgent skill of the same name."
+        "description": "How to reply to messages routed through a Telegram bot connected to this workspace via agents-platform \u2014 markers for attachments/buttons/mini-apps/location, voice vs text, tone, and delivery contract for a CLI agent session spawned by this app's runner. Ported and adapted from the agentic-workspace monolith's WorkspaceAgent skill of the same name."
       },
       {
         "id": "aw-supervisor-tool",
         "path": "skills/aw-supervisor-tool/SKILL.md",
-        "description": "The Supervisor tool — 3 MCP tools (supervise/stop_supervisor/supervisor_status) any Agents Platform agent can call to watch another session's whole run chain and get woken up exactly once when it goes idle."
+        "description": "The Supervisor tool \u2014 3 MCP tools (supervise/stop_supervisor/supervisor_status) any Agents Platform agent can call to watch another session's whole run chain and get woken up exactly once when it goes idle."
       },
       {
         "id": "aw-agent-coder",
         "path": "skills/aw-agent-coder/SKILL.md",
-        "description": "Generic coding-specialist contract for the \"Coder\" Agents Platform agent — orients it to what Agents Platform is, makes a knowledge-base search mandatory before starting any task, and sets baseline engineering conduct."
+        "description": "Generic coding-specialist contract for the \"Coder\" Agents Platform agent \u2014 orients it to what Agents Platform is, makes a knowledge-base search mandatory before starting any task, and sets baseline engineering conduct."
       },
       {
         "id": "aw-agent-doc-writer",
         "path": "skills/aw-agent-doc-writer/SKILL.md",
-        "description": "Generic documentation-writer contract for the \"Doc Writer\" Agents Platform agent — writes README/ADR/module/API docs grounded in the actual code."
+        "description": "Generic documentation-writer contract for the \"Doc Writer\" Agents Platform agent \u2014 writes README/ADR/module/API docs grounded in the actual code."
       },
       {
         "id": "aw-agent-qa",
         "path": "skills/aw-agent-qa/SKILL.md",
-        "description": "Generic QA-review contract for the \"QA\" Agents Platform agents — validates a finished task's delivery and decides the outcome (Kanban status if a card system is wired up, otherwise a plain verdict)."
+        "description": "Generic QA-review contract for the \"QA\" Agents Platform agents \u2014 validates a finished task's delivery and decides the outcome (Kanban status if a card system is wired up, otherwise a plain verdict)."
       },
       {
         "id": "aw-agent-ux-coder",
         "path": "skills/aw-agent-ux-coder/SKILL.md",
-        "description": "Contract for the \"UX Coder\" Agents Platform agent — owns end-to-end delivery of a UX-Proto prototype, with a strong mandate for usability."
+        "description": "Contract for the \"UX Coder\" Agents Platform agent \u2014 owns end-to-end delivery of a UX-Proto prototype, with a strong mandate for usability."
       },
       {
         "id": "aw-agents",
         "path": "skills/aw-agents/SKILL.md",
-        "description": "Guided agent/workflow execution via the agent-mcp server — the conductor is a MANAGER who delegates to platform agents through discovery → exploration → decomposition → plan approval → execution → validation → iteration → final report, never executing the work itself."
+        "description": "Guided agent/workflow execution via the agent-mcp server \u2014 the conductor is a MANAGER who delegates to platform agents through discovery \u2192 exploration \u2192 decomposition \u2192 plan approval \u2192 execution \u2192 validation \u2192 iteration \u2192 final report, never executing the work itself."
       }
     ]
   },
