@@ -324,6 +324,25 @@ def _build_container_kwargs(job: dict) -> tuple[str, list[str], dict]:
     # implicit $HOME — the CLI would otherwise look in / for its config.
     env["HOME"] = "/home/ubuntu"
 
+    # Share aw-workspace's own venv (Dockerfile) with this sibling container
+    # via PYTHONPATH only — NEVER prepend its bin/ to PATH here. This CLI
+    # image is a different base/distro than aw-workspace's own
+    # (confirmed live 2026-08-05: Ubuntu 24.04 / /usr/bin/python3.12 here vs
+    # python:3.12-slim / /usr/local/bin/python3.12 there), so the venv's own
+    # interpreter and any compiled C-extension wheel (psycopg[binary],
+    # cryptography) are not safely executable here. Pure-Python packages
+    # (httpx and friends — everything aw-workspace-cli actually needs to
+    # start) import fine via PYTHONPATH regardless, using THIS container's
+    # own native python3. Globbed (not hardcoded) so a future Python minor
+    # version bump on either side doesn't silently break this.
+    _venv_site_packages = sorted(
+        Path(WORKSPACE_CONTAINER_DIR, ".aw-workspace", "venv", "lib").glob(
+            "python3.*/site-packages"
+        )
+    )
+    if _venv_site_packages:
+        env["PYTHONPATH"] = str(_venv_site_packages[-1])
+
     kwargs: dict[str, Any] = {
         "name": f"aw-runner-run-{run_id}",
         "command": argv,
