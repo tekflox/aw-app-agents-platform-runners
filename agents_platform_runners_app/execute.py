@@ -102,6 +102,7 @@ CLI_SPECS: dict[str, dict] = {
         "skip_perms_flag": "--dangerously-skip-permissions",
         "model_flag": "--model", "add_dir_flag": "--add-dir",
         "mcp_config_flag": "--mcp-config",
+        "strict_mcp_flag": "--strict-mcp-config",
         "creds_dir": ".claude", "creds_file": ".claude.json",
     },
     "codex": {
@@ -362,6 +363,8 @@ def _build_container_kwargs(job: dict) -> tuple[str, list[str], dict]:
         argv += ["--append-system-prompt", job["append_system_prompt"]]
     if mcp_config_container_path:
         argv += [spec["mcp_config_flag"], mcp_config_container_path]
+        if spec.get("strict_mcp_flag"):
+            argv.append(spec["strict_mcp_flag"])
 
     # dangerous_skip_permissions: defaults to True (historic always-on
     # behavior) but must be suppressible — Agent Config "secure mode"

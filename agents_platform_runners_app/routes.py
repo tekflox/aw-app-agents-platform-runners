@@ -151,6 +151,8 @@ def build_routes(config: dict | None = None) -> FastAPI:
             "extra_args": body.get("extra_args"),
             "notion_task_id": body.get("notion_task_id"),
             "source_device": body.get("source_device"),
+            "mcp_servers": body.get("mcp_servers"),
+            "dangerous_skip_permissions": body.get("dangerous_skip_permissions", True),
         }
         execute_mod.start_job(job, redis_url)
         return {"run_id": run_id, "status": "started"}
