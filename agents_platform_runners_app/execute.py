@@ -276,9 +276,32 @@ def _build_container_kwargs(job: dict) -> tuple[str, list[str], dict]:
     creds_dir = spec["creds_dir"]
     if (Path(WORKSPACE_CONTAINER_DIR) / creds_dir).is_dir():
         _mount(creds_dir, f"/home/ubuntu/{creds_dir}", ro=False)
+        # The OAuth credentials FILE itself is mounted read-only, shadowing
+        # just that one path inside the otherwise-rw creds_dir (Docker/Podman
+        # both support a more-specific bind nested inside a broader one).
+        # Found live 2026-08-06: a spawned claude process wrote an EMPTY
+        # accessToken/refreshToken back into the shared, rw-mounted
+        # .credentials.json — since every Workspace Runner job mounts the
+        # SAME persisted copy (freshened from real $HOME before each spawn,
+        # see _sync_home_creds_into_workspace above), one bad/racing write
+        # from inside a container blanked it for every OTHER concurrent or
+        # subsequent run until the next resync happened to overwrite it back
+        # from $HOME. Read-only here closes that off entirely — a spawned
+        # process can authenticate with whatever valid token it was handed,
+        # but can never corrupt the shared source of truth. $HOME itself
+        # (this process's own real credentials, refreshed by however this
+        # workspace's own interactive login/session normally happens) is
+        # unaffected either way, since resync only ever reads from it, never
+        # writes to it.
+        _cred_file = f"{creds_dir}/.credentials.json"
+        if (Path(WORKSPACE_CONTAINER_DIR) / _cred_file).is_file():
+            _mount(_cred_file, f"/home/ubuntu/{_cred_file}", ro=True)
     creds_file = spec.get("creds_file")
     if creds_file and (Path(WORKSPACE_CONTAINER_DIR) / creds_file).is_file():
-        _mount(creds_file, f"/home/ubuntu/{creds_file}", ro=False)
+        # Also read-only (same rationale) — this is account/onboarding
+        # config (~/.claude.json for claude), not session transcript state,
+        # so nothing needs to write it back at runtime.
+        _mount(creds_file, f"/home/ubuntu/{creds_file}", ro=True)
 
     # Isolated run cwd (rw — the CLI writes its own session/project state here)
     _mount(isolated_rel, isolated_container_path, ro=False)
