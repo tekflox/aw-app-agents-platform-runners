@@ -98,26 +98,34 @@ DEFAULT_TAG = os.environ.get("AW_AGENT_TAG", "latest")
 CLI_SPECS: dict[str, dict] = {
     "claude": {
         "bin": "claude", "subcmd": None, "prompt_flag": "-p",
-        "default_extra": ["--dangerously-skip-permissions", "--output-format", "stream-json", "--verbose"],
+        "default_extra": ["--output-format", "stream-json", "--verbose"],
+        "skip_perms_flag": "--dangerously-skip-permissions",
         "model_flag": "--model", "add_dir_flag": "--add-dir",
+        "mcp_config_flag": "--mcp-config",
         "creds_dir": ".claude", "creds_file": ".claude.json",
     },
     "codex": {
         "bin": "codex", "subcmd": "exec", "prompt_flag": None,
-        "default_extra": ["--skip-git-repo-check", "--dangerously-bypass-approvals-and-sandbox", "--json"],
+        "default_extra": ["--skip-git-repo-check", "--json"],
+        "skip_perms_flag": "--dangerously-bypass-approvals-and-sandbox",
         "model_flag": "-c", "add_dir_flag": None,
+        "mcp_config_flag": None,  # codex has no --mcp-config flag — see write-up below
         "creds_dir": ".codex", "creds_file": None,
     },
     "copilot": {
         "bin": "copilot", "subcmd": None, "prompt_flag": "-p",
         "default_extra": ["--allow-all-tools"],
+        "skip_perms_flag": None,
         "model_flag": "--model", "add_dir_flag": "--add-dir",
+        "mcp_config_flag": None,
         "creds_dir": ".copilot", "creds_file": None,
     },
     "cursor-agent": {
         "bin": "cursor-agent", "subcmd": None, "prompt_flag": None,
         "default_extra": ["--print"],
+        "skip_perms_flag": None,
         "model_flag": "--model", "add_dir_flag": None,
+        "mcp_config_flag": None,
         "creds_dir": ".cursor", "creds_file": None,
     },
 }
@@ -206,8 +214,29 @@ def _build_container_kwargs(job: dict) -> tuple[str, list[str], dict]:
     # Isolated per-RUN (not per-session) scratch dir — matches legacy exactly
     # (docker_agent.py always keys by agent_id/run_id, never session_id).
     isolated_rel = f".claude/isolated/{run_id}"
-    (Path(WORKSPACE_CONTAINER_DIR) / isolated_rel).mkdir(parents=True, exist_ok=True)
+    isolated_host_dir = Path(WORKSPACE_CONTAINER_DIR) / isolated_rel
+    isolated_host_dir.mkdir(parents=True, exist_ok=True)
     isolated_container_path = f"/home/ubuntu/{isolated_rel}"
+
+    # MCP config: agents-platform_multitenant's executor.py resolves the
+    # agent's configured MCP servers (incl. gateway-token injection and the
+    # X-Aw-Caller-Run-Id header) and ships the FINAL dict over the wire as
+    # job["mcp_servers"] — this app has no filesystem access to that host's
+    # own mcp-config directory, so the config itself crosses the wire
+    # instead of a path to it. Written straight into the isolated run dir
+    # (already mounted rw below), no separate mount needed.
+    mcp_config_container_path: str | None = None
+    mcp_servers = job.get("mcp_servers") or {}
+    if mcp_servers and spec.get("mcp_config_flag"):
+        claude_mcp = {
+            "mcpServers": {
+                name: {"type": cfg.get("type", "streamable-http"), "url": cfg["url"],
+                       **({"headers": cfg["headers"]} if cfg.get("headers") else {})}
+                for name, cfg in mcp_servers.items() if cfg.get("url")
+            }
+        }
+        (isolated_host_dir / "mcp.json").write_text(json.dumps(claude_mcp, indent=2))
+        mcp_config_container_path = f"{isolated_container_path}/mcp.json"
 
     volumes: dict[str, dict] = {}
 
@@ -308,6 +337,18 @@ def _build_container_kwargs(job: dict) -> tuple[str, list[str], dict]:
         argv += ["--disallowed-tools", ",".join(disallowed)]
     if job.get("append_system_prompt"):
         argv += ["--append-system-prompt", job["append_system_prompt"]]
+    if mcp_config_container_path:
+        argv += [spec["mcp_config_flag"], mcp_config_container_path]
+
+    # dangerous_skip_permissions: defaults to True (historic always-on
+    # behavior) but must be suppressible — Agent Config "secure mode"
+    # (backend/app/core/security.py on the multitenant side) sets it False
+    # and adds "Bash" to disallowed_tools; the Bash half already worked
+    # (forwarded via disallowed_tools above) but this flag used to be
+    # hardcoded into `default_extra` regardless, silently ignoring the
+    # override for every runner-provider agent.
+    if job.get("dangerous_skip_permissions", True) and spec.get("skip_perms_flag"):
+        argv.append(spec["skip_perms_flag"])
 
     argv += spec["default_extra"]
     argv += list(job.get("extra_args") or [])
