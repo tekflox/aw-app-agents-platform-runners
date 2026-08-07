@@ -80,6 +80,15 @@ WORKSPACE_HOST_DIR = os.environ.get("AW_WORKSPACE_HOST_DIR", "")
 # The SAME directory tree, as seen by THIS process (== $HOME here) — used to
 # mkdir isolated run dirs locally before referencing them via the host path.
 WORKSPACE_CONTAINER_DIR = os.environ.get("AW_WORKSPACE_CONTAINER_DIR", "/opt/aw-workspace")
+# Host path of the workspace's OWN $HOME (/home/ubuntu). The launcher
+# (aw-remote-host ops) bind-mounts $HOME to this host dir, so the LIVE creds
+# under $HOME/.claude are a valid mount SOURCE for the sibling CLI containers
+# this app spawns — no copy needed. Empty on setups that don't separately
+# bind-mount $HOME (then the legacy copy-into-workspace fallback kicks in).
+WORKSPACE_HOME_HOST_DIR = os.environ.get("AW_WORKSPACE_HOME_HOST_DIR", "")
+# This process's real $HOME as IT sees it (container-side path) — where the
+# live credentials the workspace's own login writes actually resolve.
+REAL_HOME = os.environ.get("HOME") or "/home/ubuntu"
 CONTAINER_SOCKET = os.environ.get("AW_CONTAINER_SOCKET")
 CONTAINER_NETWORK = os.environ.get("AW_CONTAINER_NETWORK")
 
@@ -212,10 +221,26 @@ def _build_container_kwargs(job: dict) -> tuple[str, list[str], dict]:
 
     run_id = job["run_id"]
     session_id = job.get("session_id")
+
+    # Preferred credential strategy (replicates agentic-workspace's
+    # docker_agent.py, per Frederico 2026-08-07): when we know the host path of
+    # the workspace's own $HOME, mount the LIVE $HOME/.claude rw DIRECTLY as the
+    # sibling container's ~/.claude — no copy, no read-only shadow — so any
+    # OAuth token refresh the CLI does persists straight back to the source of
+    # truth. Falls back to the legacy copy-into-workspace path only when $HOME
+    # has no separate host bind-mount. (Root cause fixed:
+    # aw-workspace-runner-claude-oauth-token-not-refreshed-relogin-20260807.)
+    _real_home = Path(REAL_HOME)
+    direct_home_mount = bool(WORKSPACE_HOME_HOST_DIR) and (_real_home / spec["creds_dir"]).is_dir()
+
     # Isolated per-RUN (not per-session) scratch dir — matches legacy exactly
-    # (docker_agent.py always keys by agent_id/run_id, never session_id).
+    # (docker_agent.py always keys by agent_id/run_id, never session_id). In
+    # direct-home mode it lives UNDER the real .claude that's already mounted
+    # whole (docker_agent.py does the same — no separate mount); otherwise it
+    # sits in the host-shared workspace tree and is mounted explicitly below.
     isolated_rel = f".claude/isolated/{run_id}"
-    isolated_host_dir = Path(WORKSPACE_CONTAINER_DIR) / isolated_rel
+    isolated_base = _real_home if direct_home_mount else Path(WORKSPACE_CONTAINER_DIR)
+    isolated_host_dir = isolated_base / isolated_rel
     isolated_host_dir.mkdir(parents=True, exist_ok=True)
     isolated_container_path = f"/home/ubuntu/{isolated_rel}"
 
@@ -245,67 +270,50 @@ def _build_container_kwargs(job: dict) -> tuple[str, list[str], dict]:
         host_path = f"{WORKSPACE_HOST_DIR.rstrip('/')}/{host_rel.lstrip('/')}"
         volumes[host_path] = {"bind": container_path, "mode": "ro" if ro else "rw"}
 
-    # CLI credentials — this workspace's own $HOME/.claude (etc.), installed
-    # by the code-agent-clis app's login flow, NOT the legacy monolith's
-    # data/home/ tree. This is the entire point of the fix: creds + cwd are
-    # scoped to /opt/aw-workspace, never /opt/agentic-workspace.
-    #
-    # rw, not ro (found live 2026-08-02, same day as the /home/ubuntu DAC
-    # traversal fix above): once auth actually succeeded, the CLI still
-    # failed with a read-only-filesystem error creating a session
-    # directory — claude writes session/shell-snapshot state under
-    # ~/.claude/ at runtime (not just reads credentials from it), so
-    # mounting the whole dir ro broke every real run past the login check.
-    # rw here matches what a real interactive claude session on this host
-    # already has.
-    # Mount SOURCES must live under WORKSPACE_CONTAINER_DIR (the bind-mounted
-    # tree shared with the podman host, hence shareable into sibling
-    # containers) — but the LIVE, current credentials are wherever $HOME
-    # actually resolves to for this process, which is NOT guaranteed to be
-    # WORKSPACE_CONTAINER_DIR (found live 2026-08-03: Frederico set this
-    # workspace's own $HOME back to /home/ubuntu, a plain container-layer
-    # path with no host bind-mount at all — un-shareable with sibling
-    # containers by construction, no matter what). So: resync a copy of
-    # whatever's under real $HOME into the bind-mounted tree before every
-    # spawn, then mount from there as always. Cheap (small files, `cp -a`
-    # -pu keeps it near-instant when nothing changed) and self-healing
-    # across future credential refreshes/logins that only touch $HOME.
-    _real_home = Path(os.environ.get("HOME") or "/home/ubuntu")
-    if _real_home.resolve() != Path(WORKSPACE_CONTAINER_DIR).resolve():
-        _sync_home_creds_into_workspace(_real_home, spec)
+    def _mount_abs(host_path: str, container_path: str, ro: bool = False) -> None:
+        volumes[host_path] = {"bind": container_path, "mode": "ro" if ro else "rw"}
 
     creds_dir = spec["creds_dir"]
-    if (Path(WORKSPACE_CONTAINER_DIR) / creds_dir).is_dir():
-        _mount(creds_dir, f"/home/ubuntu/{creds_dir}", ro=False)
-        # The OAuth credentials FILE itself is mounted read-only, shadowing
-        # just that one path inside the otherwise-rw creds_dir (Docker/Podman
-        # both support a more-specific bind nested inside a broader one).
-        # Found live 2026-08-06: a spawned claude process wrote an EMPTY
-        # accessToken/refreshToken back into the shared, rw-mounted
-        # .credentials.json — since every Workspace Runner job mounts the
-        # SAME persisted copy (freshened from real $HOME before each spawn,
-        # see _sync_home_creds_into_workspace above), one bad/racing write
-        # from inside a container blanked it for every OTHER concurrent or
-        # subsequent run until the next resync happened to overwrite it back
-        # from $HOME. Read-only here closes that off entirely — a spawned
-        # process can authenticate with whatever valid token it was handed,
-        # but can never corrupt the shared source of truth. $HOME itself
-        # (this process's own real credentials, refreshed by however this
-        # workspace's own interactive login/session normally happens) is
-        # unaffected either way, since resync only ever reads from it, never
-        # writes to it.
-        _cred_file = f"{creds_dir}/.credentials.json"
-        if (Path(WORKSPACE_CONTAINER_DIR) / _cred_file).is_file():
-            _mount(_cred_file, f"/home/ubuntu/{_cred_file}", ro=True)
     creds_file = spec.get("creds_file")
-    if creds_file and (Path(WORKSPACE_CONTAINER_DIR) / creds_file).is_file():
-        # Also read-only (same rationale) — this is account/onboarding
-        # config (~/.claude.json for claude), not session transcript state,
-        # so nothing needs to write it back at runtime.
-        _mount(creds_file, f"/home/ubuntu/{creds_file}", ro=True)
 
-    # Isolated run cwd (rw — the CLI writes its own session/project state here)
-    _mount(isolated_rel, isolated_container_path, ro=False)
+    if direct_home_mount:
+        # Mount the LIVE $HOME/.claude rw straight in, exactly like
+        # agentic-workspace's docker_agent.py mounts data/home/.claude rw.
+        # Same underlying file the workspace's own `claude` login writes, so a
+        # token refresh the spawned CLI performs at runtime lands on the source
+        # of truth and the NEXT run sees the fresh token — auth self-heals, no
+        # more ~8h forced relogin. Whole dir is rw because the CLI writes both
+        # refreshed tokens (.credentials.json) and session/shell-snapshot state
+        # here. (The old read-only .credentials.json shadow from 3dd2c55 was
+        # what blocked refresh persistence; the blank-token race it guarded
+        # against only fires under concurrent refreshes — acceptable for the
+        # serial run model today, revisit with a flock if agents ever run in
+        # parallel.)
+        _home = WORKSPACE_HOME_HOST_DIR.rstrip("/")
+        _mount_abs(f"{_home}/{creds_dir}", f"/home/ubuntu/{creds_dir}", ro=False)
+        if creds_file and (_real_home / creds_file).is_file():
+            _mount_abs(f"{_home}/{creds_file}", f"/home/ubuntu/{creds_file}", ro=False)
+        # Isolated cwd already lives inside the whole-.claude mount above — no
+        # separate mount (matches docker_agent.py).
+    else:
+        # Fallback — $HOME has no separate host bind-mount, so its host path is
+        # unknown to the podman daemon and can't be a sibling-mount source.
+        # Copy creds into the host-shared workspace tree and mount that copy,
+        # with .credentials.json read-only to stop a blanking write racing
+        # across concurrent runs (3dd2c55). This path CANNOT persist refreshes
+        # (the copy is overwritten from $HOME before each spawn) — kept only so
+        # these setups still authenticate for the lifetime of a fresh token.
+        if _real_home.resolve() != Path(WORKSPACE_CONTAINER_DIR).resolve():
+            _sync_home_creds_into_workspace(_real_home, spec)
+        if (Path(WORKSPACE_CONTAINER_DIR) / creds_dir).is_dir():
+            _mount(creds_dir, f"/home/ubuntu/{creds_dir}", ro=False)
+            _cred_file = f"{creds_dir}/.credentials.json"
+            if (Path(WORKSPACE_CONTAINER_DIR) / _cred_file).is_file():
+                _mount(_cred_file, f"/home/ubuntu/{_cred_file}", ro=True)
+        if creds_file and (Path(WORKSPACE_CONTAINER_DIR) / creds_file).is_file():
+            _mount(creds_file, f"/home/ubuntu/{creds_file}", ro=True)
+        # Isolated run cwd (rw — the CLI writes its own session/project state here)
+        _mount(isolated_rel, isolated_container_path, ro=False)
 
     # Workspace root mount — found live 2026-08-02: nothing above actually
     # mounted anything AT a container path named "aw-workspace" (creds go to
