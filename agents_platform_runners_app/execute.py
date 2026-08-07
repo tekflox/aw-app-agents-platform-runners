@@ -90,6 +90,36 @@ WORKSPACE_HOME_HOST_DIR = os.environ.get("AW_WORKSPACE_HOME_HOST_DIR", "")
 # live credentials the workspace's own login writes actually resolve.
 REAL_HOME = os.environ.get("HOME") or "/home/ubuntu"
 CONTAINER_SOCKET = os.environ.get("AW_CONTAINER_SOCKET")
+# Persistent path where the workspace's long-lived Claude OAuth token
+# (`claude setup-token`, valid ~1 year) is stored. Lives under
+# `.aw-workspace/` — on the persistent /opt/aw-workspace bind-mount, preserved
+# across workspace update/restart. When present it is injected into spawned
+# claude containers as CLAUDE_CODE_OAUTH_TOKEN: env-token auth doesn't rotate
+# every 8h and never writes/blanks .credentials.json, so it survives updates
+# and is immune to the shared-account refresh-token rotation that a copied
+# .credentials.json suffers (see
+# aw-workspace-runner-claude-oauth-token-not-refreshed-relogin-20260807).
+CLAUDE_OAUTH_TOKEN_FILE = os.environ.get(
+    "AW_CLAUDE_OAUTH_TOKEN_FILE",
+    os.path.join(os.environ.get("AW_WORKSPACE_HOME") or f"{WORKSPACE_CONTAINER_DIR}/.aw-workspace",
+                 "secrets", "claude_code_oauth_token"),
+)
+
+
+def _claude_oauth_token() -> str:
+    """Long-lived Claude OAuth token for spawned claude containers, if set —
+    env var first, then the persistent secret file. Empty string when neither
+    exists (falls back to the mounted .credentials.json auth)."""
+    t = (os.environ.get("CLAUDE_CODE_OAUTH_TOKEN") or "").strip()
+    if t:
+        return t
+    try:
+        p = Path(CLAUDE_OAUTH_TOKEN_FILE)
+        if p.is_file():
+            return p.read_text().strip()
+    except Exception:
+        log.warning("execute: could not read %s", CLAUDE_OAUTH_TOKEN_FILE, exc_info=True)
+    return ""
 CONTAINER_NETWORK = os.environ.get("AW_CONTAINER_NETWORK")
 
 # Same registry/prefix convention as agents-platform's own
@@ -394,6 +424,15 @@ def _build_container_kwargs(job: dict) -> tuple[str, list[str], dict]:
         env["AW_SOURCE_DEVICE"] = job["source_device"]
     env["AW_SESSION_ID"] = job.get("session_id") or ""
     env["AW_RUN_ID"] = run_id
+    # Durable auth for claude: a long-lived OAuth token (claude setup-token)
+    # injected via env. Preferred over the mounted .credentials.json because
+    # env-token auth doesn't rotate every 8h and never writes/blanks the creds
+    # file — so it survives update/restart and can't be invalidated by another
+    # environment sharing the same account's rotating refresh token.
+    if cli == "claude":
+        _oat = _claude_oauth_token()
+        if _oat:
+            env["CLAUDE_CODE_OAUTH_TOKEN"] = _oat
     # Running as a numeric uid that has no /etc/passwd entry inside the
     # image (see the "user" kwarg below) means the container never gets an
     # implicit $HOME — the CLI would otherwise look in / for its config.

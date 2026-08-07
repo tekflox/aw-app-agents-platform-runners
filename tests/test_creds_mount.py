@@ -73,6 +73,28 @@ def test_direct_home_mount_is_rw_and_uncopied(tmp_path, monkeypatch):
                    (v["bind"] for v in vols.values()))
 
 
+def test_oauth_token_injected_as_env(tmp_path, monkeypatch):
+    home = _make_home(tmp_path)
+    monkeypatch.setattr(execute_mod, "REAL_HOME", str(home))
+    monkeypatch.setattr(execute_mod, "WORKSPACE_HOME_HOST_DIR", "/host/aw-workspace-home")
+    monkeypatch.setattr(execute_mod, "WORKSPACE_HOST_DIR", "/host/aw-workspace")
+    monkeypatch.setattr(execute_mod, "WORKSPACE_CONTAINER_DIR", str(tmp_path / "ws"))
+    monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN", raising=False)
+
+    tok_file = tmp_path / "secrets" / "claude_code_oauth_token"
+    tok_file.parent.mkdir(parents=True)
+    tok_file.write_text("sk-ant-oat01-DURABLE\n")
+    monkeypatch.setattr(execute_mod, "CLAUDE_OAUTH_TOKEN_FILE", str(tok_file))
+
+    _img, _argv, kw = execute_mod._build_container_kwargs({"run_id": "r3", "cli": "claude", "prompt": "hi"})
+    # Trimmed, injected as env — durable auth that never blanks the creds file.
+    assert kw["environment"]["CLAUDE_CODE_OAUTH_TOKEN"] == "sk-ant-oat01-DURABLE"
+
+    # Not injected for a non-claude CLI (they don't read this var).
+    _img, _argv, kw2 = execute_mod._build_container_kwargs({"run_id": "r4", "cli": "codex", "prompt": "hi"})
+    assert "CLAUDE_CODE_OAUTH_TOKEN" not in kw2["environment"]
+
+
 def test_fallback_copies_and_shadows_credentials_ro(tmp_path, monkeypatch):
     home = _make_home(tmp_path)
     ws = tmp_path / "ws"
