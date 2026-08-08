@@ -145,6 +145,11 @@ def build_routes(config: dict | None = None) -> FastAPI:
             "model": body.get("model"),
             "prompt": body.get("prompt", ""),
             "session_id": body.get("session_id"),
+            # Only used by the RUNNER_WARM_CONTAINER=1 opt-in path (see
+            # warm_pool.py) — a warm container's stable name is keyed on
+            # BOTH agent_id and session_id, mirroring agents-platform's own
+            # warm_pool.py design. Absent -> that path is skipped entirely.
+            "agent_id": body.get("agent_id"),
             "allowed_tools": body.get("allowed_tools"),
             "disallowed_tools": body.get("disallowed_tools"),
             "append_system_prompt": body.get("append_system_prompt"),

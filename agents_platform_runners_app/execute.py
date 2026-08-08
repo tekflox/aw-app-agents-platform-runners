@@ -72,6 +72,8 @@ import uuid
 from pathlib import Path
 from typing import Any
 
+from . import warm_pool
+
 log = logging.getLogger("aw_apps.agents_platform_runners.execute")
 
 # Path as seen by the PODMAN DAEMON (aw-remote-host's own filesystem) — used
@@ -218,7 +220,7 @@ def _sync_home_creds_into_workspace(real_home: Path, spec: dict) -> None:
             log.warning("execute: creds resync %s -> %s failed", src, dst, exc_info=True)
 
 
-def _build_container_kwargs(job: dict) -> tuple[str, list[str], dict]:
+def _build_container_kwargs(job: dict) -> tuple[str, list[str], dict, str | None]:
     """Return (image, command_argv, docker-SDK run kwargs) for this job.
 
     Mirrors agents-platform's ``build_docker_argv`` narrowed to what a single
@@ -518,7 +520,118 @@ def _build_container_kwargs(job: dict) -> tuple[str, list[str], dict]:
     }
     if CONTAINER_NETWORK:
         kwargs["network"] = CONTAINER_NETWORK
-    return image, argv, kwargs
+    # Returned separately (not embedded in `argv`/`kwargs`) so warm mode's
+    # own command-building (see _build_warm_kwargs) can wire the SAME
+    # resolved MCP config into its differently-shaped claude_argv, instead
+    # of losing every MCP tool silently.
+    return image, argv, kwargs, mcp_config_container_path
+
+
+_SHARED_DIR = Path(__file__).resolve().parent.parent / "agent-images" / "shared"
+WARM_WRAPPER_PATH = _SHARED_DIR / "aw-warm-wrapper"
+WARM_RELAY_PATH = _SHARED_DIR / "aw-warm-relay.py"
+
+
+def _host_path_for(container_side_path: Path) -> str:
+    """Map a path inside THIS process's own container to the corresponding
+    host path the podman daemon can mount from — the same
+    WORKSPACE_CONTAINER_DIR -> WORKSPACE_HOST_DIR prefix swap every other
+    mount source in this module already relies on (see _mount() above)."""
+    rel = os.path.relpath(str(container_side_path), WORKSPACE_CONTAINER_DIR)
+    return f"{WORKSPACE_HOST_DIR.rstrip('/')}/{rel}"
+
+
+def _build_warm_kwargs(job: dict, epoch_hash: str, redis_url: str) -> tuple[str, dict]:
+    """(image, docker-SDK run kwargs) for a FRESH warm container — the
+    ``build_kwargs`` callback ``warm_pool.get_or_create()`` calls only on a
+    cold/stale session. Reuses ``_build_container_kwargs()``'s mount/env/
+    credential resolution verbatim (already correct for this host's
+    quirks — uid/gid, direct-home-mount, venv PYTHONPATH, etc; see that
+    function's own docstring) and only overrides what warm mode needs to
+    differ: long-lived (get_or_create sets detach/remove), entrypoint = the
+    wrapper script instead of the CLI directly, no prompt baked into the
+    command (fed later via FIFO through warm_pool.dispatch_turn), and the
+    stable-name labels get_or_create() matches epochs against.
+
+    claude_argv mirrors agents-platform's docker_agent.py
+    ``build_docker_argv(warm_mode=True)`` branch — same shape (--input-format
+    stream-json, --resume <session_id>, model, mcp-config, extra_args).
+    Ported as-is, INCLUDING that source's own gap: allowed_tools/
+    disallowed_tools/append_system_prompt are not wired into warm mode's
+    argv there either — flag this if it turns out to matter here too.
+    """
+    agent_id = job["agent_id"]
+    session_id = job["session_id"]
+    spec = CLI_SPECS["claude"]
+
+    image, _argv, kwargs, mcp_config_container_path = _build_container_kwargs(job)
+    kwargs = dict(kwargs)
+
+    volumes = dict(kwargs.get("volumes") or {})
+    volumes[_host_path_for(WARM_WRAPPER_PATH)] = {"bind": "/usr/local/bin/aw-warm-wrapper", "mode": "ro"}
+    volumes[_host_path_for(WARM_RELAY_PATH)] = {"bind": "/usr/local/bin/aw-warm-relay.py", "mode": "ro"}
+    kwargs["volumes"] = volumes
+
+    env = dict(kwargs.get("environment") or {})
+    env["AW_REDIS_URL"] = redis_url
+    kwargs["environment"] = env
+
+    kwargs["entrypoint"] = ["/usr/local/bin/aw-warm-wrapper"]
+    claude_argv = [spec["bin"], "--input-format", "stream-json", *spec["default_extra"]]
+    claude_argv += ["--resume", session_id]
+    model = job.get("model")
+    if model and spec.get("model_flag"):
+        claude_argv += [spec["model_flag"], model]
+    if mcp_config_container_path:
+        claude_argv += [spec["mcp_config_flag"], mcp_config_container_path]
+        if spec.get("strict_mcp_flag"):
+            claude_argv.append(spec["strict_mcp_flag"])
+    claude_argv += list(job.get("extra_args") or [])
+    kwargs["command"] = claude_argv
+
+    kwargs["labels"] = {
+        warm_pool.WARM_LABEL: "1",
+        warm_pool.AGENT_ID_LABEL: agent_id,
+        warm_pool.SESSION_ID_LABEL: session_id,
+        warm_pool.EPOCH_LABEL: epoch_hash,
+    }
+    return image, kwargs
+
+
+def _dispatch_warm_turn(client, job: dict, redis_url: str) -> None:
+    """RUNNER_WARM_CONTAINER=1 path: get-or-create this session's persistent
+    container (spawning + pulling only on a cold/stale session) and feed the
+    turn into its FIFO. Does NOT stream or wait for output — aw-warm-relay.py
+    (running inside the container) publishes stdout AND the turn's "done"
+    sentinel directly to ``run:{run_id}:events``, the SAME stream
+    execute.py's ephemeral path publishes to, so agents-platform's existing
+    consumer picks it up with zero changes and nothing else needs to happen
+    in this process once the turn is fed."""
+    import docker as docker_sdk
+
+    agent_id = job["agent_id"]
+    session_id = job["session_id"]
+    run_id = job["run_id"]
+    epoch = warm_pool.get_generation(redis_url)
+
+    image = f"{REGISTRY}/{IMAGE_PREFIX}-claude:{DEFAULT_TAG}"
+    try:
+        log.info("execute: pulling %s for warm run=%s", image, run_id)
+        client.images.pull(image)
+    except docker_sdk.errors.APIError:
+        log.warning("execute: warm image pull failed for %s (run=%s), falling back to local cache",
+                   image, run_id, exc_info=True)
+        client.images.get(image)
+
+    name = warm_pool.get_or_create(
+        client=client, agent_id=agent_id, session_id=session_id, epoch_hash=epoch,
+        build_kwargs=lambda _name, _epoch: _build_warm_kwargs(job, _epoch, redis_url),
+    )
+    log.info("execute: dispatching run=%s to warm container %s", run_id, name)
+    warm_pool.dispatch_turn(
+        client=client, name=name, run_id=run_id, prompt=job.get("prompt") or "",
+        notion_task_id=job.get("notion_task_id"), source_device=job.get("source_device"),
+    )
 
 
 def _run_job_blocking(job: dict, redis_url: str) -> None:
@@ -536,8 +649,33 @@ def _run_job_blocking(job: dict, redis_url: str) -> None:
         return
 
     import docker as docker_sdk
+
+    # RUNNER_WARM_CONTAINER=1 opt-in path (default OFF — see warm_pool.py):
+    # only for claude, and only once the caller sends agent_id (the other
+    # half of a warm container's stable name alongside session_id — see
+    # RunnerLLM._dispatch in agents-platform-multitenant). Any job missing
+    # either falls straight through to the unchanged ephemeral path below.
+    if (warm_pool.enabled() and (job.get("cli") or "claude") == "claude"
+            and job.get("agent_id") and job.get("session_id")):
+        try:
+            client = docker_sdk.DockerClient(base_url="unix://" + CONTAINER_SOCKET)
+            _dispatch_warm_turn(client, job, redis_url)
+        except Exception as e:
+            log.exception("execute: warm dispatch failed run=%s", run_id)
+            _publish_line(r, run_id, json.dumps({
+                "type": "result", "subtype": "spawn_error", "is_error": True,
+                "result": f"runner failed to dispatch warm turn: {e}",
+            }))
+            _publish_done(r, run_id, 1)
+        finally:
+            try:
+                r.close()
+            except Exception:
+                pass
+        return
+
     try:
-        image, argv, kwargs = _build_container_kwargs(job)
+        image, argv, kwargs, _mcp_config_container_path = _build_container_kwargs(job)
         client = docker_sdk.DockerClient(base_url="unix://" + CONTAINER_SOCKET)
         # Always attempt a pull, not just when the tag is missing locally —
         # a `:latest`-pinned image that already exists locally otherwise

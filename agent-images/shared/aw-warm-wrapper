@@ -1,0 +1,113 @@
+#!/bin/sh
+# aw-warm-wrapper — entrypoint for a persistent ("warm") claude container.
+#
+# Spawns ONE long-lived `claude --input-format stream-json --output-format
+# stream-json` process, fed multiple turns over a FIFO (mkfifo + opening it
+# read-write on an extra fd so it never sees EOF between docker-exec
+# writers — see the hand-validated PoC this is built from, memory file
+# project_persistent_claude_container_streamjson.md). Its stdout goes
+# through a second FIFO into aw-warm-relay.py, which publishes each turn to
+# the run's Redis Stream (same schema aw-connector-redis uses) so
+# agents-platform's existing consumer needs zero changes.
+#
+# Usage (set by docker_agent.py's warm_mode branch):
+#   aw-warm-wrapper <claude-binary-and-flags...>
+#
+# Runtime files live under $RUNDIR ($HOME-relative, NOT /aw/ — bind-mounting
+# individual files into a not-yet-existing /aw/ would create it root-owned,
+# and this image runs as USER ubuntu, see agent-images/claude/Dockerfile):
+#   $RUNDIR/fifo_in         — claude's stdin (turns fed in via `docker exec`)
+#   $RUNDIR/fifo_out        — claude's stdout, read by the relay
+#   $RUNDIR/current_run_id  — written by warm_pool.dispatch_turn() BEFORE
+#                             each turn's prompt, so the relay tags the next
+#                             lines it reads with the right run_id
+#   $RUNDIR/drain           — touched by warm_pool.drain() (`docker exec
+#                             <name> touch /aw/drain` from the host) — see
+#                             the poll loop below for how this is consumed
+#   $RUNDIR/ready           — touched once claude is spawned; warm_pool
+#                             polls for this after creating a fresh container
+set -e
+
+RUNDIR="$HOME/.aw-warm"
+mkdir -p "$RUNDIR"
+FIFO_IN="$RUNDIR/fifo_in"
+FIFO_OUT="$RUNDIR/fifo_out"
+rm -f "$FIFO_IN" "$FIFO_OUT" "$RUNDIR/drain" "$RUNDIR/ready"
+mkfifo "$FIFO_IN" "$FIFO_OUT"
+
+# Open both FIFOs read-write on their own fds. For fifo_in this is the trick
+# that keeps claude from seeing EOF between separate `docker exec` writers
+# (each exec is a distinct process that opens-writes-closes the FIFO on the
+# host side). For fifo_out it means the relay momentarily not reading never
+# blocks/SIGPIPEs claude's stdout writes.
+exec 3<>"$FIFO_IN"
+exec 4<>"$FIFO_OUT"
+
+# claude's stdin must be a SEPARATE, read-only fd (5), NOT a dup of fd 3.
+# Giving claude `<&3` directly would hand it our own O_RDWR fd — which makes
+# claude itself a writer of its own read end, so it can NEVER see EOF no
+# matter what we close (confirmed empirically: closing fd 3 alone left
+# claude running 60s+ with no further input). fd 5 is read-only, so once fd
+# 3 (the only remaining writer, held by us) is closed, the pipe correctly
+# has zero writers and claude's next read on fd 5 gets EOF and exits.
+exec 5<"$FIFO_IN"
+
+# IMPORTANT: every backgrounded child below explicitly closes fd 3 (and any
+# other fifo fd it doesn't need) on its OWN command line. A plain `&` does
+# NOT do this for you — fork() inherits ALL open fds, and exec() does not
+# drop them unless FD_CLOEXEC is set (POSIX sh's `exec N<>file` doesn't set
+# it). Without these explicit closes, claude/the relay/the TTL watcher each
+# keep their own inherited copy of fd 3 open for their whole lifetime, so
+# the pipe never actually loses its last writer no matter what the main
+# process closes — confirmed empirically: fixing only the main process's fd
+# 3 above still left claude alive 60s+ after drain (its own leftover
+# inherited fd 3 kept the pipe "written-to" from its own end).
+"$@" <&5 >"$FIFO_OUT" 2>"$RUNDIR/claude_err.log" 3<&- &
+CLAUDE_PID=$!
+echo "$CLAUDE_PID" > "$RUNDIR/claude.pid"
+
+python3 /usr/local/bin/aw-warm-relay.py "$RUNDIR" <&4 3<&- 5<&- &
+RELAY_PID=$!
+
+touch "$RUNDIR/ready"
+echo "aw-warm-wrapper: ready, claude pid=$CLAUDE_PID relay pid=$RELAY_PID" >&2
+
+# 6h TTL backstop (design constraint: enforced INSIDE the container so it's a
+# zero-actor safety net that works even if all the epoch-hash/ownership
+# tracking on the agents-platform side fails completely). A direct kill of
+# OUR OWN child process — not `docker kill`/`docker stop` from the outside,
+# so this is unrelated to (and must never be confused with) the graceful
+# drain path below or with kill_run (cli.py:84, the actual abort mechanism).
+# Closes its inherited fifo fds immediately (see the comment above the
+# claude/relay backgrounding) — this subshell doesn't touch either FIFO, but
+# without closing them it would otherwise sit on a leaked writer for the
+# entire 6h TTL, silently defeating drain().
+( exec 3<&- 4<&- 4>&- 5<&-; sleep 21600; kill "$CLAUDE_PID" 2>/dev/null || true ) &
+TTL_WATCHER_PID=$!
+
+# Graceful drain: poll (~15s, matching the idle-tick cadence in the design)
+# for $RUNDIR/drain and, once seen, close fd 3 — the ONLY remaining writer
+# on fifo_in (claude reads via the separate read-only fd 5, so it never
+# holds a write reference on itself — see the fd 5 comment above). With fd 3
+# closed, claude's next read() on fd 5 gets a real EOF and it exits on its
+# own. claude only notices on its NEXT stdin read, which only happens once
+# it's done streaming whatever turn it's currently mid-way through (this
+# CLI's turn loop is read-one-line -> respond -> read-next-line), so this
+# can never truncate an in-flight turn — an uncapped wait by construction,
+# not by an explicit timeout. No signal is ever sent to claude here; this
+# must stay mechanically separate from kill_run's SIGKILL `docker kill` (see
+# warm_pool.drain()'s docstring) — do not "simplify" this into a `docker
+# stop`/`docker kill`/`kill -TERM` later.
+while kill -0 "$CLAUDE_PID" 2>/dev/null; do
+    if [ -f "$RUNDIR/drain" ]; then
+        echo "aw-warm-wrapper: drain flag seen — closing stdin, claude exits after its current turn (if any)" >&2
+        exec 3<&-
+        break
+    fi
+    sleep 15
+done
+
+wait "$CLAUDE_PID" 2>/dev/null || true
+kill "$TTL_WATCHER_PID" 2>/dev/null || true
+kill "$RELAY_PID" 2>/dev/null || true
+exit 0

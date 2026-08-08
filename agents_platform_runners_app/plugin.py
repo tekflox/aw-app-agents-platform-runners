@@ -32,6 +32,7 @@ from pathlib import Path
 
 from . import routes as routes_mod
 from . import skills_sync as skills_sync_mod
+from . import warm_pool as warm_pool_mod
 
 log = logging.getLogger("aw_apps.agents_platform_runners")
 
@@ -110,6 +111,16 @@ class AgentsPlatformRunnersAppPlugin:
 
         self._register_skills_watchdog(ctx, config)
 
+        # This app (re)starting is one of warm_pool's invalidation triggers
+        # (mirrors agents-platform's own boot-time bump_generation — see
+        # main.py's rearm sequence) — every warm container labeled before
+        # this boot is stale by construction and drains on its next dispatch.
+        # No-op (warm_pool.enabled() False) unless RUNNER_WARM_CONTAINER=1.
+        if warm_pool_mod.enabled():
+            redis_url = config.get("shared_redis_url")
+            if redis_url:
+                warm_pool_mod.bump_generation(redis_url)
+
         log.info(
             "aw-app-agents-platform-runners activated: mcp.json servers=%s, routes mounted",
             list(mcp_doc["mcpServers"]),
@@ -156,6 +167,15 @@ class AgentsPlatformRunnersAppPlugin:
         config = getattr(ctx, "config", {}) or {}
         mcp_doc = write_mcp_json(ctx.package_dir, config)
         log.info("aw-app-agents-platform-runners config saved: mcp.json servers=%s", list(mcp_doc["mcpServers"]))
+
+        # Any settings save could change what a warm container was spawned
+        # with (mcp.json, agents_platform_base, ...) — bump generation so
+        # every warm container drains+respawns on its next dispatch, same
+        # trigger agents-platform's own config-save path fires.
+        if warm_pool_mod.enabled():
+            redis_url = config.get("shared_redis_url")
+            if redis_url:
+                warm_pool_mod.bump_generation(redis_url)
 
     async def deactivate(self) -> None:
         log.info("aw-app-agents-platform-runners deactivated")
