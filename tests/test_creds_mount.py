@@ -38,7 +38,7 @@ def _make_home(tmp_path: Path) -> Path:
 
 
 def _volumes_for(job: dict) -> dict:
-    _image, _argv, kwargs = execute_mod._build_container_kwargs(job)
+    _image, _argv, kwargs, _mcp = execute_mod._build_container_kwargs(job)
     return kwargs["volumes"]
 
 
@@ -86,12 +86,12 @@ def test_oauth_token_injected_as_env(tmp_path, monkeypatch):
     tok_file.write_text("sk-ant-oat01-DURABLE\n")
     monkeypatch.setattr(execute_mod, "CLAUDE_OAUTH_TOKEN_FILE", str(tok_file))
 
-    _img, _argv, kw = execute_mod._build_container_kwargs({"run_id": "r3", "cli": "claude", "prompt": "hi"})
+    _img, _argv, kw, _mcp = execute_mod._build_container_kwargs({"run_id": "r3", "cli": "claude", "prompt": "hi"})
     # Trimmed, injected as env — durable auth that never blanks the creds file.
     assert kw["environment"]["CLAUDE_CODE_OAUTH_TOKEN"] == "sk-ant-oat01-DURABLE"
 
     # Not injected for a non-claude CLI (they don't read this var).
-    _img, _argv, kw2 = execute_mod._build_container_kwargs({"run_id": "r4", "cli": "codex", "prompt": "hi"})
+    _img, _argv, kw2, _mcp2 = execute_mod._build_container_kwargs({"run_id": "r4", "cli": "codex", "prompt": "hi"})
     assert "CLAUDE_CODE_OAUTH_TOKEN" not in kw2["environment"]
 
 
