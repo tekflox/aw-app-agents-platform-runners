@@ -31,7 +31,8 @@
     "routes:register",
     "net:outbound",
     "secrets:own",
-    "containers:manage"
+    "containers:manage",
+    "watchdog:tasks"
   ],
   "contributes": {
     "routes": [

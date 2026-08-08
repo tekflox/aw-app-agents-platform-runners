@@ -24,14 +24,24 @@ This app installs no CLI of its own — its two jobs are:
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
 from pathlib import Path
 
 from . import routes as routes_mod
+from . import skills_sync as skills_sync_mod
 
 log = logging.getLogger("aw_apps.agents_platform_runners")
+
+# Skills-index watchdog cadences (ADR 2026-08-06). The delta task runs
+# immediately on boot — with no ack yet that first tick is a full sync — then
+# every DELTA_INTERVAL_S only POSTs when the local skill set actually changed.
+# The reconcile task ships the complete list unconditionally so the index can't
+# silently drift.
+DELTA_INTERVAL_S = 180.0
+RECONCILE_INTERVAL_S = 360.0
 
 # agents-platform_multitenant now runs as its own docker-compose stack
 # (repos/agents-platform_multitenant/docker-compose.yml), attached to the
@@ -98,10 +108,45 @@ class AgentsPlatformRunnersAppPlugin:
 
         ctx.routes.register(routes_mod.build_routes(config))
 
+        self._register_skills_watchdog(ctx, config)
+
         log.info(
             "aw-app-agents-platform-runners activated: mcp.json servers=%s, routes mounted",
             list(mcp_doc["mcpServers"]),
         )
+
+    def _register_skills_watchdog(self, ctx, config: dict) -> None:
+        """Register the decentralized skills-index sync watchdog (ADR
+        2026-08-06). Skipped (with a log) when the app isn't configured to
+        reach agents-platform-multitenant, or when the ``watchdog:tasks``
+        capability wasn't granted — the app's other jobs still work."""
+        base = config.get("agents_platform_base") or DEFAULT_AGENTS_PLATFORM_BASE
+        token = config.get("agents_platform_token")
+        if not token:
+            log.info("skills_sync: agents_platform_token not configured — "
+                     "skills index watchdog not started")
+            return
+        if not ctx.has("watchdog:tasks"):
+            log.warning("skills_sync: 'watchdog:tasks' capability not granted — "
+                        "skills index watchdog not started")
+            return
+
+        workspace = os.environ.get("AW_WORKSPACE", "aw")
+        client = skills_sync_mod.SkillsSyncClient(base=base, token=token, workspace=workspace)
+
+        async def _delta() -> None:
+            result = await asyncio.to_thread(client.sync_incremental)
+            log.info("skills_sync delta: %s", result)
+
+        async def _reconcile() -> None:
+            result = await asyncio.to_thread(client.sync_full)
+            log.info("skills_sync reconcile: %s", result)
+
+        ctx.watchdog.register("skills-sync-delta", _delta, DELTA_INTERVAL_S,
+                              run_immediately=True)
+        ctx.watchdog.register("skills-sync-reconcile", _reconcile, RECONCILE_INTERVAL_S,
+                              run_immediately=False)
+        log.info("skills_sync: watchdog registered (workspace=%s base=%s)", workspace, base)
 
     async def on_config_saved(self, ctx) -> None:
         """Regenerate mcp.json from the newly-saved config (agents_platform_base) —
