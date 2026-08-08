@@ -14,6 +14,7 @@ that the dependency actually did its job, not just that it's declared.
 """
 from __future__ import annotations
 
+import logging
 import os
 import shutil
 import subprocess
@@ -142,6 +143,12 @@ def build_routes(config: dict | None = None) -> FastAPI:
 
         body = await request.json()
         run_id = body.get("run_id") or uuid.uuid4().hex
+        # TEMP DEBUG (2026-08-08, remove once confirmed): checking whether
+        # agents-platform-multitenant's agent_id-in-payload change
+        # (runner.py) has actually been deployed yet.
+        logging.getLogger("aw_apps.agents_platform_runners.routes").info(
+            "execute_job debug: run_id=%s agent_id=%r session_id=%r",
+            run_id, body.get("agent_id"), body.get("session_id"))
         job = {
             "run_id": run_id,
             "cli": body.get("cli", "claude"),
