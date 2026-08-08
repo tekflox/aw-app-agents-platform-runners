@@ -14,7 +14,6 @@ that the dependency actually did its job, not just that it's declared.
 """
 from __future__ import annotations
 
-import logging
 import os
 import shutil
 import subprocess
@@ -145,10 +144,20 @@ def build_routes(config: dict | None = None) -> FastAPI:
         run_id = body.get("run_id") or uuid.uuid4().hex
         # TEMP DEBUG (2026-08-08, remove once confirmed): checking whether
         # agents-platform-multitenant's agent_id-in-payload change
-        # (runner.py) has actually been deployed yet.
-        logging.getLogger("aw_apps.agents_platform_runners.routes").info(
-            "execute_job debug: run_id=%s agent_id=%r session_id=%r",
-            run_id, body.get("agent_id"), body.get("session_id"))
+        # (runner.py) has actually been deployed yet. Written to a file
+        # under the shared workspace mount (not just logged) because this
+        # in-process app's own stdout isn't exposed as a named component in
+        # `aw-workspace-cli logs` — the file IS reachable from any other
+        # container sharing this workspace's filesystem mount.
+        try:
+            import time as _time
+            _dbg_path = os.path.join(execute_mod.WORKSPACE_CONTAINER_DIR, ".tmp", "execute_debug.log")
+            os.makedirs(os.path.dirname(_dbg_path), exist_ok=True)
+            with open(_dbg_path, "a") as _dbg_f:
+                _dbg_f.write(f"{_time.time():.0f} run_id={run_id} agent_id={body.get('agent_id')!r} "
+                             f"session_id={body.get('session_id')!r}\n")
+        except Exception:
+            pass
         job = {
             "run_id": run_id,
             "cli": body.get("cli", "claude"),
