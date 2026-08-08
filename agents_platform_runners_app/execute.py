@@ -433,9 +433,15 @@ def _build_container_kwargs(job: dict) -> tuple[str, list[str], dict]:
         _oat = _claude_oauth_token()
         if _oat:
             env["CLAUDE_CODE_OAUTH_TOKEN"] = _oat
-    # Running as a numeric uid that has no /etc/passwd entry inside the
-    # image (see the "user" kwarg below) means the container never gets an
-    # implicit $HOME — the CLI would otherwise look in / for its config.
+    # Must match the credential mount targets below (/home/ubuntu/...) so the
+    # spawned CLI's own $HOME-relative lookups (~/.claude, ~/.config/gh, etc.)
+    # resolve to them. podman DOES synthesize a passwd entry for the "user"
+    # kwarg's numeric uid (home = the image's WORKDIR), but that's a
+    # different, unrelated path (/opt/aw-workspace) — irrelevant here since
+    # this explicit env var always wins. /home/ubuntu itself is chmod 0770 in
+    # the image (agent-images/*/Dockerfile) specifically so this uid, which
+    # is only a member of it via --group-add below, can still write new
+    # paths under $HOME that aren't one of the pre-mounted credential dirs.
     env["HOME"] = "/home/ubuntu"
 
     # Share aw-workspace's own venv (Dockerfile) with this sibling container
