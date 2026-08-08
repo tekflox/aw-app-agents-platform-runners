@@ -23,6 +23,7 @@ import httpx
 from fastapi import FastAPI, HTTPException, Request
 
 from . import execute as execute_mod
+from . import shared_redis
 
 RUNNERS = ["claude", "codex", "copilot", "cursor-agent"]
 
@@ -127,9 +128,11 @@ def build_routes(config: dict | None = None) -> FastAPI:
         if presented != secret:
             raise HTTPException(401, "invalid or missing X-Runner-Secret")
 
-        redis_url = cfg.get("shared_redis_url")
+        redis_url = shared_redis.resolve(cfg)
         if not redis_url:
-            raise HTTPException(500, "shared_redis_url is not configured on this app's Settings")
+            raise HTTPException(
+                500, "shared_redis_url is not configured on this app's Settings and "
+                     "could not be derived from this container's default route")
 
         if not execute_mod.CONTAINER_SOCKET:
             raise HTTPException(

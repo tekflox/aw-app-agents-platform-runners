@@ -31,6 +31,7 @@ import os
 from pathlib import Path
 
 from . import routes as routes_mod
+from . import shared_redis as shared_redis_mod
 from . import skills_sync as skills_sync_mod
 from . import warm_pool as warm_pool_mod
 
@@ -117,7 +118,7 @@ class AgentsPlatformRunnersAppPlugin:
         # this boot is stale by construction and drains on its next dispatch.
         # No-op (warm_pool.enabled() False) unless RUNNER_WARM_CONTAINER=1.
         if warm_pool_mod.enabled():
-            redis_url = config.get("shared_redis_url")
+            redis_url = shared_redis_mod.resolve(config)
             if redis_url:
                 warm_pool_mod.bump_generation(redis_url)
 
@@ -173,7 +174,7 @@ class AgentsPlatformRunnersAppPlugin:
         # every warm container drains+respawns on its next dispatch, same
         # trigger agents-platform's own config-save path fires.
         if warm_pool_mod.enabled():
-            redis_url = config.get("shared_redis_url")
+            redis_url = shared_redis_mod.resolve(config)
             if redis_url:
                 warm_pool_mod.bump_generation(redis_url)
 
