@@ -161,6 +161,7 @@ def build_routes(config: dict | None = None) -> FastAPI:
             "source_device": body.get("source_device"),
             "mcp_servers": body.get("mcp_servers"),
             "dangerous_skip_permissions": body.get("dangerous_skip_permissions", True),
+            "permissions": body.get("permissions"),
         }
         execute_mod.start_job(job, redis_url)
         return {"run_id": run_id, "status": "started"}

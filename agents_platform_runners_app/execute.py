@@ -106,6 +106,13 @@ CLAUDE_OAUTH_TOKEN_FILE = os.environ.get(
     os.path.join(os.environ.get("AW_WORKSPACE_HOME") or f"{WORKSPACE_CONTAINER_DIR}/.aw-workspace",
                  "secrets", "claude_code_oauth_token"),
 )
+# aw-app-git's own data dir (fs:workspace-data — see that app's gh_auth.py
+# _sync_creds_to_data_dir()), relative to WORKSPACE_CONTAINER_DIR so it can
+# be mounted via the SAME WORKSPACE_HOST_DIR-relative helper (_mount) as
+# every other WORKSPACE_CONTAINER_DIR-rooted path in this file — matches
+# AW_WORKSPACE_HOME's own default (".aw-workspace" under the container dir,
+# see CLAUDE_OAUTH_TOKEN_FILE above), not a separate/new convention.
+GIT_CREDS_REL = ".aw-workspace/data/git"
 
 
 def _claude_oauth_token() -> str:
@@ -346,6 +353,25 @@ def _build_container_kwargs(job: dict) -> tuple[str, list[str], dict, str | None
             _mount(creds_file, f"/home/ubuntu/{creds_file}", ro=True)
         # Isolated run cwd (rw — the CLI writes its own session/project state here)
         _mount(isolated_rel, isolated_container_path, ro=False)
+
+    # Agent Config's "GitHub / Git" permission (agents-platform-multitenant's
+    # executor.py forwards permissions.get("github") through RunnerLLM's
+    # dispatch payload — see that repo's runner.py) — mount gh's own
+    # credential store + .gitconfig (mirrored into aw-app-git's data dir on
+    # login, see that app's gh_auth.py) read-only, same shape the
+    # pre-decoupling agents-platform host-path mount used
+    # (data/home/.gitconfig + .config/gh, executor.py's
+    # _perm_volumes["github"]) — just sourced from the app's own data dir
+    # instead of a hand-populated shared one. Read-only: a spawned agent
+    # container has no legitimate reason to write back into the credential
+    # aw-app-git's own login flow owns.
+    if (job.get("permissions") or {}).get("github"):
+        _git_config_gh = Path(WORKSPACE_CONTAINER_DIR) / GIT_CREDS_REL / "config-gh"
+        _git_gitconfig = Path(WORKSPACE_CONTAINER_DIR) / GIT_CREDS_REL / "gitconfig"
+        if _git_config_gh.is_dir():
+            _mount(f"{GIT_CREDS_REL}/config-gh", "/home/ubuntu/.config/gh", ro=True)
+        if _git_gitconfig.is_file():
+            _mount(f"{GIT_CREDS_REL}/gitconfig", "/home/ubuntu/.gitconfig", ro=True)
 
     # Workspace root mount — found live 2026-08-02: nothing above actually
     # mounted anything AT a container path named "aw-workspace" (creds go to
