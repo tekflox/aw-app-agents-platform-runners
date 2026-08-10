@@ -83,10 +83,12 @@ def build_mcp_servers(config: dict) -> dict:
             # aw-mcp-gateway spawns stdio upstreams with cwd defaulting to its
             # own BASE_DIR (/app), which doesn't have this app's package on
             # sys.path — explicit cwd is required so `python3 -m
-            # agents_platform_runners_app.mcp_server` resolves. AW_APP_SCAN_ROOTS
-            # mounts every installed app at this same path inside the gateway
-            # container.
-            "cwd": "/workspace/apps/agents-platform-runners",
+            # agents_platform_runners_app.mcp_server` resolves. $AW_APPS_ROOT
+            # is now mounted into the gateway container at this SAME path it
+            # has on the host (/opt/aw-workspace/apps/<id>) — no more
+            # gateway-specific /workspace/apps translation (see
+            # tekflox/aw-mcp-gateway's aw-app.json).
+            "cwd": "/opt/aw-workspace/apps/agents-platform-runners",
         }
     }
 
