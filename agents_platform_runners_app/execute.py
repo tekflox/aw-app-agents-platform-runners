@@ -384,6 +384,24 @@ def _build_container_kwargs(job: dict) -> tuple[str, list[str], dict, str | None
     if WORKSPACE_HOST_DIR:
         volumes[WORKSPACE_HOST_DIR.rstrip("/")] = {"bind": "/opt/aw-workspace", "mode": "rw"}
 
+    # Bare `aw-workspace-cli` on PATH from any cwd (Telegram request,
+    # 2026-08-11): the script is already visible at /opt/aw-workspace/
+    # aw-workspace-cli via the rw mount just above, but /opt/aw-workspace
+    # itself isn't on this image's PATH, so it only ran as `./aw-workspace-cli`
+    # from that exact cwd. Rather than overriding the container's PATH env var
+    # (which would require replicating the WHOLE image-baked PATH — e.g.
+    # /opt/agent-npm/bin, wherever this image's own npm-installed CLI bin
+    # lives — risking silently dropping an entry another agent image needs),
+    # bind the same script a second time straight into /usr/local/bin, which
+    # every agent image's baked-in PATH already includes. Mirrors the
+    # aw-warm-wrapper mount pattern below (WARM_WRAPPER_PATH). The script's
+    # own `#!/usr/bin/env python3` shebang resolves to THIS container's native
+    # python3 either way, with PYTHONPATH (set below) supplying the pure-
+    # Python deps — same cross-image-safety reasoning as that PYTHONPATH
+    # comment.
+    if WORKSPACE_HOST_DIR:
+        _mount("aw-workspace-cli", "/usr/local/bin/aw-workspace-cli", ro=True)
+
     # Legacy skills mount intentionally REMOVED 2026-08-02 (Frederico): the
     # agent's real cwd is /opt/aw-workspace now — skills for this runner
     # belong under that tree, to be built out natively later, not borrowed
