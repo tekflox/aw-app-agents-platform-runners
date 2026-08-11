@@ -599,10 +599,17 @@ def _build_warm_kwargs(job: dict, epoch_hash: str, redis_url: str) -> tuple[str,
 
     claude_argv mirrors agents-platform's docker_agent.py
     ``build_docker_argv(warm_mode=True)`` branch — same shape (--input-format
-    stream-json, --resume <session_id>, model, mcp-config, extra_args).
-    Ported as-is, INCLUDING that source's own gap: allowed_tools/
-    disallowed_tools/append_system_prompt are not wired into warm mode's
-    argv there either — flag this if it turns out to matter here too.
+    stream-json, --resume <session_id>, model, mcp-config, extra_args), PLUS
+    allowed_tools/disallowed_tools/append_system_prompt/dangerous_skip_
+    permissions — the cold path's `_build_container_kwargs` (see its own
+    comment above the skip-permissions block) wires all of these into its
+    `argv`, but this function built `claude_argv` from scratch and never
+    picked them up. Turn 1 of a session is always cold (no session_id yet
+    to key a warm container on — see `_run_job_blocking`), so the flags
+    silently vanishing only showed up starting turn 2, e.g.
+    --dangerously-skip-permissions missing meant Claude Code's interactive
+    permission gate kicked in for real on a supposedly-unattended runner
+    ("This command requires approval") — found live 2026-08-11.
     """
     agent_id = job["agent_id"]
     session_id = job["session_id"]
@@ -630,6 +637,20 @@ def _build_warm_kwargs(job: dict, epoch_hash: str, redis_url: str) -> tuple[str,
         claude_argv += [spec["mcp_config_flag"], mcp_config_container_path]
         if spec.get("strict_mcp_flag"):
             claude_argv.append(spec["strict_mcp_flag"])
+
+    allowed = job.get("allowed_tools") or []
+    if allowed:
+        claude_argv += ["--allowed-tools", ",".join(allowed)]
+    disallowed = job.get("disallowed_tools") or []
+    if disallowed:
+        claude_argv += ["--disallowed-tools", ",".join(disallowed)]
+    if job.get("append_system_prompt"):
+        claude_argv += ["--append-system-prompt", job["append_system_prompt"]]
+    # Same default-True + per-job-override contract as the cold path (see
+    # _build_container_kwargs's comment on this same check).
+    if job.get("dangerous_skip_permissions", True) and spec.get("skip_perms_flag"):
+        claude_argv.append(spec["skip_perms_flag"])
+
     claude_argv += list(job.get("extra_args") or [])
     kwargs["command"] = claude_argv
 
