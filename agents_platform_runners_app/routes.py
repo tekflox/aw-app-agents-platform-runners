@@ -44,9 +44,20 @@ def _runner_status(name: str) -> dict:
 
 def build_routes(config: dict | None = None) -> FastAPI:
     """Mode-agnostic factory — call this fresh for each mode (plugin.py /
-    __main__.py both call it exactly once)."""
+    __main__.py both call it exactly once).
+
+    ``cfg`` is bound to the SAME dict object every route closure below
+    reads from. plugin.py relies on that identity: it hands us its own
+    ``self._live_config`` and, on every ``on_config_saved``, mutates that
+    dict IN PLACE (clear()+update(), never rebinds it to a new dict) so a
+    config save (e.g. rotating ``execute_secret`` after a wiped-secret
+    reinstall, found live 2026-08-11) takes effect on the very next
+    request — no full workspace-process restart required. Using
+    ``config or {}`` here would silently break that identity the moment
+    the live config is empty (``{} or {}`` evaluates the right-hand
+    literal, a NEW dict) — use an explicit None-check instead."""
     app = FastAPI(title="agents-platform-runners")
-    cfg = config or {}
+    cfg = config if config is not None else {}
 
     @app.get("/status")
     async def status() -> dict:

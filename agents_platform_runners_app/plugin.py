@@ -103,16 +103,28 @@ def write_mcp_json(package_dir: str, config: dict) -> dict:
 
 
 class AgentsPlatformRunnersAppPlugin:
+    def __init__(self) -> None:
+        # The exact dict object build_routes()'s /execute, /register and
+        # /status closures read `cfg` from. Kept as a persistent instance
+        # attribute (not a local var) so on_config_saved() below can mutate
+        # it IN PLACE — see routes.py's build_routes docstring for why that
+        # identity matters: it's what lets a config save (e.g. restoring a
+        # secret wiped by an uninstall/reinstall) take effect on the very
+        # next HTTP request, with no app or workspace restart needed.
+        self._live_config: dict = {}
+
     async def activate(self, ctx) -> None:
         with open(os.path.join(ctx.package_dir, "aw-app.json"), encoding="utf-8") as f:
             json.load(f)  # validated at install time — just confirms the file is readable here
 
         config = getattr(ctx, "config", {}) or {}
-        mcp_doc = write_mcp_json(ctx.package_dir, config)
+        self._live_config.clear()
+        self._live_config.update(config)
+        mcp_doc = write_mcp_json(ctx.package_dir, self._live_config)
 
-        ctx.routes.register(routes_mod.build_routes(config))
+        ctx.routes.register(routes_mod.build_routes(self._live_config))
 
-        self._register_skills_watchdog(ctx, config)
+        self._register_skills_watchdog(ctx, self._live_config)
 
         # This app (re)starting is one of warm_pool's invalidation triggers
         # (mirrors agents-platform's own boot-time bump_generation — see
@@ -166,9 +178,22 @@ class AgentsPlatformRunnersAppPlugin:
         """Regenerate mcp.json from the newly-saved config (agents_platform_base) —
         aw-workspace's save_app_config calls this BEFORE telling the MCP
         Gateway to /reload (contributes.mcp.reload_on_save), so the gateway
-        always scans the file this write just produced."""
+        always scans the file this write just produced.
+
+        Also mutates self._live_config IN PLACE (never rebinds it) — that's
+        the same dict object build_routes()'s /execute, /register, /status
+        closures hold as `cfg`, so e.g. a rotated execute_secret or
+        agents_platform_token is honoured on this app's very next HTTP
+        request. Before this fix (found live 2026-08-11, after an
+        uninstall+reinstall wiped 3 secret config fields), a config save
+        only updated the on-disk config — the routes' in-memory `cfg` was
+        still the stale snapshot from activate(), so nothing short of a
+        full workspace-process restart made a saved secret actually take
+        effect."""
         config = getattr(ctx, "config", {}) or {}
-        mcp_doc = write_mcp_json(ctx.package_dir, config)
+        self._live_config.clear()
+        self._live_config.update(config)
+        mcp_doc = write_mcp_json(ctx.package_dir, self._live_config)
         log.info("aw-app-agents-platform-runners config saved: mcp.json servers=%s", list(mcp_doc["mcpServers"]))
 
         # Any settings save could change what a warm container was spawned
