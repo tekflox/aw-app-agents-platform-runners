@@ -192,7 +192,34 @@ def _redis_client(redis_url: str):
     return redis.from_url(redis_url, decode_responses=True, socket_connect_timeout=5, socket_timeout=30)
 
 
+_attach_module = None
+
+
+def _attach_helper():
+    """Load ``agent-images/shared/aw_attach.py`` — the SAME file the warm
+    relay imports inside the spawned container, so both output paths rewrite
+    identically and there is only one copy to keep correct. It lives outside
+    this package (it has to be bind-mountable into an image that has no
+    access to this app's python env), hence the explicit path load."""
+    global _attach_module
+    if _attach_module is None:
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("aw_attach", str(ATTACH_HELPER_PATH))
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        _attach_module = mod
+    return _attach_module
+
+
 def _publish_line(r, run_id: str, line: str) -> None:
+    # Cold/ephemeral path's counterpart to the rewrite aw-warm-relay.py does
+    # for warm containers — an [[ATTACH]] pointing at a file only reachable on
+    # this side of the wall is swapped for an artefact reference before the
+    # line reaches agents-platform. See aw_attach.py.
+    try:
+        line = _attach_helper().rewrite_stream_line(line, run_id)
+    except Exception:
+        log.exception("execute: attach rewrite failed run=%s (line published unchanged)", run_id)
     try:
         r.xadd(_stream_key(run_id), {"line": line}, maxlen=STREAM_MAXLEN, approximate=True)
     except Exception:
@@ -574,6 +601,7 @@ def _build_container_kwargs(job: dict) -> tuple[str, list[str], dict, str | None
 _SHARED_DIR = Path(__file__).resolve().parent.parent / "agent-images" / "shared"
 WARM_WRAPPER_PATH = _SHARED_DIR / "aw-warm-wrapper"
 WARM_RELAY_PATH = _SHARED_DIR / "aw-warm-relay.py"
+ATTACH_HELPER_PATH = _SHARED_DIR / "aw_attach.py"
 
 
 def _host_path_for(container_side_path: Path) -> str:
@@ -621,6 +649,10 @@ def _build_warm_kwargs(job: dict, epoch_hash: str, redis_url: str) -> tuple[str,
     volumes = dict(kwargs.get("volumes") or {})
     volumes[_host_path_for(WARM_WRAPPER_PATH)] = {"bind": "/usr/local/bin/aw-warm-wrapper", "mode": "ro"}
     volumes[_host_path_for(WARM_RELAY_PATH)] = {"bind": "/usr/local/bin/aw-warm-relay.py", "mode": "ro"}
+    # Sibling module the relay imports (it adds its own dirname to sys.path),
+    # so it has to land in the SAME directory as the relay, not just anywhere
+    # importable. Absent → the relay logs and runs without attach rewriting.
+    volumes[_host_path_for(ATTACH_HELPER_PATH)] = {"bind": "/usr/local/bin/aw_attach.py", "mode": "ro"}
     kwargs["volumes"] = volumes
 
     env = dict(kwargs.get("environment") or {})

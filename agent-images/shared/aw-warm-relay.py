@@ -35,6 +35,27 @@ import sys
 
 import redis
 
+# aw_attach lives outside the image (it must be editable without a rebuild),
+# so its directory goes on sys.path explicitly. Two candidates, in order:
+#   1. next to this script — execute.py bind-mounts it there;
+#   2. the workspace tree, which every agent container already mounts.
+# (2) is not redundant: it makes the rewrite work on the NEXT warm container
+# after a deploy, without waiting for a workspace restart to pick up the new
+# mount in _build_warm_kwargs.
+for _cand in (
+    os.path.dirname(os.path.abspath(__file__)),
+    os.path.join(os.environ.get("AW_WORKSPACE_CONTAINER_DIR", "/opt/aw-workspace"),
+                 "apps", "agents-platform-runners", "agent-images", "shared"),
+):
+    if os.path.isfile(os.path.join(_cand, "aw_attach.py")):
+        sys.path.insert(0, _cand)
+        break
+try:
+    import aw_attach
+except Exception as _e:  # pragma: no cover - a missing helper must not kill the relay
+    aw_attach = None
+    print(f"aw-warm-relay: attachment rewriting disabled ({_e})", file=sys.stderr)
+
 
 def main() -> int:
     if len(sys.argv) < 2:
@@ -59,6 +80,15 @@ def main() -> int:
             continue
         run_id = current_run_id()
         stream_key = f"run:{run_id}:events"
+        # An [[ATTACH: /local/path]] the agent wrote is readable HERE and
+        # nowhere near the Telegram connector's container — swap it for a
+        # reference that side can resolve before the line leaves this host.
+        # See aw_attach.py's module docstring.
+        if aw_attach is not None:
+            try:
+                line = aw_attach.rewrite_stream_line(line, run_id)
+            except Exception as e:
+                print(f"aw-warm-relay: attach rewrite failed ({e})", file=sys.stderr)
         try:
             r.xadd(stream_key, {"type": "stdout", "line": line}, maxlen=50_000, approximate=True)
         except Exception as e:
