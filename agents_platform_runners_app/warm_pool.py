@@ -14,10 +14,14 @@ translates the docker-ACCESS mechanism to match this app's own substrate:
   locks here are ``threading.Lock``, not ``asyncio.Lock``, and there is no
   ``await`` anywhere in this module.
 
-Gated behind ``RUNNER_WARM_CONTAINER=1`` (default OFF) — see `enabled()`.
-Callers (execute.py) must never invoke anything here unless `enabled()` is
-true AND the job is for the "claude" CLI with both agent_id and session_id
-set (warm containers are keyed by both, same as the original).
+Warm mode is ON by default since 0.32.0 and is switched off through this
+app's own persisted config (``warm_container: false``) — see `enabled()` /
+`configure()` for the precedence rules and for why the previous
+host-env-only gate (``RUNNER_WARM_CONTAINER=1``, default OFF) could not be
+kept. Callers (execute.py) must never invoke anything here unless
+`enabled()` is true AND the job is for the "claude" CLI with both agent_id
+and session_id set (warm containers are keyed by both, same as the
+original).
 
 **Not yet validated against a live podman socket** (ported 2026-08-08) —
 this app's own containers:manage capability is only reachable from its own
@@ -58,8 +62,62 @@ WARM_TTL_S = 21600
 GENERATION_KEY = "warm:config_generation"
 
 
+ENV_VAR = "RUNNER_WARM_CONTAINER"
+
+# Resolved from this app's persisted config by `configure()` (called from
+# plugin.activate + plugin.on_config_saved). Default True: warm is the
+# DEFAULT mode since 0.32.0, opt-OUT rather than opt-in.
+_config_enabled: bool = True
+
+_FALSEY = {"0", "false", "no", "off", ""}
+
+
+def _truthy(raw: Any) -> bool:
+    """Config values arrive as real booleans from a JSON-schema boolean
+    field, but env vars (and a hand-edited config) are strings — accept both
+    rather than treating the string "false" as true."""
+    if isinstance(raw, bool):
+        return raw
+    return str(raw).strip().lower() not in _FALSEY
+
+
+def configure(config: dict | None) -> bool:
+    """Resolve warm mode from this app's persisted config and remember it.
+
+    The switch lived in the HOST's environment (``RUNNER_WARM_CONTAINER=1``)
+    until 0.32.0, which was not survivable: aw-remote-host's
+    ``bootstrap/workspace/install.sh`` only forwards that var into the
+    workspace container when the host's OWN aw-remote-host process has it
+    set, so every workspace recreate (i.e. every update/deploy) silently
+    dropped a hand-set flag and the whole feature turned itself back off —
+    observed repeatedly, last on 2026-08-12. On a nested BYOD host the
+    aw-remote-host process is itself containerised, so there is no reachable
+    place to set that env durably from inside the workspace at all.
+
+    App config, by contrast, is persisted in the workspace DB and round-trips
+    through aw-backend's AppInstall.config, so it survives recreates,
+    updates and reinstalls (see the ``public`` field's note in aw-app.json
+    for the reinstall half of that reasoning).
+    """
+    global _config_enabled
+    raw = (config or {}).get("warm_container")
+    _config_enabled = True if raw is None else _truthy(raw)
+    return enabled()
+
+
 def enabled() -> bool:
-    return os.environ.get("RUNNER_WARM_CONTAINER") == "1"
+    """True when warm containers should be used.
+
+    Precedence: an explicitly-set ``RUNNER_WARM_CONTAINER`` env var still
+    wins (kept as a per-host escape hatch — e.g. forcing warm off on a host
+    whose podman socket can't sustain long-lived containers, without
+    touching shared app config), otherwise the persisted config decides,
+    which defaults to ON.
+    """
+    raw = os.environ.get(ENV_VAR)
+    if raw is not None and raw.strip() != "":
+        return _truthy(raw)
+    return _config_enabled
 
 
 def warm_container_name(agent_id: str, session_id: str) -> str:

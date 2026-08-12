@@ -715,7 +715,8 @@ def _run_job_blocking(job: dict, redis_url: str) -> None:
 
     import docker as docker_sdk
 
-    # RUNNER_WARM_CONTAINER=1 opt-in path (default OFF — see warm_pool.py):
+    # Warm path (ON by default since 0.32.0, switched off with the
+    # warm_container config field — see warm_pool.enabled()/configure()):
     # only for claude, and only once the caller sends agent_id (the other
     # half of a warm container's stable name alongside session_id — see
     # RunnerLLM._dispatch in agents-platform-multitenant). Any job missing

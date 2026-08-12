@@ -126,12 +126,19 @@ class AgentsPlatformRunnersAppPlugin:
 
         self._register_skills_watchdog(ctx, self._live_config)
 
+        # Resolve warm mode from persisted config BEFORE anything asks
+        # warm_pool.enabled() — config is the source of truth since 0.32.0
+        # (default ON), with the RUNNER_WARM_CONTAINER env var left as a
+        # per-host escape hatch. See warm_pool.configure()'s docstring for
+        # why the env-only gate had to go.
+        warm_on = warm_pool_mod.configure(self._live_config)
+        log.info("warm containers: %s", "enabled" if warm_on else "disabled")
+
         # This app (re)starting is one of warm_pool's invalidation triggers
         # (mirrors agents-platform's own boot-time bump_generation — see
         # main.py's rearm sequence) — every warm container labeled before
         # this boot is stale by construction and drains on its next dispatch.
-        # No-op (warm_pool.enabled() False) unless RUNNER_WARM_CONTAINER=1.
-        if warm_pool_mod.enabled():
+        if warm_on:
             redis_url = shared_redis_mod.resolve(config)
             if redis_url:
                 warm_pool_mod.bump_generation(redis_url)
@@ -196,11 +203,16 @@ class AgentsPlatformRunnersAppPlugin:
         mcp_doc = write_mcp_json(ctx.package_dir, self._live_config)
         log.info("aw-app-agents-platform-runners config saved: mcp.json servers=%s", list(mcp_doc["mcpServers"]))
 
+        # A save is also how warm mode itself is turned on/off (the
+        # warm_container field) — re-resolve before acting on it.
+        warm_on = warm_pool_mod.configure(self._live_config)
+        log.info("warm containers: %s", "enabled" if warm_on else "disabled")
+
         # Any settings save could change what a warm container was spawned
         # with (mcp.json, agents_platform_base, ...) — bump generation so
         # every warm container drains+respawns on its next dispatch, same
         # trigger agents-platform's own config-save path fires.
-        if warm_pool_mod.enabled():
+        if warm_on:
             redis_url = shared_redis_mod.resolve(config)
             if redis_url:
                 warm_pool_mod.bump_generation(redis_url)
