@@ -6,7 +6,7 @@
   "description": "Depends on the code-agent-clis app (claude/codex/copilot/cursor-agent already installed at /usr/local/bin, single source of truth) so this workspace's agent-CLI runners are what agents-platform_multitenant's agent sessions use, and contributes the ported \"aw-agents\" MCP (agent_mcp.py) so agents-platform is controllable as MCP tools from this workspace.",
   "tier": "inprocess",
   "requires_ui_refresh": false,
-  "category": "dev-tools",
+  "category": "Runnables",
   "publisher": "TekFlox",
   "resource_estimate": {
     "cpu": "low",
@@ -52,6 +52,12 @@
           "type": "declarative",
           "spec": "windows/main.json"
         }
+      }
+    ],
+    "settings_panels": [
+      {
+        "id": "agents-platform-runners.settings-panel",
+        "window": "agents-platform-runners.settings"
       }
     ],
     "skills": [
