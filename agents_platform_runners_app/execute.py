@@ -745,8 +745,6 @@ def _run_job_blocking(job: dict, redis_url: str) -> None:
         log.exception("execute: could not build redis client for run=%s — job aborted", run_id)
         return
 
-    import docker as docker_sdk
-
     # Inbound attachments ride along in the dispatch payload — write them to
     # the agent's disk and point the prompt at the real files BEFORE either
     # path below consumes job["prompt"] (cold bakes it into argv, warm feeds
@@ -759,6 +757,8 @@ def _run_job_blocking(job: dict, redis_url: str) -> None:
     except Exception:
         log.exception("execute: inbound attachment materialise failed run=%s "
                       "(prompt left with its URLs)", run_id)
+
+    import docker as docker_sdk
 
     # Warm path (ON by default since 0.32.0, switched off with the
     # warm_container config field — see warm_pool.enabled()/configure()):
