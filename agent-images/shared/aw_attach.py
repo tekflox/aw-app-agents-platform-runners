@@ -86,9 +86,12 @@ MAX_ATTACH_BYTES = 15 * 1024 * 1024
 WORKSPACE_DIR = os.environ.get("AW_WORKSPACE_CONTAINER_DIR", "/opt/aw-workspace")
 _MCP_JSON = os.path.join(WORKSPACE_DIR, "apps", "agents-platform-runners", "mcp.json")
 
-# path -> artefact name, so a file mentioned in both an assistant message and
-# the final result event is uploaded once per process, not once per mention.
+# (run_id, path) -> artefact name, so a file mentioned in both an assistant
+# message and the final result event is uploaded once, not once per mention.
+# Bounded because the warm relay imports this and never exits — it would
+# otherwise accumulate an entry per attachment for the container's whole life.
 _uploaded: dict[tuple[str, str], str] = {}
+_UPLOAD_MEMO_MAX = 256
 
 
 def _credentials() -> tuple[str, str]:
@@ -177,6 +180,8 @@ def rewrite_text(text: str, run_id: str) -> str:
                 with open(path, "rb") as f:
                     data = f.read()
                 name = _upload(run_id, path, data)
+                if len(_uploaded) >= _UPLOAD_MEMO_MAX:
+                    _uploaded.clear()
                 _uploaded[key] = name
             if not name:
                 return whole
@@ -187,6 +192,86 @@ def rewrite_text(text: str, run_id: str) -> str:
         return f"[[ATTACH: artefact://{run_id}/{name}{tail}]]"
 
     return _ATTACH_RE.sub(_sub, text)
+
+
+# ---------------------------------------------------------------------------
+# Inbound — the same wall, crossed the other way
+# ---------------------------------------------------------------------------
+#
+# A file the user attaches in Telegram reaches the agent as a gallery URL,
+# because a path on AP's disk means nothing on the runner's machine. That
+# works, but it makes every agent curl its own attachment before it can look
+# at it. So AP now sends the bytes WITH the job (`attachments` in the
+# /execute payload, see api/gallery.py::inline_attachments_for_prompt) and
+# this side drops them on the agent's disk and rewrites the URL in the prompt
+# to the local path. Same trick as the outbound rewrite, mirrored.
+
+# Where inbound files land, relative to the workspace root. The agent
+# container binds the workspace tree at AGENT_WORKSPACE_BIND, so a file
+# written here by the runner process is readable by the agent at the path we
+# hand it, with no copy.
+INBOUND_REL_DIR = os.path.join(".tmp", "agent-inbound")
+AGENT_WORKSPACE_BIND = "/opt/aw-workspace"
+INBOUND_RETENTION_S = 7 * 24 * 3600
+
+
+def _prune_inbound(root: str) -> None:
+    """Best-effort: drop run dirs older than the retention window. Inbound
+    files are small but a run happens every turn, so without this the tree
+    grows forever."""
+    import shutil
+    import time
+    try:
+        cutoff = time.time() - INBOUND_RETENTION_S
+        for entry in os.scandir(root):
+            if entry.is_dir() and entry.stat().st_mtime < cutoff:
+                shutil.rmtree(entry.path, ignore_errors=True)
+    except Exception:
+        pass
+
+
+def materialise_inbound(prompt: str, attachments: "list[dict] | None", run_id: str,
+                        workspace_dir: str = WORKSPACE_DIR,
+                        agent_bind: str = AGENT_WORKSPACE_BIND) -> str:
+    """Write each inbound attachment to the agent's disk and return ``prompt``
+    with every ``placeholder`` swapped for the file's path as the AGENT sees
+    it.
+
+    ``workspace_dir`` is this process's view of the workspace tree;
+    ``agent_bind`` is where the spawned container binds that same tree. They
+    are the same string in every deployment so far, but they are not the same
+    thing, and the path that goes into the prompt has to be the agent's.
+
+    An attachment that can't be written is left as its URL — still fetchable,
+    which is what the agent did before this existed.
+    """
+    if not attachments or not prompt:
+        return prompt
+    root = os.path.join(workspace_dir, INBOUND_REL_DIR)
+    agent_root = os.path.join(agent_bind, INBOUND_REL_DIR)
+    try:
+        os.makedirs(root, exist_ok=True)
+        _prune_inbound(root)
+        run_dir = os.path.join(root, re.sub(r"[^A-Za-z0-9._-]", "_", run_id or "unknown"))
+        os.makedirs(run_dir, exist_ok=True)
+    except Exception:
+        return prompt
+
+    for att in attachments:
+        try:
+            placeholder = att.get("placeholder") or ""
+            content = att.get("content") or ""
+            if not placeholder or not content or placeholder not in prompt:
+                continue
+            name = re.sub(r"[^A-Za-z0-9._-]", "_", os.path.basename(att.get("name") or "")) or "attachment"
+            dest = os.path.join(run_dir, name)
+            with open(dest, "wb") as f:
+                f.write(base64.b64decode(content))
+            agent_path = os.path.join(agent_root, os.path.basename(run_dir), name)
+            prompt = prompt.replace(placeholder, agent_path)
+        except Exception:
+            continue
+    return prompt
 
 
 def rewrite_stream_line(line: str, run_id: str) -> str:

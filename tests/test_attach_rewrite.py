@@ -1,14 +1,21 @@
-"""``[[ATTACH]]`` rewriting — the runner half of cross-host attachments.
+"""Attachments across the runner/connector host boundary — both directions.
 
-An agent writes ``[[ATTACH: /opt/aw-workspace/.tmp/chart.png]]``. The Telegram
-connector in agents-platform_multitenant then does ``os.path.exists(path)``
-against ITS OWN filesystem — a different machine — so the block was dropped
-with nothing but a log line and the user saw neither file nor error.
+The agent CLI runs in a nested podman container on aw-remote-host; the
+Telegram connector in agents-platform_multitenant runs under docker on the
+outer bare-metal host. Neither can open a path the other produced.
 
-``agent-images/shared/aw_attach.py`` fixes that on this side, where the bytes
-are still readable: upload to the run, rewrite the marker to ``artefact://``.
-These tests cover the wiring and the do-no-harm guarantees; the upload itself
-is exercised against a live AP separately (it needs a real run to attach to).
+* **Outbound** — an agent writes ``[[ATTACH: /opt/aw-workspace/.tmp/x.png]]``
+  and ``_deliver_reply``'s ``os.path.exists()`` misses, dropping the block
+  with nothing but a log line. Fixed on this side, where the bytes are still
+  readable: upload to the run, rewrite to ``artefact://``.
+* **Inbound** — a file the user attaches arrives as a gallery URL the agent
+  has to download before it can look at it. AP now sends the bytes with the
+  job and this side writes them to the agent's own disk, rewriting the URL in
+  the prompt to that path.
+
+Both live in ``agent-images/shared/aw_attach.py``. These tests cover the
+wiring and the do-no-harm guarantees; the outbound upload itself is exercised
+against a live AP separately (it needs a real run to attach to).
 
 Run: .venv/aw/bin/python -m pytest tests/test_attach_rewrite.py
 """
@@ -195,3 +202,155 @@ class TestRewriteSuccess:
         evt = json.loads(self.mod.rewrite_stream_line(line, "run-9"))
         assert evt["subtype"] == "success" and evt["is_error"] is False
         assert "artefact://run-9/" in evt["result"]
+
+
+class TestMaterialiseInbound:
+    """The other direction: AP ships the user's attachment inline with the
+    job, the runner writes it to the agent's disk and points the prompt at
+    the real file instead of a URL the agent would have to download."""
+
+    def setup_method(self):
+        self.mod = execute_mod._attach_helper()
+
+    def _att(self, name="photo.jpg", data=b"\xff\xd8\xffbytes",
+             url="https://ap.test/api/gallery/direct/tok123"):
+        import base64
+        return {"placeholder": url, "name": name, "mime": "image/jpeg",
+                "content": base64.b64encode(data).decode()}
+
+    def test_file_lands_on_disk_and_prompt_points_at_it(self, tmp_path):
+        att = self._att()
+        prompt = f"[UPLOAD] Image available at: {att['placeholder']}\n\nwhat is this?"
+        out = self.mod.materialise_inbound(prompt, [att], "run-7",
+                                           workspace_dir=str(tmp_path),
+                                           agent_bind=str(tmp_path))
+        assert att["placeholder"] not in out
+        path = out.split("at: ")[1].split("\n")[0]
+        assert Path(path).is_file()
+        assert Path(path).read_bytes() == b"\xff\xd8\xffbytes"
+        assert "what is this?" in out
+
+    def test_path_handed_over_is_the_agents_view_not_the_runners(self, tmp_path):
+        # The runner writes through its own mount; the agent sees the same
+        # tree at a different root. The prompt must carry the AGENT's path.
+        att = self._att()
+        out = self.mod.materialise_inbound(att["placeholder"], [att], "run-7",
+                                           workspace_dir=str(tmp_path),
+                                           agent_bind="/opt/aw-workspace")
+        assert out.startswith("/opt/aw-workspace/.tmp/agent-inbound/run-7/")
+        assert str(tmp_path) not in out
+        # ...and the bytes really are on disk under the runner's own root.
+        written = Path(str(tmp_path)) / ".tmp" / "agent-inbound" / "run-7" / "photo.jpg"
+        assert written.is_file()
+
+    def test_runs_are_isolated_from_each_other(self, tmp_path):
+        a = self._att(name="x.png", data=b"aaa", url="https://ap.test/api/gallery/direct/t1")
+        b = self._att(name="x.png", data=b"bbb", url="https://ap.test/api/gallery/direct/t2")
+        pa = self.mod.materialise_inbound(a["placeholder"], [a], "run-A",
+                                          workspace_dir=str(tmp_path), agent_bind=str(tmp_path))
+        pb = self.mod.materialise_inbound(b["placeholder"], [b], "run-B",
+                                          workspace_dir=str(tmp_path), agent_bind=str(tmp_path))
+        assert pa != pb
+        assert Path(pa).read_bytes() == b"aaa"
+        assert Path(pb).read_bytes() == b"bbb"
+
+    def test_multiple_attachments_each_get_their_own_placeholder_swapped(self, tmp_path):
+        a = self._att(name="a.png", data=b"aaa", url="https://ap.test/api/gallery/direct/t1")
+        b = self._att(name="b.png", data=b"bbb", url="https://ap.test/api/gallery/direct/t2")
+        prompt = f"first {a['placeholder']} then {b['placeholder']}"
+        out = self.mod.materialise_inbound(prompt, [a, b], "run-7",
+                                           workspace_dir=str(tmp_path), agent_bind=str(tmp_path))
+        assert a["placeholder"] not in out and b["placeholder"] not in out
+        assert out.count(".tmp/agent-inbound/run-7/") == 2
+
+    def test_filename_is_sanitised(self, tmp_path):
+        att = self._att(name="../../etc/passwd")
+        out = self.mod.materialise_inbound(att["placeholder"], [att], "run-7",
+                                           workspace_dir=str(tmp_path), agent_bind=str(tmp_path))
+        assert ".." not in out
+        assert Path(out).parent.name == "run-7"
+
+    def test_no_attachments_is_a_noop(self, tmp_path):
+        prompt = "just text"
+        assert self.mod.materialise_inbound(prompt, None, "run-7",
+                                            workspace_dir=str(tmp_path)) == prompt
+        assert self.mod.materialise_inbound(prompt, [], "run-7",
+                                            workspace_dir=str(tmp_path)) == prompt
+
+    def test_placeholder_absent_from_prompt_writes_nothing(self, tmp_path):
+        att = self._att()
+        out = self.mod.materialise_inbound("unrelated prompt", [att], "run-7",
+                                           workspace_dir=str(tmp_path), agent_bind=str(tmp_path))
+        assert out == "unrelated prompt"
+
+    def test_corrupt_payload_leaves_the_url_in_place(self, tmp_path):
+        att = self._att()
+        att["content"] = "!!!not base64!!!"
+        prompt = f"see {att['placeholder']}"
+        out = self.mod.materialise_inbound(prompt, [att], "run-7",
+                                           workspace_dir=str(tmp_path), agent_bind=str(tmp_path))
+        assert out == prompt
+
+    def test_old_run_dirs_are_pruned(self, tmp_path):
+        import os
+        import time
+        root = tmp_path / ".tmp" / "agent-inbound"
+        stale = root / "run-old"
+        stale.mkdir(parents=True)
+        (stale / "x.png").write_bytes(b"x")
+        old = time.time() - self.mod.INBOUND_RETENTION_S - 60
+        os.utime(stale, (old, old))
+        att = self._att()
+        self.mod.materialise_inbound(att["placeholder"], [att], "run-new",
+                                     workspace_dir=str(tmp_path), agent_bind=str(tmp_path))
+        assert not stale.exists()
+        assert (root / "run-new").is_dir()
+
+
+class TestInboundWiring:
+    def test_execute_route_forwards_attachments(self, monkeypatch):
+        from fastapi.testclient import TestClient
+
+        from agents_platform_runners_app.routes import build_routes
+
+        captured = {}
+        monkeypatch.setattr(execute_mod, "start_job", lambda job, url: captured.update(job))
+        monkeypatch.setattr(execute_mod, "CONTAINER_SOCKET", "unix:///fake.sock")
+        client = TestClient(build_routes({
+            "execute_secret": "s3cr3t",
+            "shared_redis_url": "redis://example.test:6379/0",
+        }))
+        atts = [{"placeholder": "https://ap.test/api/gallery/direct/t1",
+                 "name": "a.png", "mime": "image/png", "content": "eA=="}]
+        resp = client.post("/execute", headers={"x-runner-secret": "s3cr3t"},
+                           json={"prompt": "hi", "attachments": atts})
+        assert resp.status_code == 200
+        assert captured.get("attachments") == atts
+
+    def test_prompt_is_rewritten_before_either_spawn_path_reads_it(self, tmp_path, monkeypatch):
+        """_run_job_blocking must rewrite job["prompt"] before the warm/cold
+        branch — the cold path bakes the prompt into argv and the warm path
+        feeds it through the FIFO, so a later rewrite would miss both."""
+        import base64
+
+        monkeypatch.setattr(execute_mod, "WORKSPACE_CONTAINER_DIR", str(tmp_path))
+        monkeypatch.setattr(execute_mod, "_redis_client", lambda url: None)
+        monkeypatch.setattr(execute_mod, "_publish_line", lambda *a, **k: None)
+        monkeypatch.setattr(execute_mod, "_publish_done", lambda *a, **k: None)
+
+        seen = {}
+
+        def _boom(*a, **k):
+            raise RuntimeError("stop after the rewrite")
+
+        monkeypatch.setattr(execute_mod.warm_pool, "enabled", lambda: False)
+        monkeypatch.setattr(execute_mod, "_build_container_kwargs", _boom)
+
+        url = "https://ap.test/api/gallery/direct/t1"
+        job = {"run_id": "run-5", "prompt": f"look at {url}", "cli": "claude",
+               "attachments": [{"placeholder": url, "name": "p.png", "mime": "image/png",
+                                "content": base64.b64encode(b"png").decode()}]}
+        execute_mod._run_job_blocking(job, "redis://example.test:6379/0")
+        seen["prompt"] = job["prompt"]
+        assert url not in seen["prompt"]
+        assert "/.tmp/agent-inbound/run-5/p.png" in seen["prompt"]

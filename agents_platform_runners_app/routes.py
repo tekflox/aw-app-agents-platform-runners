@@ -189,6 +189,12 @@ def build_routes(config: dict | None = None) -> FastAPI:
             "mcp_servers": body.get("mcp_servers"),
             "dangerous_skip_permissions": body.get("dangerous_skip_permissions", True),
             "permissions": body.get("permissions"),
+            # Files the user attached in the originating chat, carried inline
+            # (base64) so they can be written to the agent's own disk and the
+            # prompt's URLs swapped for real paths — see
+            # aw_attach.materialise_inbound. Absent from older callers, which
+            # simply keep getting URL-only prompts.
+            "attachments": body.get("attachments"),
         }
         execute_mod.start_job(job, redis_url)
         return {"run_id": run_id, "status": "started"}
