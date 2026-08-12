@@ -332,7 +332,15 @@ class TestInboundWiring:
         branch — the cold path bakes the prompt into argv and the warm path
         feeds it through the FIFO, so a later rewrite would miss both."""
         import base64
+        import sys
+        import types
 
+        # _run_job_blocking imports the docker SDK to spawn the container.
+        # This test never gets that far — it stops the function right after
+        # the rewrite — but the import itself would still fail wherever the
+        # SDK isn't installed, e.g. this repo's release CI. Stub it so the
+        # test measures the rewrite's position, not the environment.
+        monkeypatch.setitem(sys.modules, "docker", types.ModuleType("docker"))
         monkeypatch.setattr(execute_mod, "WORKSPACE_CONTAINER_DIR", str(tmp_path))
         monkeypatch.setattr(execute_mod, "_redis_client", lambda url: None)
         monkeypatch.setattr(execute_mod, "_publish_line", lambda *a, **k: None)
