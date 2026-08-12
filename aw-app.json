@@ -118,6 +118,12 @@
         "type": "string",
         "x-secret": true,
         "description": "OPTIONAL since 0.26.0 \u2014 leave blank and it is derived automatically. Full redis:// URL (with password + db index) of the SAME shared Redis instance agents-platform_multitenant uses for its Redis-Stream run-event transport (its AP_REDIS_URL). /execute publishes each spawned CLI agent's stdout lines to run:{run_id}:events on this Redis so RunnerLLM can attach and replay exactly like a local docker-CLI run. Verified 2026-08-02: reachable from this workspace via the docker bridge gateway IP, e.g. redis://:<password>@172.18.0.1:6379/1 \u2014 aw-sandbox's own DNS name does NOT resolve from inside this workspace's nested podman netns, only the numeric gateway IP does. When blank, agents_platform_runners_app/shared_redis.py falls back to AW_SHARED_REDIS_URL, then to redis://<this container's default-route gateway>:6379/1 (db 1 = the db agents-platform_multitenant attaches its consumer groups on; override with AW_SHARED_REDIS_DB). Set this only when the shared Redis is NOT on the bridge gateway or needs a password \u2014 a freshly created workspace must not require pasting it by hand."
+      },
+      "public": {
+        "type": "boolean",
+        "default": true,
+        "title": "Public",
+        "description": "Expose this app through the workspace's public tunnel routing layer (aw-backend's own AppInstall.config.public flag, same mechanism mcp-gateway's own \"Public\" setting uses) \u2014 required for POST /execute to be reachable at all: agents-platform_multitenant's RunnerLLM calls this app's own_base_url over the public BYOD tunnel edge, which 401s any non-public app before the request even reaches this app's own execute_secret check. Defaulting this to true (declared in schema, not just set by hand) makes it survive an uninstall+reinstall from scratch: every config save round-trips the FULL config dict through aw-backend's AppInstall.config \u2014 a field that exists only as a manually-poked cloud-side value (not part of any app's own persisted config) gets silently dropped on the very next save. Found live 2026-08-11/12: exactly that happened after an uninstall+reinstall, and /execute kept 401ing at the tunnel edge even after the app's own execute_secret was correctly restored."
       }
     },
     "required": []
