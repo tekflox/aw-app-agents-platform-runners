@@ -58,6 +58,16 @@ RECONCILE_INTERVAL_S = 360.0
 # host's own address on that network) — verified reachable end-to-end from
 # inside aw-app-mcp-gateway, 2026-08-02.
 DEFAULT_AGENTS_PLATFORM_BASE = "http://172.18.0.1:10014"
+# Address a SPAWNED AGENT CONTAINER uses to reach this workspace's MCP
+# gateway. Not the same as the URL in .mcp.json — that one
+# (http://aw-app-mcp-gateway:9200/mcp) is resolvable from inside the
+# workspace container, where the gateway is a compose peer, but an agent
+# container is a sibling in the nested podman namespace and only the bridge
+# gateway IP resolves there. This is the value every hand-configured agent
+# on this tenant already carries (telegram-*, crispal-*), so it is the
+# verified-working default rather than a guess; override per-workspace with
+# the `gateway_mcp_url` setting if the bridge subnet differs.
+DEFAULT_GATEWAY_MCP_URL = "http://172.18.0.1:9200/mcp"
 
 
 def build_mcp_servers(config: dict) -> dict:
@@ -209,6 +219,15 @@ class AgentsPlatformRunnersAppPlugin:
         provisioner = agent_provisioner_mod.AgentProvisioner(
             base=config.get("agents_platform_base") or DEFAULT_AGENTS_PLATFORM_BASE,
             token=config.get("agents_platform_token") or "",
+            # An app declares `mcp_servers: ["aw-gateway"]` and the token is
+            # resolved from this workspace's own .mcp.json — but the URL there
+            # (http://aw-app-mcp-gateway:9200/mcp) is this container's view,
+            # and a spawned agent container cannot resolve that name. Same
+            # gateway, different address; only the address is configurable.
+            mcp_url_overrides={
+                "aw-gateway": config.get("gateway_mcp_url")
+                or DEFAULT_GATEWAY_MCP_URL,
+            },
         )
         created = provisioner.seed(app_id, spec)
         if created:

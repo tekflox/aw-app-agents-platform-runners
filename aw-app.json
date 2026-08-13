@@ -64,37 +64,37 @@
       {
         "id": "aw-agent-telegram",
         "path": "skills/aw-agent-telegram/SKILL.md",
-        "description": "How to reply to messages routed through a Telegram bot connected to this workspace via agents-platform \u2014 markers for attachments/buttons/mini-apps/location, voice vs text, tone, and delivery contract for a CLI agent session spawned by this app's runner. Ported and adapted from the agentic-workspace monolith's WorkspaceAgent skill of the same name."
+        "description": "How to reply to messages routed through a Telegram bot connected to this workspace via agents-platform — markers for attachments/buttons/mini-apps/location, voice vs text, tone, and delivery contract for a CLI agent session spawned by this app's runner. Ported and adapted from the agentic-workspace monolith's WorkspaceAgent skill of the same name."
       },
       {
         "id": "aw-supervisor-tool",
         "path": "skills/aw-supervisor-tool/SKILL.md",
-        "description": "The Supervisor tool \u2014 3 MCP tools (supervise/stop_supervisor/supervisor_status) any Agents Platform agent can call to watch another session's whole run chain and get woken up exactly once when it goes idle."
+        "description": "The Supervisor tool — 3 MCP tools (supervise/stop_supervisor/supervisor_status) any Agents Platform agent can call to watch another session's whole run chain and get woken up exactly once when it goes idle."
       },
       {
         "id": "aw-agent-coder",
         "path": "skills/aw-agent-coder/SKILL.md",
-        "description": "Generic coding-specialist contract for the \"Coder\" Agents Platform agent \u2014 orients it to what Agents Platform is, makes a knowledge-base search mandatory before starting any task, and sets baseline engineering conduct."
+        "description": "Generic coding-specialist contract for the \"Coder\" Agents Platform agent — orients it to what Agents Platform is, makes a knowledge-base search mandatory before starting any task, and sets baseline engineering conduct."
       },
       {
         "id": "aw-agent-doc-writer",
         "path": "skills/aw-agent-doc-writer/SKILL.md",
-        "description": "Generic documentation-writer contract for the \"Doc Writer\" Agents Platform agent \u2014 writes README/ADR/module/API docs grounded in the actual code."
+        "description": "Generic documentation-writer contract for the \"Doc Writer\" Agents Platform agent — writes README/ADR/module/API docs grounded in the actual code."
       },
       {
         "id": "aw-agent-qa",
         "path": "skills/aw-agent-qa/SKILL.md",
-        "description": "Generic QA-review contract for the \"QA\" Agents Platform agents \u2014 validates a finished task's delivery and decides the outcome (Kanban status if a card system is wired up, otherwise a plain verdict)."
+        "description": "Generic QA-review contract for the \"QA\" Agents Platform agents — validates a finished task's delivery and decides the outcome (Kanban status if a card system is wired up, otherwise a plain verdict)."
       },
       {
         "id": "aw-agent-ux-coder",
         "path": "skills/aw-agent-ux-coder/SKILL.md",
-        "description": "Contract for the \"UX Coder\" Agents Platform agent \u2014 owns end-to-end delivery of a UX-Proto prototype, with a strong mandate for usability."
+        "description": "Contract for the \"UX Coder\" Agents Platform agent — owns end-to-end delivery of a UX-Proto prototype, with a strong mandate for usability."
       },
       {
         "id": "aw-agents",
         "path": "skills/aw-agents/SKILL.md",
-        "description": "Guided agent/workflow execution via the agent-mcp server \u2014 the conductor is a MANAGER who delegates to platform agents through discovery \u2192 exploration \u2192 decomposition \u2192 plan approval \u2192 execution \u2192 validation \u2192 iteration \u2192 final report, never executing the work itself."
+        "description": "Guided agent/workflow execution via the agent-mcp server — the conductor is a MANAGER who delegates to platform agents through discovery → exploration → decomposition → plan approval → execution → validation → iteration → final report, never executing the work itself."
       }
     ]
   },
@@ -104,38 +104,44 @@
       "agents_platform_base": {
         "type": "string",
         "default": "http://172.18.0.1:10014",
-        "description": "Base URL of the agents-platform_multitenant instance this app's MCP tools control. 172.18.0.1 is the agentic-workspace_default bridge gateway (== the real host) \u2014 the only address reachable from aw-app-mcp-gateway's nested podman namespace; override if your workspace's network subnet differs."
+        "description": "Base URL of the agents-platform_multitenant instance this app's MCP tools control. 172.18.0.1 is the agentic-workspace_default bridge gateway (== the real host) — the only address reachable from aw-app-mcp-gateway's nested podman namespace; override if your workspace's network subnet differs."
       },
       "agents_platform_token": {
         "type": "string",
         "x-secret": true,
-        "description": "aw-backend identity JWT sent as Authorization: Bearer on every call to agents_platform_base \u2014 required, agents-platform_multitenant's require_identity() rejects unauthenticated requests with 401. Mint one inside the aw-backend container: python -c \"from src.api.identity_auth import create_identity_jwt; print(create_identity_jwt(<user_id>, [{'workspace': 'aw', 'role': 'owner'}], expiry_seconds=<seconds>))\""
+        "description": "aw-backend identity JWT sent as Authorization: Bearer on every call to agents_platform_base — required, agents-platform_multitenant's require_identity() rejects unauthenticated requests with 401. Mint one inside the aw-backend container: python -c \"from src.api.identity_auth import create_identity_jwt; print(create_identity_jwt(<user_id>, [{'workspace': 'aw', 'role': 'owner'}], expiry_seconds=<seconds>))\""
       },
       "execute_secret": {
         "type": "string",
         "x-secret": true,
-        "description": "Shared secret RunnerLLM (agents-platform_multitenant) must present as the X-Runner-Secret header on every POST /execute call. This app is registered PUBLIC in aw-backend's AppInstall registry (bypasses the tunnel edge's aw_id_jwt+membership check), so this secret \u2014 combined with aw-workspace's own per-app IdentityGuard, which still requires a validly-signed identity JWT \u2014 is the real access control for /execute. Generate with e.g. `python3 -c \"import secrets; print(secrets.token_urlsafe(32))\"` and configure the SAME value on agents-platform_multitenant's Runner row / RunnerLLM env."
+        "description": "Shared secret RunnerLLM (agents-platform_multitenant) must present as the X-Runner-Secret header on every POST /execute call. This app is registered PUBLIC in aw-backend's AppInstall registry (bypasses the tunnel edge's aw_id_jwt+membership check), so this secret — combined with aw-workspace's own per-app IdentityGuard, which still requires a validly-signed identity JWT — is the real access control for /execute. Generate with e.g. `python3 -c \"import secrets; print(secrets.token_urlsafe(32))\"` and configure the SAME value on agents-platform_multitenant's Runner row / RunnerLLM env."
       },
       "own_base_url": {
         "type": "string",
-        "description": "Override for this app's own reachable base URL, sent to agents-platform_multitenant on POST /register as the Runner row's base_url. Defaults to https://agents-platform-runners.app.<workspace>.workspace.aw.tekflox.com (the per-app subdomain shape, bare host/path \u2014 verified-reachable via the same public BYOD tunnel edge) \u2014 only override if this workspace's public domain differs."
+        "description": "Override for this app's own reachable base URL, sent to agents-platform_multitenant on POST /register as the Runner row's base_url. Defaults to https://agents-platform-runners.app.<workspace>.workspace.aw.tekflox.com (the per-app subdomain shape, bare host/path — verified-reachable via the same public BYOD tunnel edge) — only override if this workspace's public domain differs."
       },
       "shared_redis_url": {
         "type": "string",
         "x-secret": true,
-        "description": "OPTIONAL since 0.26.0 \u2014 leave blank and it is derived automatically. Full redis:// URL (with password + db index) of the SAME shared Redis instance agents-platform_multitenant uses for its Redis-Stream run-event transport (its AP_REDIS_URL). /execute publishes each spawned CLI agent's stdout lines to run:{run_id}:events on this Redis so RunnerLLM can attach and replay exactly like a local docker-CLI run. Verified 2026-08-02: reachable from this workspace via the docker bridge gateway IP, e.g. redis://:<password>@172.18.0.1:6379/1 \u2014 aw-sandbox's own DNS name does NOT resolve from inside this workspace's nested podman netns, only the numeric gateway IP does. When blank, agents_platform_runners_app/shared_redis.py falls back to AW_SHARED_REDIS_URL, then to redis://<this container's default-route gateway>:6379/1 (db 1 = the db agents-platform_multitenant attaches its consumer groups on; override with AW_SHARED_REDIS_DB). Set this only when the shared Redis is NOT on the bridge gateway or needs a password \u2014 a freshly created workspace must not require pasting it by hand."
+        "description": "OPTIONAL since 0.26.0 — leave blank and it is derived automatically. Full redis:// URL (with password + db index) of the SAME shared Redis instance agents-platform_multitenant uses for its Redis-Stream run-event transport (its AP_REDIS_URL). /execute publishes each spawned CLI agent's stdout lines to run:{run_id}:events on this Redis so RunnerLLM can attach and replay exactly like a local docker-CLI run. Verified 2026-08-02: reachable from this workspace via the docker bridge gateway IP, e.g. redis://:<password>@172.18.0.1:6379/1 — aw-sandbox's own DNS name does NOT resolve from inside this workspace's nested podman netns, only the numeric gateway IP does. When blank, agents_platform_runners_app/shared_redis.py falls back to AW_SHARED_REDIS_URL, then to redis://<this container's default-route gateway>:6379/1 (db 1 = the db agents-platform_multitenant attaches its consumer groups on; override with AW_SHARED_REDIS_DB). Set this only when the shared Redis is NOT on the bridge gateway or needs a password — a freshly created workspace must not require pasting it by hand."
       },
       "public": {
         "type": "boolean",
         "default": true,
         "title": "Public",
-        "description": "Expose this app through the workspace's public tunnel routing layer (aw-backend's own AppInstall.config.public flag, same mechanism mcp-gateway's own \"Public\" setting uses) \u2014 required for POST /execute to be reachable at all: agents-platform_multitenant's RunnerLLM calls this app's own_base_url over the public BYOD tunnel edge, which 401s any non-public app before the request even reaches this app's own execute_secret check. Defaulting this to true (declared in schema, not just set by hand) makes it survive an uninstall+reinstall from scratch: every config save round-trips the FULL config dict through aw-backend's AppInstall.config \u2014 a field that exists only as a manually-poked cloud-side value (not part of any app's own persisted config) gets silently dropped on the very next save. Found live 2026-08-11/12: exactly that happened after an uninstall+reinstall, and /execute kept 401ing at the tunnel edge even after the app's own execute_secret was correctly restored."
+        "description": "Expose this app through the workspace's public tunnel routing layer (aw-backend's own AppInstall.config.public flag, same mechanism mcp-gateway's own \"Public\" setting uses) — required for POST /execute to be reachable at all: agents-platform_multitenant's RunnerLLM calls this app's own_base_url over the public BYOD tunnel edge, which 401s any non-public app before the request even reaches this app's own execute_secret check. Defaulting this to true (declared in schema, not just set by hand) makes it survive an uninstall+reinstall from scratch: every config save round-trips the FULL config dict through aw-backend's AppInstall.config — a field that exists only as a manually-poked cloud-side value (not part of any app's own persisted config) gets silently dropped on the very next save. Found live 2026-08-11/12: exactly that happened after an uninstall+reinstall, and /execute kept 401ing at the tunnel edge even after the app's own execute_secret was correctly restored."
       },
       "warm_container": {
         "type": "boolean",
         "default": true,
         "title": "Warm containers",
-        "description": "Keep one long-lived \"warm\" claude container per session (aw-warm-<agent_id>-<session_id>, 6h TTL) and dispatch each turn into it, instead of spawning a fresh container per turn. Turn 1 of a session is always cold \u2014 the warm container is keyed by the session_id that turn 1 produces \u2014 so reuse starts from turn 2. ON by default since 0.32.0; untick to force the per-turn ephemeral path. This lives in app config, NOT in the RUNNER_WARM_CONTAINER env var it replaces: aw-remote-host's install.sh only forwards that var into the workspace container when the HOST process has it set, so every workspace recreate (i.e. every update/deploy) silently dropped a hand-set flag and warm mode turned itself back off \u2014 observed repeatedly, last on 2026-08-12. The env var still wins when explicitly set, as a per-host escape hatch."
+        "description": "Keep one long-lived \"warm\" claude container per session (aw-warm-<agent_id>-<session_id>, 6h TTL) and dispatch each turn into it, instead of spawning a fresh container per turn. Turn 1 of a session is always cold — the warm container is keyed by the session_id that turn 1 produces — so reuse starts from turn 2. ON by default since 0.32.0; untick to force the per-turn ephemeral path. This lives in app config, NOT in the RUNNER_WARM_CONTAINER env var it replaces: aw-remote-host's install.sh only forwards that var into the workspace container when the HOST process has it set, so every workspace recreate (i.e. every update/deploy) silently dropped a hand-set flag and warm mode turned itself back off — observed repeatedly, last on 2026-08-12. The env var still wins when explicitly set, as a per-host escape hatch."
+      },
+      "gateway_mcp_url": {
+        "type": "string",
+        "default": "http://172.18.0.1:9200/mcp",
+        "title": "Gateway MCP URL (for seeded agents)",
+        "description": "Address a SPAWNED AGENT CONTAINER uses to reach this workspace's MCP gateway. Written into the mcp_config of any AgentConfig an app contributes with `mcp_servers: [\"aw-gateway\"]`; the bearer token for it is read from the workspace's own .mcp.json and never travels in a manifest. Deliberately NOT the URL .mcp.json carries (http://aw-app-mcp-gateway:9200/mcp) — that name resolves inside the workspace container, where the gateway is a compose peer, but an agent container is a sibling in the nested podman namespace and only the bridge gateway IP resolves there. Override only if this workspace's bridge subnet differs."
       }
     },
     "required": []
@@ -146,13 +152,13 @@
         "id": "mcp-gateway",
         "version": ">=0.1.0",
         "required": false,
-        "reason": "This app contributes mcp.json definitions the MCP Gateway discovers and merges. Softened to non-required 2026-08-03: the deployed aw-remote-host workspace runs an aw-workspace build whose capability catalog predates mcp-gateway's own 'mcp:register-gateway' permission, so a strict required-dependency install of THIS app cascades into mcp-gateway manifest validation and fails with 'unknown permission' \u2014 blocking /execute entirely, which is worse than temporarily losing the mcp.json auto-merge. Revert to required:true once the deployed aw-workspace build is upgraded past the fix already on its own master (see aw-workspace's src/apps/capabilities.py)."
+        "reason": "This app contributes mcp.json definitions the MCP Gateway discovers and merges. Softened to non-required 2026-08-03: the deployed aw-remote-host workspace runs an aw-workspace build whose capability catalog predates mcp-gateway's own 'mcp:register-gateway' permission, so a strict required-dependency install of THIS app cascades into mcp-gateway manifest validation and fails with 'unknown permission' — blocking /execute entirely, which is worse than temporarily losing the mcp.json auto-merge. Revert to required:true once the deployed aw-workspace build is upgraded past the fix already on its own master (see aw-workspace's src/apps/capabilities.py)."
       },
       {
         "id": "code-agent-clis",
         "version": ">=0.2.1",
         "required": false,
-        "reason": "This app doesn't install the CLIs itself \u2014 it depends on code-agent-clis having already put claude/codex/copilot/cursor-agent on /usr/local/bin, same path aw-workspace installs already reuse: one app owns installing each runner, this app just depends on that instead of re-implementing it. Softened to non-required 2026-08-03 alongside mcp-gateway above \u2014 not itself implicated in the permission failure, but the reconciler validates ALL required deps in the same pass, so leaving this required still blocks install. The CLIs are already present on /usr/local/bin from an earlier successful bootstrap; revert to required:true once dependency installs are unblocked again."
+        "reason": "This app doesn't install the CLIs itself — it depends on code-agent-clis having already put claude/codex/copilot/cursor-agent on /usr/local/bin, same path aw-workspace installs already reuse: one app owns installing each runner, this app just depends on that instead of re-implementing it. Softened to non-required 2026-08-03 alongside mcp-gateway above — not itself implicated in the permission failure, but the reconciler validates ALL required deps in the same pass, so leaving this required still blocks install. The CLIs are already present on /usr/local/bin from an earlier successful bootstrap; revert to required:true once dependency installs are unblocked again."
       }
     ]
   },

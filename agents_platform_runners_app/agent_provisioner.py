@@ -39,7 +39,9 @@ didn't land beats an app that refuses to install.
 """
 from __future__ import annotations
 
+import json
 import logging
+import os
 from typing import Any
 
 import httpx
@@ -88,19 +90,28 @@ class AgentProvisioner:
     """Seeds one app's declared Agents Platform objects. Reusable per call."""
 
     def __init__(self, base: str, token: str, timeout: float = DEFAULT_TIMEOUT,
-                 transport: httpx.BaseTransport | None = None):
+                 transport: httpx.BaseTransport | None = None,
+                 mcp_url_overrides: dict[str, str] | None = None):
         self.base = (base or "").rstrip("/")
         self.token = token or ""
         self.timeout = timeout
         # Test seam only — production always builds a real client. Keeps the
         # ordering + 409 behaviour testable without a live platform.
         self.transport = transport
+        # server name -> URL to use instead of the one in .mcp.json. See
+        # resolve_mcp_servers: the token is shared, only the address differs
+        # between this container's network view and a spawned agent's.
+        self.mcp_url_overrides = mcp_url_overrides or {}
 
     # ---- public ------------------------------------------------------------
 
     def seed(self, app_id: str, spec: dict[str, Any]) -> dict[str, int]:
         """Create every declared object that doesn't exist. Returns counts."""
         created: dict[str, int] = {}
+        # Expand `mcp_servers: ["aw-gateway"]` into the real connection dict
+        # before anything is POSTed — see apply_mcp_references below for why
+        # the credential is resolved here and not carried in the manifest.
+        spec = apply_mcp_references(spec, url_overrides=self.mcp_url_overrides)
         if not self.base or not self.token:
             log.warning(
                 "agent seeding skipped for %s: agents_platform_base/"
@@ -170,3 +181,117 @@ def _payload(kind: str, entry: dict[str, Any], allowed: frozenset[str]) -> dict[
         if not body.get(field):
             body[field] = entry.get(source, "")
     return body
+
+
+# --- mcp_servers by reference ------------------------------------------------
+#
+# An agent that can't reach the workspace's MCP gateway has no Kanban, no
+# knowledge base and no platform tools — for most contributed agents that is
+# the difference between working and not. But the gateway entry is
+# ``{url, headers: {Authorization: Bearer <token>}}``, and a manifest is a
+# public artefact that ships to a marketplace, so an app cannot simply
+# declare it.
+#
+# So an app declares the server it wants BY NAME::
+#
+#     "agent_configs": [
+#       {"slug": "...", "name": "...", "mcp_servers": ["aw-gateway"]}
+#     ]
+#
+# and this module resolves each name into the real connection dict at seed
+# time, here, inside the workspace that owns the secret. The manifest carries
+# an intention; the credential never leaves the machine.
+#
+# Resolution reads the workspace's own canonical ``.mcp.json`` (AGENTS.md:
+# "``.mcp.json`` at the repo root is the canonical config"), which the
+# gateway app already writes itself on boot — so a freshly created workspace
+# resolves correctly with nothing pasted by hand, which was the whole point.
+
+#: Where the workspace's canonical MCP config lives.
+MCP_CONFIG_PATH = os.path.join(
+    os.environ.get("AW_WORKSPACE_CONTAINER_DIR", "/opt/aw-workspace"), ".mcp.json"
+)
+
+
+def resolve_mcp_servers(
+    names: list[str], *, url_overrides: dict[str, str] | None = None,
+    config_path: str | None = None,
+) -> dict[str, dict[str, Any]]:
+    """Turn ``["aw-gateway"]`` into the servers dict an AgentConfig stores.
+
+    Unknown names, an unreadable ``.mcp.json`` and a missing entry all
+    resolve to "not included" rather than raising: a contributed agent that
+    comes up without its gateway is degraded, while an app that refuses to
+    install is broken. Each omission is logged — this is precisely the kind
+    of gap that otherwise shows up as an agent mysteriously having no tools.
+
+    ``url_overrides`` exists because the URL in ``.mcp.json`` is written for
+    THIS container's network view (``http://aw-app-mcp-gateway:9200/mcp``),
+    and a spawned agent container sits in a different one, where that name
+    does not resolve. The token is identical in both; only the address
+    differs, so the address is the one thing configurable.
+    """
+    resolved: dict[str, dict[str, Any]] = {}
+    if not names:
+        return resolved
+    path = config_path or MCP_CONFIG_PATH
+    try:
+        with open(path, encoding="utf-8") as fh:
+            servers = (json.load(fh) or {}).get("mcpServers") or {}
+    except (OSError, ValueError) as exc:
+        log.warning(
+            "could not read %s (%s) — contributed agents will be seeded "
+            "WITHOUT their declared MCP servers %s", path, exc, names,
+        )
+        return resolved
+
+    overrides = url_overrides or {}
+    for name in names:
+        entry = servers.get(name)
+        if not isinstance(entry, dict) or not entry.get("url"):
+            log.warning(
+                "MCP server %r is not present in %s — the agent config "
+                "declaring it will be seeded without it", name, path,
+            )
+            continue
+        server = {
+            "type": entry.get("type") or "streamable-http",
+            "url": overrides.get(name) or entry["url"],
+        }
+        if entry.get("headers"):
+            server["headers"] = dict(entry["headers"])
+        resolved[name] = server
+    return resolved
+
+
+def apply_mcp_references(
+    spec: dict[str, Any], *, url_overrides: dict[str, str] | None = None,
+    config_path: str | None = None,
+) -> dict[str, Any]:
+    """Expand every ``mcp_servers`` name list in *spec* into ``mcp_config``.
+
+    Returns a copy — the caller's declaration (which core may replay for
+    another provider) is never mutated. An entry that already carries an
+    explicit ``mcp_config`` is left alone: a manifest that spells the whole
+    thing out has said what it means, and this must not silently overwrite it.
+    """
+    out = dict(spec)
+    for kind in ("agent_configs", "agents"):
+        entries = out.get(kind) or []
+        if not entries:
+            continue
+        expanded = []
+        for entry in entries:
+            names = entry.get("mcp_servers")
+            if not names or entry.get("mcp_config"):
+                expanded.append(entry)
+                continue
+            servers = resolve_mcp_servers(
+                list(names), url_overrides=url_overrides, config_path=config_path,
+            )
+            new = {k: v for k, v in entry.items() if k != "mcp_servers"}
+            if servers:
+                new["mcp_config"] = {"servers": servers}
+            expanded.append(new)
+        out[kind] = expanded
+    return out
