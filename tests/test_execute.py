@@ -39,3 +39,11 @@ def test_only_claude_authenticates_via_an_injected_env_token():
     from agents_platform_runners_app.execute import CLI_SPECS
     assert CLI_SPECS["claude"]["env_token_auth"] is True
     assert CLI_SPECS["codex"]["env_token_auth"] is False
+
+
+def test_codex_relocates_its_home_off_the_unwritable_container_home():
+    """The container runs as the workspace uid while the image bakes
+    /home/ubuntu 0750 ubuntu:ubuntu — the run user never gets write there, so
+    creds must be staged somewhere else and the CLI pointed at it."""
+    from agents_platform_runners_app.execute import CLI_SPECS
+    assert CLI_SPECS["codex"]["home_env"] == "CODEX_HOME"

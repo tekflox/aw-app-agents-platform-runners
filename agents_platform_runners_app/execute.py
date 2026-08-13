@@ -174,6 +174,9 @@ CLI_SPECS: dict[str, dict] = {
         # auth_mode "chatgpt" has no API key to inject — codex MUST read
         # auth.json off disk, and write its session state back.
         "env_token_auth": False,
+        # Lets the creds land somewhere the RUN USER can actually write —
+        # see the staging note in _build_spawn().
+        "home_env": "CODEX_HOME",
         "creds_dir": ".codex", "creds_file": None,
     },
     "copilot": {
@@ -648,10 +651,22 @@ def _build_container_kwargs(job: dict) -> tuple[str, list[str], dict, str | None
     # off disk, copy them into the container's OWN $HOME before exec'ing it.
     if creds_staged:
         import shlex
+        # NOT under $HOME. The container runs as --user <workspace uid>:<gid>
+        # (see the long note on "user" below), while the image bakes
+        # /home/ubuntu as 0750 ubuntu:ubuntu — the run user gets r-x through
+        # --group-add, never w, so it cannot even mkdir $HOME/.codex. Every
+        # earlier attempt died here: no creds copied, then
+        # "failed to initialize in-process app-server client: Permission
+        # denied". /tmp is 1777 on the container's own writable layer, which
+        # is both writable by the run user AND a filesystem the app-server
+        # can create its socket on.
+        staged_home = f"/tmp/aw-{creds_dir.lstrip('.')}-home"
+        if spec.get("home_env"):
+            env[spec["home_env"]] = staged_home
         _inner = " ".join(shlex.quote(a) for a in argv)
         argv = ["sh", "-lc",
-                f'mkdir -p "$HOME/{creds_dir}" && cp -a /aw-creds/. "$HOME/{creds_dir}/" '
-                f'2>/dev/null; chmod -R u+rwX "$HOME/{creds_dir}" 2>/dev/null; exec {_inner}']
+                f'mkdir -p {staged_home} && cp -a /aw-creds/. {staged_home}/ 2>/dev/null; '
+                f'chmod -R u+rwX {staged_home} 2>/dev/null; exec {_inner}']
 
     kwargs: dict[str, Any] = {
         "name": f"aw-runner-run-{run_id}",
