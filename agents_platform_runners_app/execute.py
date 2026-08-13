@@ -309,10 +309,20 @@ def _build_container_kwargs(job: dict) -> tuple[str, list[str], dict, str | None
 
     # Isolated per-RUN (not per-session) scratch dir — matches legacy exactly
     # (docker_agent.py always keys by agent_id/run_id, never session_id). In
-    # direct-home mode it lives UNDER the real .claude that's already mounted
+    # direct-home mode it lives UNDER the creds dir that's already mounted
     # whole (docker_agent.py does the same — no separate mount); otherwise it
     # sits in the host-shared workspace tree and is mounted explicitly below.
-    isolated_rel = f".claude/isolated/{run_id}"
+    #
+    # It MUST hang off THIS cli's creds_dir, not a hardcoded ".claude": in
+    # direct-home mode only the selected CLI's own creds dir is mounted, so a
+    # codex run got a working_dir under an unmounted .claude and podman
+    # refused to start the container outright —
+    #   Error: workdir "/home/ubuntu/.claude/isolated/<run_id>" does not exist
+    # Confirmed by hand 2026-08-13; the same command with the cwd under
+    # .codex/ starts fine. Only bites once a CLI has creds on disk (that is
+    # what turns direct_home_mount on), so codex "worked" — as a 401 — right
+    # up until someone logged it in.
+    isolated_rel = f"{spec['creds_dir']}/isolated/{run_id}"
     isolated_base = _real_home if direct_home_mount else Path(WORKSPACE_CONTAINER_DIR)
     isolated_host_dir = isolated_base / isolated_rel
     isolated_host_dir.mkdir(parents=True, exist_ok=True)
