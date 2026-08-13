@@ -30,6 +30,7 @@ import logging
 import os
 from pathlib import Path
 
+from . import agent_provisioner as agent_provisioner_mod
 from . import routes as routes_mod
 from . import shared_redis as shared_redis_mod
 from . import skills_sync as skills_sync_mod
@@ -180,6 +181,39 @@ class AgentsPlatformRunnersAppPlugin:
         ctx.watchdog.register("skills-sync-reconcile", _reconcile, RECONCILE_INTERVAL_S,
                               run_immediately=False)
         log.info("skills_sync: watchdog registered (workspace=%s base=%s)", workspace, base)
+
+    def register_contributed_agents(self, app_id: str, spec: dict) -> dict:
+        """Seed one ``contributes.agents`` declaration into Agents Platform.
+
+        This is the provider side of aw-workspace's agent-contribution
+        protocol (its ``src/apps/agents.py``): any installed app declares
+        the models, agent configs, groups and agents its features need, and
+        the workspace hands the whole declaration here on activation — as
+        one call, so this side owns the creation ORDER an Agent's slug
+        references depend on.
+
+        **Create-if-absent, matched by slug, never updated**, exactly like
+        the tasks surface: an existing object is left as it is, prompt and
+        model and all. See ``agent_provisioner.py`` for why a 409 counts as
+        already-there rather than an error.
+
+        Reads ``self._live_config``, not a snapshot, so a token pasted into
+        the settings panel after this app came up is used by the next
+        activation without a workspace restart.
+
+        Called from aw-workspace's synchronous activation path, which
+        already guards against exceptions; raising here is safe but
+        pointless.
+        """
+        config = self._live_config or {}
+        provisioner = agent_provisioner_mod.AgentProvisioner(
+            base=config.get("agents_platform_base") or DEFAULT_AGENTS_PLATFORM_BASE,
+            token=config.get("agents_platform_token") or "",
+        )
+        created = provisioner.seed(app_id, spec)
+        if created:
+            log.info("seeded agents platform objects from %s: %s", app_id, created)
+        return created
 
     async def on_config_saved(self, ctx) -> None:
         """Regenerate mcp.json from the newly-saved config (agents_platform_base) —
