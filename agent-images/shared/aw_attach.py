@@ -308,6 +308,20 @@ def rewrite_stream_line(line: str, run_id: str) -> str:
                     if new != block["text"]:
                         block["text"] = new
                         changed = True
+    elif evt.get("type") == "item.completed":
+        # codex's shape: {"type":"item.completed","item":{"type":"agent_message",
+        # "text":...}}. It matches neither branch above, so for a codex agent
+        # NO outbound rewrite happened at all and every [[ATTACH: /local/path]]
+        # reached agents-platform as a raw path it cannot open — logged as
+        # "ATTACH path not found" and silently dropped. The user got a message
+        # announcing four images and no images. Only surfaced once a Telegram
+        # bot was switched from claude to codex.
+        item = evt.get("item")
+        if isinstance(item, dict) and isinstance(item.get("text"), str):
+            new = rewrite_text(item["text"], run_id)
+            if new != item["text"]:
+                item["text"] = new
+                changed = True
 
     if not changed:
         return line
