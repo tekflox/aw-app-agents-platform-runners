@@ -660,7 +660,13 @@ def _build_container_kwargs(job: dict) -> tuple[str, list[str], dict, str | None
         # denied". /tmp is 1777 on the container's own writable layer, which
         # is both writable by the run user AND a filesystem the app-server
         # can create its socket on.
-        staged_home = f"/tmp/aw-{creds_dir.lstrip('.')}-home"
+        # /var/tmp, NOT /tmp: codex refuses a CODEX_HOME under the process
+        # temp dir outright — "Refusing to create helper binaries under
+        # temporary dir \"/tmp\"" — and then never runs a turn. /var/tmp is
+        # equally 1777 and on the same writable container layer, and is
+        # verified working end to end (real answer, real tokens) under the
+        # exact --user/--group-add the spawn uses.
+        staged_home = f"/var/tmp/aw-{creds_dir.lstrip('.')}-home"
         if spec.get("home_env"):
             env[spec["home_env"]] = staged_home
         _inner = " ".join(shlex.quote(a) for a in argv)
