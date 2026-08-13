@@ -92,6 +92,12 @@ WORKSPACE_HOME_HOST_DIR = os.environ.get("AW_WORKSPACE_HOME_HOST_DIR", "")
 # live credentials the workspace's own login writes actually resolve.
 REAL_HOME = os.environ.get("HOME") or "/home/ubuntu"
 CONTAINER_SOCKET = os.environ.get("AW_CONTAINER_SOCKET")
+# Host path of the docker socket handed to an agent that has the Agent
+# Config's "docker" permission. Distinct from CONTAINER_SOCKET above, which
+# is THIS app's own podman socket used to spawn the agent container in the
+# first place — the permission is about what the spawned agent may reach,
+# not how it gets spawned.
+DOCKER_SOCKET_PATH = os.environ.get("AW_DOCKER_SOCKET_PATH", "/var/run/docker.sock")
 # Persistent path where the workspace's long-lived Claude OAuth token
 # (`claude setup-token`, valid ~1 year) is stored. Lives under
 # `.aw-workspace/` — on the persistent /opt/aw-workspace bind-mount, preserved
@@ -153,6 +159,7 @@ CLI_SPECS: dict[str, dict] = {
         "strict_mcp_flag": "--strict-mcp-config",
         "allowed_tools_flag": "--allowed-tools",
         "disallowed_tools_flag": "--disallowed-tools",
+        "tools_flag_style": "csv",          # --allowed-tools a,b,c
         "append_system_prompt_flag": "--append-system-prompt",
         # Auth reaches the container as CLAUDE_CODE_OAUTH_TOKEN, so the CLI
         # never has to READ the mounted creds — which is the only reason the
@@ -166,10 +173,12 @@ CLI_SPECS: dict[str, dict] = {
         "skip_perms_flag": "--dangerously-bypass-approvals-and-sandbox",
         "model_flag": "-c", "add_dir_flag": None,
         "mcp_config_flag": None,  # codex has no --mcp-config flag — see write-up below
-        # codex has none of claude's tool/system-prompt flags; the system
-        # prompt is prepended to the prompt text instead (see below).
+        # codex genuinely has no per-tool allow/deny flags and no
+        # system-prompt flag (checked against codex-cli 0.147.0 --help); the
+        # system prompt is prepended to the prompt text instead (see below).
         "allowed_tools_flag": None,
         "disallowed_tools_flag": None,
+        "tools_flag_style": None,
         "append_system_prompt_flag": None,
         # auth_mode "chatgpt" has no API key to inject — codex MUST read
         # auth.json off disk, and write its session state back.
@@ -185,14 +194,33 @@ CLI_SPECS: dict[str, dict] = {
         "skip_perms_flag": None,
         "model_flag": "--model", "add_dir_flag": "--add-dir",
         "mcp_config_flag": None,
+        # GitHub Copilot CLI 1.0.79: --allow-tool / --deny-tool, and they are
+        # REPEATED once per tool, not comma-joined like claude's. Its own help
+        # example is the spec:
+        #   copilot --allow-tool='shell(git:*)' --deny-tool='shell(git push)'
+        "allowed_tools_flag": "--allow-tool",
+        "disallowed_tools_flag": "--deny-tool",
+        "tools_flag_style": "repeat",
+        # No --append-system-prompt equivalent — prompt-prepended instead.
+        "append_system_prompt_flag": None,
         "creds_dir": ".copilot", "creds_file": None,
     },
     "cursor-agent": {
         "bin": "cursor-agent", "subcmd": None, "prompt_flag": None,
         "default_extra": ["--print"],
-        "skip_perms_flag": None,
-        "model_flag": "--model", "add_dir_flag": None,
+        # cursor-agent 2026.08.11: --force ("Run Everything", --yolo is its
+        # alias) IS the skip-permissions equivalent, and --add-dir exists.
+        # Both were None here, so a dangerous_skip_permissions=true agent ran
+        # WITH prompts (i.e. hung waiting for a human that a headless run
+        # does not have) and extra dirs were dropped.
+        "skip_perms_flag": "--force",
+        "model_flag": "--model", "add_dir_flag": "--add-dir",
         "mcp_config_flag": None,
+        # No per-tool allow/deny and no system-prompt flag in its --help.
+        "allowed_tools_flag": None,
+        "disallowed_tools_flag": None,
+        "tools_flag_style": None,
+        "append_system_prompt_flag": None,
         "creds_dir": ".cursor", "creds_file": None,
     },
 }
@@ -371,6 +399,44 @@ def _build_container_kwargs(job: dict) -> tuple[str, list[str], dict, str | None
 
     volumes: dict[str, dict] = {}
 
+    # The Agent Config's permission dict, forwarded verbatim by
+    # agents-platform's executor.py (`if provider == "runner":
+    # params["permissions"] = permissions`). Each key means whatever THIS
+    # side decides it means — the platform can't resolve a host path it has
+    # no access to — so the mapping below is the runner's half of the
+    # contract, and it must agree with executor.py's `_perm_volumes` or an
+    # Agent Config behaves differently depending on which executor happens
+    # to pick the run up.
+    _perms: dict = job.get("permissions") or {}
+
+    def _workspace_access() -> bool:
+        """Whether this run gets the workspace tree mounted.
+
+        Deliberately NOT ``_perms.get("workspace_access", False)``, which is
+        what agents-platform's executor.py does. This path ignored the
+        permission entirely until 2026-08-13, so no Agent Config here has
+        ever needed to set it — and a straight fail-closed port would
+        un-mount the workspace from every agent whose config simply never
+        mentions the key, which today is an unknown set that plausibly
+        includes all of them.
+
+        So: an EXPLICIT false is honoured (that is the case that was actually
+        wrong — the crispal-* agents opt out and were being handed the tree
+        anyway), and a missing key keeps the old behaviour and says so in the
+        log. Flip this to fail-closed, matching executor.py, once every
+        Agent Config in use carries the key explicitly.
+        """
+        if "workspace_access" in _perms:
+            return bool(_perms["workspace_access"])
+        log.warning(
+            "execute: run=%s agent_id=%s has no 'workspace_access' in its "
+            "Agent Config — defaulting to MOUNTED for backwards "
+            "compatibility. Set the permission explicitly; this default will "
+            "become false.",
+            run_id, job.get("agent_id") or "?",
+        )
+        return True
+
     def _mount(host_rel: str, container_path: str, ro: bool = False) -> None:
         host_path = f"{WORKSPACE_HOST_DIR.rstrip('/')}/{host_rel.lstrip('/')}"
         volumes[host_path] = {"bind": container_path, "mode": "ro" if ro else "rw"}
@@ -496,7 +562,7 @@ def _build_container_kwargs(job: dict) -> tuple[str, list[str], dict, str | None
     # instead of a hand-populated shared one. Read-only: a spawned agent
     # container has no legitimate reason to write back into the credential
     # aw-app-git's own login flow owns.
-    if (job.get("permissions") or {}).get("github"):
+    if _perms.get("github"):
         _git_config_gh = Path(WORKSPACE_CONTAINER_DIR) / GIT_CREDS_REL / "config-gh"
         _git_gitconfig = Path(WORKSPACE_CONTAINER_DIR) / GIT_CREDS_REL / "gitconfig"
         if _git_config_gh.is_dir():
@@ -512,8 +578,27 @@ def _build_container_kwargs(job: dict) -> tuple[str, list[str], dict, str | None
     # scoped there. rw (Frederico, 2026-08-02): this IS the agent's real
     # working tree now, not just a visibility check — the CLI needs to
     # write here, not only read.
-    if WORKSPACE_HOST_DIR:
+    #
+    # Gated on the Agent Config's "AW Workspace Folder Access" permission
+    # since 2026-08-13. It was unconditional before, which quietly inverted
+    # the meaning of that checkbox on this execution path: an agent whose
+    # config said workspace_access=false still received the entire workspace
+    # tree, read-write. That was not theoretical — the crispal-* agents are
+    # configured that way and their own system prompts tell them they have no
+    # workspace filesystem, so they were being lied to in the safe direction
+    # by the prompt and the unsafe direction by the mount. Mirrors
+    # agents-platform's executor.py, where the same permission drives
+    # CliLLM's mount_cwd.
+    if WORKSPACE_HOST_DIR and _workspace_access():
         volumes[WORKSPACE_HOST_DIR.rstrip("/")] = {"bind": "/opt/aw-workspace", "mode": "rw"}
+
+    # "docker" and "tmp_access" mirror executor.py's _perm_volumes entries of
+    # the same name. They were dropped on this path entirely — a config could
+    # tick either box and nothing happened, with no log to say so.
+    if _perms.get("docker") and Path(DOCKER_SOCKET_PATH).exists():
+        volumes[DOCKER_SOCKET_PATH] = {"bind": "/var/run/docker.sock", "mode": "rw"}
+    if _perms.get("tmp_access") and WORKSPACE_HOST_DIR:
+        _mount("data/sandbox-tmp", "/tmp", ro=False)
 
     # Bare `aw-workspace-cli` on PATH from any cwd (Telegram request,
     # 2026-08-11): the script is already visible at /opt/aw-workspace/
@@ -530,7 +615,11 @@ def _build_container_kwargs(job: dict) -> tuple[str, list[str], dict, str | None
     # python3 either way, with PYTHONPATH (set below) supplying the pure-
     # Python deps — same cross-image-safety reasoning as that PYTHONPATH
     # comment.
-    if WORKSPACE_HOST_DIR:
+    # Gated with the workspace mount above, not separately: the CLI drives
+    # this workspace's own API (apps, folders, remote-hosts), so handing it
+    # to an agent that was denied the workspace tree would give back through
+    # a command exactly what the permission just withheld.
+    if WORKSPACE_HOST_DIR and _workspace_access():
         _mount("aw-workspace-cli", "/usr/local/bin/aw-workspace-cli", ro=True)
 
     # Legacy skills mount intentionally REMOVED 2026-08-02 (Frederico): the
@@ -600,12 +689,24 @@ def _build_container_kwargs(job: dict) -> tuple[str, list[str], dict, str | None
     #
     # Gate each flag on the spec declaring it, so adding a CLI is a table
     # entry rather than another `if cli == ...` here.
-    allowed = job.get("allowed_tools") or []
-    if allowed and spec.get("allowed_tools_flag"):
-        argv += [spec["allowed_tools_flag"], ",".join(allowed)]
-    disallowed = job.get("disallowed_tools") or []
-    if disallowed and spec.get("disallowed_tools_flag"):
-        argv += [spec["disallowed_tools_flag"], ",".join(disallowed)]
+    def _tool_flags(values: list[str], flag: str | None) -> list[str]:
+        """Render a tool list the way THIS cli wants it.
+
+        claude takes one flag with a comma-joined list; copilot repeats the
+        flag once per tool (its own --help example:
+        ``--allow-tool='shell(git:*)' --deny-tool='shell(git push)'``).
+        Passing claude's shape to copilot would hand it a single tool literally
+        named "a,b,c" — an allow-list that silently matches nothing, which is
+        the quietest possible way to get the permissions wrong.
+        """
+        if not values or not flag:
+            return []
+        if spec.get("tools_flag_style") == "repeat":
+            return [arg for v in values for arg in (flag, v)]
+        return [flag, ",".join(values)]
+
+    argv += _tool_flags(job.get("allowed_tools") or [], spec.get("allowed_tools_flag"))
+    argv += _tool_flags(job.get("disallowed_tools") or [], spec.get("disallowed_tools_flag"))
     if job.get("append_system_prompt") and spec.get("append_system_prompt_flag"):
         argv += [spec["append_system_prompt_flag"], job["append_system_prompt"]]
     if mcp_config_container_path:
