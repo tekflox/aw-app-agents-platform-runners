@@ -399,22 +399,21 @@ def _build_container_kwargs(job: dict) -> tuple[str, list[str], dict, str | None
                 path.chmod(0o777 if path.is_dir() else 0o666)
             _host_creds = str(isolated_host_dir).replace(
                 str(_real_home), WORKSPACE_HOME_HOST_DIR.rstrip("/"), 1)
-            # Mount the creds FILE BY FILE, never the directory. Binding the
-            # whole dir leaves ~/.codex on the nested bind-mounted host tree,
-            # and codex's in-process app-server cannot create its socket /
-            # PATH aliases there — it dies at startup with EPERM:
-            #   WARNING: could not create PATH aliases: Operation not permitted
-            #   Error: failed to initialize in-process app-server client:
-            #          Operation not permitted (os error 1)
-            # ...which, again, surfaced as an empty green run. Proven by
-            # elimination 2026-08-13: the same image with NO mounts at all
-            # gets all the way to a 401 from the API, and the same run with
-            # per-file mounts starts normally. Per-file binds leave the DIR
-            # itself on the container's own writable layer.
-            for _f in sorted(creds_copy.iterdir()):
-                if _f.is_file():
-                    _mount_abs(f"{_host_creds}/creds/{_f.name}",
-                               f"/home/ubuntu/{creds_dir}/{_f.name}", ro=False)
+            # Hand the creds over at a NEUTRAL path and let the entrypoint
+            # copy them into the container's own $HOME below. Two distinct
+            # failures make the obvious "bind ~/.codex straight in" wrong:
+            #
+            #  * a whole-DIR bind leaves ~/.codex on the nested bind-mounted
+            #    host tree, where codex's in-process app-server cannot create
+            #    its socket / PATH aliases — EPERM at startup, run dies.
+            #  * per-FILE binds fix that, but podman then auto-creates the
+            #    parent /home/ubuntu/.codex as ROOT, and the container user
+            #    (uid 1000) cannot mkdir thread-writer-locks/ inside it —
+            #    "failed to initialize thread persistence: Permission denied".
+            #
+            # Copying into $HOME at startup sidesteps both: the dir ends up on
+            # the container's own writable layer, owned by the run user.
+            _mount_abs(f"{_host_creds}/creds", "/aw-creds", ro=True)
             # The run cwd cannot stay under <creds_dir>/isolated/ — that path
             # is now shadowed by the creds mount above and would not exist in
             # the container (podman refuses to start on a missing workdir).
@@ -644,6 +643,15 @@ def _build_container_kwargs(job: dict) -> tuple[str, list[str], dict, str | None
     )
     if _venv_site_packages:
         env["PYTHONPATH"] = str(_venv_site_packages[-1])
+
+    # See the /aw-creds staging note above: for a CLI that must read its creds
+    # off disk, copy them into the container's OWN $HOME before exec'ing it.
+    if creds_staged:
+        import shlex
+        _inner = " ".join(shlex.quote(a) for a in argv)
+        argv = ["sh", "-lc",
+                f'mkdir -p "$HOME/{creds_dir}" && cp -a /aw-creds/. "$HOME/{creds_dir}/" '
+                f'2>/dev/null; chmod -R u+rwX "$HOME/{creds_dir}" 2>/dev/null; exec {_inner}']
 
     kwargs: dict[str, Any] = {
         "name": f"aw-runner-run-{run_id}",
