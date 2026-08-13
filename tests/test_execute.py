@@ -106,31 +106,31 @@ def test_every_cli_declares_each_gated_flag_explicitly():
             assert key in spec, f"{cli} does not declare {key}"
 
 
-def test_tmp_access_mount_source_is_created_world_writable(tmp_path, monkeypatch):
-    """The bind replaces the image's 1777 /tmp. If the host dir does not
-    exist podman creates it root:root 0755 and the container — which runs as
-    the workspace uid — cannot write its own scratch:
-        EACCES: permission denied, mkdir '/tmp/claude-1001'
-    Only bites the COLD path; a warm container reuses a /tmp it already made,
-    so the agent looks healthy until it starts a fresh session."""
+def test_tmp_access_mount_source_lives_where_the_workspace_can_create_it(tmp_path, monkeypatch):
+    """podman creates a missing bind source as root:root 0755, and it made the
+    old parent (a bare data/) root-owned too — so the workspace could not
+    mkdir, chmod OR rmdir it from its own uid. The source must therefore sit
+    under AW_WORKSPACE_HOME, which the workspace owns and creates itself."""
     import os
     from agents_platform_runners_app import execute
 
     monkeypatch.setattr(execute, "WORKSPACE_CONTAINER_DIR", str(tmp_path))
-    made = execute._prepare_tmp_mount_source()
+    rel = execute._prepare_tmp_mount_source()
 
+    assert rel.startswith(".aw-workspace/"), rel
+    made = tmp_path / rel
     assert made.is_dir()
     assert oct(os.stat(made).st_mode & 0o777) == "0o777"
 
 
 def test_tmp_access_mount_source_widens_an_existing_narrow_dir(tmp_path, monkeypatch):
-    """The failure in the wild was a dir podman had ALREADY created 0755, so
+    """The dir seen in the wild was one podman had ALREADY created 0755, so
     exist_ok alone would have left it unusable."""
     import os
     from agents_platform_runners_app import execute
 
     monkeypatch.setattr(execute, "WORKSPACE_CONTAINER_DIR", str(tmp_path))
-    stale = tmp_path / "data" / "sandbox-tmp"
+    stale = tmp_path / ".aw-workspace" / "data" / "agents-platform-runners" / "sandbox-tmp"
     stale.mkdir(parents=True)
     stale.chmod(0o755)
 

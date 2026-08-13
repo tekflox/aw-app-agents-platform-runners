@@ -231,28 +231,43 @@ STREAM_TTL_S = 86400
 
 
 
-def _prepare_tmp_mount_source() -> Path:
-    """Create ``data/sandbox-tmp`` 0777 before it is bound over the container's
-    /tmp, and return it.
+def _prepare_tmp_mount_source() -> str:
+    """Create the dir that gets bound over the container's /tmp, 0777, and
+    return it RELATIVE to the workspace tree.
 
-    The bind replaces the image's own /tmp (1777). When the host dir does not
-    exist podman creates it root:root 0755, and the container — which runs as
-    the workspace uid, not root — then cannot write its own scratch::
+    The bind replaces the image's own /tmp (1777). Two things went wrong with
+    the old ``data/sandbox-tmp``:
 
-        EACCES: permission denied, mkdir '/tmp/claude-1001'
+    * that path is not one the workspace creates, so podman created it — and
+      podman creates a missing bind source as **root:root 0755**. The
+      container runs as the workspace uid, not root, so claude could not make
+      its scratch dir::
 
-    claude dies on that before the turn starts, so the run lands green with
-    the error as its entire output. Only the COLD path is affected: a warm
-    container keeps the /tmp it already made, so an agent holding tmp_access
-    looks healthy right up until it starts a fresh session.
+          EACCES: permission denied, mkdir '/tmp/claude-1001'
+
+      It dies there, before the turn, and the run lands green with that line
+      as its whole output.
+    * the workspace could not repair it either: podman had made the PARENT
+      ``data/`` root-owned too, so mkdir, chmod and even rmdir all failed
+      from uid 1001. Self-healing was impossible by construction.
+
+    So the source now lives under AW_WORKSPACE_HOME, which the workspace owns
+    and creates itself — podman never invents it — and which is also where
+    CLAUDE.md says durable per-app state belongs, rather than a bare ``data/``
+    at the repo root.
+
+    Only the COLD path ever showed this: a warm container keeps the /tmp it
+    already made, so an agent holding tmp_access looks healthy right up until
+    it starts a fresh session.
     """
-    path = Path(WORKSPACE_CONTAINER_DIR) / "data" / "sandbox-tmp"
+    rel = os.path.join(".aw-workspace", "data", "agents-platform-runners", "sandbox-tmp")
+    path = Path(WORKSPACE_CONTAINER_DIR) / rel
     try:
         path.mkdir(parents=True, exist_ok=True)
-        path.chmod(0o777)   # unconditional: an earlier root-created 0755 must be widened
+        path.chmod(0o777)   # unconditional — a pre-existing narrow dir must be widened
     except Exception:
         log.exception("execute: could not prepare %s for the /tmp mount", path)
-    return path
+    return rel
 
 
 def _codex_auth_mode(home: Path) -> str:
@@ -633,8 +648,7 @@ def _build_container_kwargs(job: dict) -> tuple[str, list[str], dict, str | None
         # path: a warm container keeps the /tmp it successfully made earlier,
         # so an agent with tmp_access looks fine right up until it starts a
         # fresh session. 0777 matches the /tmp semantics being replaced.
-        _prepare_tmp_mount_source()
-        _mount("data/sandbox-tmp", "/tmp", ro=False)
+        _mount(_prepare_tmp_mount_source(), "/tmp", ro=False)
 
     # Bare `aw-workspace-cli` on PATH from any cwd (Telegram request,
     # 2026-08-11): the script is already visible at /opt/aw-workspace/

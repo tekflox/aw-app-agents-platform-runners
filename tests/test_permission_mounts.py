@@ -158,7 +158,24 @@ def test_docker_permission_with_no_socket_present_is_skipped(tmp_path, monkeypat
 def test_tmp_access_mounts_the_shared_sandbox_tmp(tmp_path, monkeypatch):
     _setup(tmp_path, monkeypatch)
     vols = _volumes(_job(permissions={"workspace_access": True, "tmp_access": True}))
-    assert vols[f"{WS_HOST}/data/sandbox-tmp"] == {"bind": "/tmp", "mode": "rw"}
+    rel = ".aw-workspace/data/agents-platform-runners/sandbox-tmp"
+    assert vols[f"{WS_HOST}/{rel}"] == {"bind": "/tmp", "mode": "rw"}
+
+
+def test_tmp_access_source_exists_and_is_writable_by_the_run_uid(tmp_path, monkeypatch):
+    """This bind REPLACES the image's 1777 /tmp. If the source does not
+    already exist, podman creates it root:root 0755 and the container — which
+    runs as the workspace uid — cannot write its own scratch:
+        EACCES: permission denied, mkdir '/tmp/claude-1001'
+    The run then lands green with that line as its entire output."""
+    import os
+    _setup(tmp_path, monkeypatch)
+    _volumes(_job(permissions={"workspace_access": True, "tmp_access": True}))
+
+    src = (Path(execute_mod.WORKSPACE_CONTAINER_DIR)
+           / ".aw-workspace" / "data" / "agents-platform-runners" / "sandbox-tmp")
+    assert src.is_dir(), "the mount source must be created BEFORE podman sees the path"
+    assert oct(os.stat(src).st_mode & 0o777) == "0o777"
 
 
 def test_tmp_access_off_leaves_tmp_alone(tmp_path, monkeypatch):
