@@ -136,3 +136,20 @@ def test_tmp_access_mount_source_widens_an_existing_narrow_dir(tmp_path, monkeyp
 
     execute._prepare_tmp_mount_source()
     assert oct(os.stat(stale).st_mode & 0o777) == "0o777"
+
+
+def test_codex_home_is_persistent_and_keyed_by_session(tmp_path, monkeypatch):
+    """Staging the codex home inside the container made every follow-up turn
+    fail — the rollout files died with the container:
+        thread/resume failed: no rollout found for thread id <id>
+    so codex could not resume a session it had just created. The home must
+    live in the workspace tree and be keyed by session, not by run."""
+    from agents_platform_runners_app import execute
+    import inspect
+    src = inspect.getsource(execute._build_spawn) if hasattr(execute, "_build_spawn") else ""
+    if not src:
+        import pathlib
+        src = pathlib.Path(execute.__file__).read_text()
+    assert "/var/tmp/aw-" not in src, "codex home must not live inside the container"
+    assert "session_id or run_id" in src, "the home must be keyed by session first"
+    assert ".aw-workspace" in src

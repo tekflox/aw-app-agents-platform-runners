@@ -826,28 +826,52 @@ def _build_container_kwargs(job: dict) -> tuple[str, list[str], dict, str | None
     # See the /aw-creds staging note above: for a CLI that must read its creds
     # off disk, copy them into the container's OWN $HOME before exec'ing it.
     if creds_staged:
+        # PERSISTENT per-session home, bind-mounted from the workspace tree.
+        #
+        # The earlier version staged into /var/tmp INSIDE the container. That
+        # ran, but the container is ephemeral, so codex's rollout files died
+        # with it and EVERY follow-up turn failed:
+        #
+        #   Error: thread/resume: thread/resume failed: no rollout found for
+        #   thread id <id> (code -32600)
+        #
+        # i.e. codex could not resume a session it had itself just created.
+        # A chat bot that cannot continue a conversation is not working, even
+        # though each individual turn looked fine in isolation.
+        #
+        # It went to /var/tmp because a bind over ~/.codex had failed with
+        # EPERM and I read that as "the nested bind filesystem cannot host the
+        # app-server's socket". That was WRONG. The real cause was the same
+        # one behind the tmp_access bug: podman creates a missing bind source
+        # as root:root, and the run user is not root. A source this process
+        # creates itself, 0777, binds and works — verified end to end,
+        # including `codex exec resume` recalling the previous turn.
+        #
+        # Keyed by session so a conversation keeps its rollouts, and falls
+        # back to the run when there is no session (one-shot call).
         import shlex
-        # NOT under $HOME. The container runs as --user <workspace uid>:<gid>
-        # (see the long note on "user" below), while the image bakes
-        # /home/ubuntu as 0750 ubuntu:ubuntu — the run user gets r-x through
-        # --group-add, never w, so it cannot even mkdir $HOME/.codex. Every
-        # earlier attempt died here: no creds copied, then
-        # "failed to initialize in-process app-server client: Permission
-        # denied". /tmp is 1777 on the container's own writable layer, which
-        # is both writable by the run user AND a filesystem the app-server
-        # can create its socket on.
-        # /var/tmp, NOT /tmp: codex refuses a CODEX_HOME under the process
-        # temp dir outright — "Refusing to create helper binaries under
-        # temporary dir \"/tmp\"" — and then never runs a turn. /var/tmp is
-        # equally 1777 and on the same writable container layer, and is
-        # verified working end to end (real answer, real tokens) under the
-        # exact --user/--group-add the spawn uses.
-        staged_home = f"/var/tmp/aw-{creds_dir.lstrip('.')}-home"
+        _key = session_id or run_id
+        _home_rel = os.path.join(".aw-workspace", "data", "agents-platform-runners",
+                                 f"{creds_dir.lstrip('.')}-home", _key)
+        _home_abs = Path(WORKSPACE_CONTAINER_DIR) / _home_rel
+        try:
+            _home_abs.mkdir(parents=True, exist_ok=True)
+            for _p in [_home_abs, *_home_abs.parents][:3]:
+                try:
+                    _p.chmod(0o777)
+                except Exception:
+                    pass
+        except Exception:
+            log.exception("execute: could not prepare codex home %s", _home_abs)
+        staged_home = f"/aw-{creds_dir.lstrip('.')}-home"
+        _mount(_home_rel, staged_home, ro=False)
         if spec.get("home_env"):
             env[spec["home_env"]] = staged_home
         _inner = " ".join(shlex.quote(a) for a in argv)
+        # Creds are copied in only when absent, so a refreshed token written
+        # by a previous turn is not clobbered by the staged copy.
         argv = ["sh", "-lc",
-                f'mkdir -p {staged_home} && cp -a /aw-creds/. {staged_home}/ 2>/dev/null; '
+                f'[ -f {staged_home}/auth.json ] || cp -a /aw-creds/. {staged_home}/ 2>/dev/null; '
                 f'chmod -R u+rwX {staged_home} 2>/dev/null; exec {_inner}']
 
     kwargs: dict[str, Any] = {
