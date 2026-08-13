@@ -151,6 +151,9 @@ CLI_SPECS: dict[str, dict] = {
         "model_flag": "--model", "add_dir_flag": "--add-dir",
         "mcp_config_flag": "--mcp-config",
         "strict_mcp_flag": "--strict-mcp-config",
+        "allowed_tools_flag": "--allowed-tools",
+        "disallowed_tools_flag": "--disallowed-tools",
+        "append_system_prompt_flag": "--append-system-prompt",
         "creds_dir": ".claude", "creds_file": ".claude.json",
     },
     "codex": {
@@ -159,6 +162,11 @@ CLI_SPECS: dict[str, dict] = {
         "skip_perms_flag": "--dangerously-bypass-approvals-and-sandbox",
         "model_flag": "-c", "add_dir_flag": None,
         "mcp_config_flag": None,  # codex has no --mcp-config flag — see write-up below
+        # codex has none of claude's tool/system-prompt flags; the system
+        # prompt is prepended to the prompt text instead (see below).
+        "allowed_tools_flag": None,
+        "disallowed_tools_flag": None,
+        "append_system_prompt_flag": None,
         "creds_dir": ".codex", "creds_file": None,
     },
     "copilot": {
@@ -452,6 +460,13 @@ def _build_container_kwargs(job: dict) -> tuple[str, list[str], dict, str | None
         argv.extend(["resume", session_id])
 
     prompt = job.get("prompt") or ""
+    # A CLI with no --append-system-prompt equivalent (codex) would otherwise
+    # DROP the agent's persona entirely — the run still "succeeds", just as a
+    # different agent than the one that was asked for. Prepend it to the
+    # prompt so the instructions still arrive.
+    sys_prompt = job.get("append_system_prompt")
+    if sys_prompt and not spec.get("append_system_prompt_flag"):
+        prompt = f"{sys_prompt}\n\n---\n\n{prompt}" if prompt else sys_prompt
     if spec.get("prompt_flag"):
         argv += [spec["prompt_flag"], prompt]
     else:
@@ -464,14 +479,25 @@ def _build_container_kwargs(job: dict) -> tuple[str, list[str], dict, str | None
         else:
             argv += [spec["model_flag"], model]
 
+    # --allowed-tools / --disallowed-tools / --append-system-prompt are
+    # CLAUDE flags. They were emitted for every CLI, and codex rejects an
+    # unknown flag outright ("error: unexpected argument
+    # '--append-system-prompt' found") — the process then exits having
+    # published only thread.started, so the run lands as success with empty
+    # output and zero tokens instead of an error. Confirmed live 2026-08-13:
+    # every codex run through this Runner was silently a no-op, because an
+    # agent with a system_prompt always sends append_system_prompt.
+    #
+    # Gate each flag on the spec declaring it, so adding a CLI is a table
+    # entry rather than another `if cli == ...` here.
     allowed = job.get("allowed_tools") or []
-    if allowed:
-        argv += ["--allowed-tools", ",".join(allowed)]
+    if allowed and spec.get("allowed_tools_flag"):
+        argv += [spec["allowed_tools_flag"], ",".join(allowed)]
     disallowed = job.get("disallowed_tools") or []
-    if disallowed:
-        argv += ["--disallowed-tools", ",".join(disallowed)]
-    if job.get("append_system_prompt"):
-        argv += ["--append-system-prompt", job["append_system_prompt"]]
+    if disallowed and spec.get("disallowed_tools_flag"):
+        argv += [spec["disallowed_tools_flag"], ",".join(disallowed)]
+    if job.get("append_system_prompt") and spec.get("append_system_prompt_flag"):
+        argv += [spec["append_system_prompt_flag"], job["append_system_prompt"]]
     if mcp_config_container_path:
         argv += [spec["mcp_config_flag"], mcp_config_container_path]
         if spec.get("strict_mcp_flag"):
