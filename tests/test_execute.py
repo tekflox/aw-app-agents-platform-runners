@@ -47,3 +47,17 @@ def test_codex_relocates_its_home_off_the_unwritable_container_home():
     creds must be staged somewhere else and the CLI pointed at it."""
     from agents_platform_runners_app.execute import CLI_SPECS
     assert CLI_SPECS["codex"]["home_env"] == "CODEX_HOME"
+
+
+def test_codex_auth_mode_reads_chatgpt(tmp_path):
+    from agents_platform_runners_app.execute import _codex_auth_mode
+    (tmp_path / ".codex").mkdir()
+    (tmp_path / ".codex" / "auth.json").write_text('{"auth_mode": "chatgpt"}')
+    assert _codex_auth_mode(tmp_path) == "chatgpt"
+
+
+def test_codex_auth_mode_is_blank_when_unreadable(tmp_path):
+    """Must never raise — an unreadable auth.json just means no override is
+    suppressed, not a failed run."""
+    from agents_platform_runners_app.execute import _codex_auth_mode
+    assert _codex_auth_mode(tmp_path) == ""

@@ -201,6 +201,17 @@ STREAM_MAXLEN = 50_000
 STREAM_TTL_S = 86400
 
 
+
+def _codex_auth_mode(home: Path) -> str:
+    """``auth_mode`` out of codex's auth.json ("chatgpt" | "apikey"), or "" if
+    it can't be read. Best-effort on purpose: an unreadable file must not stop
+    a run, it just means no override is suppressed."""
+    try:
+        return json.loads((home / ".codex" / "auth.json").read_text()).get("auth_mode") or ""
+    except Exception:
+        return ""
+
+
 def _stream_key(run_id: str) -> str:
     return f"run:{run_id}:events"
 
@@ -558,6 +569,20 @@ def _build_container_kwargs(job: dict) -> tuple[str, list[str], dict, str | None
         argv.append(prompt)
 
     model = job.get("model")
+    # A codex CLI logged in with a ChatGPT account (auth_mode "chatgpt")
+    # accepts ONLY that account's default model. Any -c model= override is
+    # rejected by the API and the whole turn fails:
+    #   400 invalid_request_error: The 'gpt-5' model is not supported when
+    #   using Codex with a ChatGPT account.
+    # Verified 2026-08-13 for both "gpt-5-codex" (what the codex-runner-gpt-5
+    # model row asks for) and "gpt-5"; the identical run with no override
+    # answers normally. Drop the override rather than fail every run — the
+    # model row is a platform-wide default that no agent author can see is
+    # incompatible with how this workspace's codex happens to be logged in.
+    if model and cli == "codex" and _codex_auth_mode(_real_home) == "chatgpt":
+        log.info("execute: codex is logged in with a ChatGPT account — ignoring "
+                 "model override %r (only the account default is supported)", model)
+        model = None
     if model and spec.get("model_flag"):
         if spec["model_flag"] == "-c":
             argv += ["-c", f'model="{model}"']
