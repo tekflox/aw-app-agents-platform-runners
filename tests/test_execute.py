@@ -104,3 +104,35 @@ def test_every_cli_declares_each_gated_flag_explicitly():
         for key in ("allowed_tools_flag", "disallowed_tools_flag",
                     "tools_flag_style", "append_system_prompt_flag"):
             assert key in spec, f"{cli} does not declare {key}"
+
+
+def test_tmp_access_mount_source_is_created_world_writable(tmp_path, monkeypatch):
+    """The bind replaces the image's 1777 /tmp. If the host dir does not
+    exist podman creates it root:root 0755 and the container — which runs as
+    the workspace uid — cannot write its own scratch:
+        EACCES: permission denied, mkdir '/tmp/claude-1001'
+    Only bites the COLD path; a warm container reuses a /tmp it already made,
+    so the agent looks healthy until it starts a fresh session."""
+    import os
+    from agents_platform_runners_app import execute
+
+    monkeypatch.setattr(execute, "WORKSPACE_CONTAINER_DIR", str(tmp_path))
+    made = execute._prepare_tmp_mount_source()
+
+    assert made.is_dir()
+    assert oct(os.stat(made).st_mode & 0o777) == "0o777"
+
+
+def test_tmp_access_mount_source_widens_an_existing_narrow_dir(tmp_path, monkeypatch):
+    """The failure in the wild was a dir podman had ALREADY created 0755, so
+    exist_ok alone would have left it unusable."""
+    import os
+    from agents_platform_runners_app import execute
+
+    monkeypatch.setattr(execute, "WORKSPACE_CONTAINER_DIR", str(tmp_path))
+    stale = tmp_path / "data" / "sandbox-tmp"
+    stale.mkdir(parents=True)
+    stale.chmod(0o755)
+
+    execute._prepare_tmp_mount_source()
+    assert oct(os.stat(stale).st_mode & 0o777) == "0o777"

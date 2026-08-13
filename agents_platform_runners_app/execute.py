@@ -230,6 +230,31 @@ STREAM_TTL_S = 86400
 
 
 
+
+def _prepare_tmp_mount_source() -> Path:
+    """Create ``data/sandbox-tmp`` 0777 before it is bound over the container's
+    /tmp, and return it.
+
+    The bind replaces the image's own /tmp (1777). When the host dir does not
+    exist podman creates it root:root 0755, and the container — which runs as
+    the workspace uid, not root — then cannot write its own scratch::
+
+        EACCES: permission denied, mkdir '/tmp/claude-1001'
+
+    claude dies on that before the turn starts, so the run lands green with
+    the error as its entire output. Only the COLD path is affected: a warm
+    container keeps the /tmp it already made, so an agent holding tmp_access
+    looks healthy right up until it starts a fresh session.
+    """
+    path = Path(WORKSPACE_CONTAINER_DIR) / "data" / "sandbox-tmp"
+    try:
+        path.mkdir(parents=True, exist_ok=True)
+        path.chmod(0o777)   # unconditional: an earlier root-created 0755 must be widened
+    except Exception:
+        log.exception("execute: could not prepare %s for the /tmp mount", path)
+    return path
+
+
 def _codex_auth_mode(home: Path) -> str:
     """``auth_mode`` out of codex's auth.json ("chatgpt" | "apikey"), or "" if
     it can't be read. Best-effort on purpose: an unreadable file must not stop
@@ -598,6 +623,17 @@ def _build_container_kwargs(job: dict) -> tuple[str, list[str], dict, str | None
     if _perms.get("docker") and Path(DOCKER_SOCKET_PATH).exists():
         volumes[DOCKER_SOCKET_PATH] = {"bind": "/var/run/docker.sock", "mode": "rw"}
     if _perms.get("tmp_access") and WORKSPACE_HOST_DIR:
+        # Create it OURSELVES, 0777. This bind replaces the image's own /tmp
+        # (1777) with a host dir; when that dir does not exist podman creates
+        # it root:root 0755, and the container — which runs as the workspace
+        # uid, not root — then cannot write its own scratch:
+        #   EACCES: permission denied, mkdir '/tmp/claude-1001'
+        # claude dies on that before the turn starts, which lands as a green
+        # run with the error as its only output. Only ever seen on the COLD
+        # path: a warm container keeps the /tmp it successfully made earlier,
+        # so an agent with tmp_access looks fine right up until it starts a
+        # fresh session. 0777 matches the /tmp semantics being replaced.
+        _prepare_tmp_mount_source()
         _mount("data/sandbox-tmp", "/tmp", ro=False)
 
     # Bare `aw-workspace-cli` on PATH from any cwd (Telegram request,
