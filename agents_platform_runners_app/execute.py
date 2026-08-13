@@ -387,6 +387,7 @@ def _build_container_kwargs(job: dict) -> tuple[str, list[str], dict, str | None
     # token refresh inside the container does not persist (same limitation
     # the fallback branch below already documents) — the workspace's own
     # `codex login` remains the source of truth.
+    creds_staged = False
     if direct_home_mount and not spec.get("env_token_auth"):
         creds_copy = isolated_host_dir / "creds"
         try:
@@ -406,12 +407,18 @@ def _build_container_kwargs(job: dict) -> tuple[str, list[str], dict, str | None
             isolated_container_path = f"/home/ubuntu/run-{run_id}"
             isolated_host_dir.chmod(0o777)
             _mount_abs(_host_creds, isolated_container_path, ro=False)
-            direct_home_mount = False  # creds handled; skip the live-mount branch
+            creds_staged = True  # creds handled — skip BOTH branches below
         except Exception:
             log.exception("execute: could not stage %s creds for run=%s — "
                           "falling back to the live mount", creds_dir, run_id)
 
-    if direct_home_mount:
+    if creds_staged:
+        # Already mounted above. Falling through to either branch would mount
+        # a SECOND bind on the same destination and podman rejects the whole
+        # container: "fill out specgen: /home/ubuntu/.codex: duplicate mount
+        # destination".
+        pass
+    elif direct_home_mount:
         # Mount the LIVE $HOME/.claude rw straight in, exactly like
         # agentic-workspace's docker_agent.py mounts data/home/.claude rw.
         # Same underlying file the workspace's own `claude` login writes, so a
