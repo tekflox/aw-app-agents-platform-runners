@@ -92,31 +92,40 @@ def test_workspace_access_true_still_mounts_the_workspace_cli(tmp_path, monkeypa
     assert "/usr/local/bin/aw-workspace-cli" in _binds(vols)
 
 
-def test_missing_workspace_access_key_keeps_the_old_behaviour(tmp_path, monkeypatch):
-    """Fail-OPEN on absence, unlike executor.py's fail-closed default.
+def test_missing_workspace_access_key_denies(tmp_path, monkeypatch):
+    """Fail-CLOSED on absence, matching executor.py exactly.
 
-    No Agent Config here ever had to set this key, so treating absence as
-    false would un-mount the workspace from every agent at once. Absence
-    keeps the tree and logs a warning; only an explicit false denies.
+    Shipped fail-open for a few hours on 2026-08-13, as a hedge against
+    configs that might not carry the key. All six on the live tenant do, so
+    the hedge protected nothing and left the same Agent Config meaning two
+    different things depending on which executor ran it.
     """
     _setup(tmp_path, monkeypatch)
     vols = _volumes(_job(permissions={"github": False}))
-    assert vols[WS_HOST] == {"bind": WS_BIND, "mode": "rw"}
+    assert WS_HOST not in vols
+    assert WS_BIND not in _binds(vols)
 
 
-def test_absent_permissions_dict_entirely_keeps_the_old_behaviour(tmp_path, monkeypatch):
+def test_absent_permissions_dict_entirely_denies(tmp_path, monkeypatch):
     _setup(tmp_path, monkeypatch)
     vols = _volumes(_job())
-    assert vols[WS_HOST] == {"bind": WS_BIND, "mode": "rw"}
+    assert WS_HOST not in vols
+    assert WS_BIND not in _binds(vols)
 
 
-def test_missing_key_warns_so_the_default_is_visible(tmp_path, monkeypatch, caplog):
-    # A silent backwards-compatible default is how this class of bug hides;
-    # the log line is what makes the eventual flip to fail-closed safe.
+def test_the_two_executors_agree_on_every_input(tmp_path, monkeypatch):
+    """The property that actually matters, stated directly.
+
+    executor.py computes bool(permissions.get("workspace_access", False)).
+    Anything this side does that differs turns a permission into a
+    coincidence of which executor picked the run up.
+    """
     _setup(tmp_path, monkeypatch)
-    with caplog.at_level("WARNING"):
-        _volumes(_job())
-    assert any("workspace_access" in r.message for r in caplog.records)
+    for perms in ({}, {"workspace_access": True}, {"workspace_access": False},
+                  {"github": True}, {"workspace_access": None}):
+        expected = bool((perms or {}).get("workspace_access", False))
+        mounted = WS_HOST in _volumes(_job(permissions=perms))
+        assert mounted is expected, f"{perms!r}: runner={mounted} executor={expected}"
 
 
 # --- docker ------------------------------------------------------------------

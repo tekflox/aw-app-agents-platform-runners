@@ -471,30 +471,26 @@ def _build_container_kwargs(job: dict) -> tuple[str, list[str], dict, str | None
     def _workspace_access() -> bool:
         """Whether this run gets the workspace tree mounted.
 
-        Deliberately NOT ``_perms.get("workspace_access", False)``, which is
-        what agents-platform's executor.py does. This path ignored the
-        permission entirely until 2026-08-13, so no Agent Config here has
-        ever needed to set it — and a straight fail-closed port would
-        un-mount the workspace from every agent whose config simply never
-        mentions the key, which today is an unknown set that plausibly
-        includes all of them.
+        Fail-CLOSED, byte-for-byte what agents-platform's executor.py does
+        (``bool(permissions.get("workspace_access", False))`` driving
+        CliLLM's ``mount_cwd``). An Agent Config must mean the same thing
+        whichever executor happens to pick a run up; a permission that
+        depends on the execution path is not a permission, it is a
+        coincidence.
 
-        So: an EXPLICIT false is honoured (that is the case that was actually
-        wrong — the crispal-* agents opt out and were being handed the tree
-        anyway), and a missing key keeps the old behaviour and says so in the
-        log. Flip this to fail-closed, matching executor.py, once every
-        Agent Config in use carries the key explicitly.
+        This briefly shipped fail-OPEN (2026-08-13) because this path had
+        ignored the permission altogether and it was unknown whether any
+        config actually set the key. Checked on the live tenant the same
+        day: all six agent configs carry it explicitly, and the only four
+        agents with no config at all (echo-coder, fake-tool-tester,
+        monitor-shell, self-openai-agent) never reach this function — none
+        of them spawns a CLI container. So the compatibility default
+        protected nothing and silently disagreed with the other executor,
+        which is precisely the shape of bug this workspace keeps producing.
+
+        A grant is now explicit or it does not exist.
         """
-        if "workspace_access" in _perms:
-            return bool(_perms["workspace_access"])
-        log.warning(
-            "execute: run=%s agent_id=%s has no 'workspace_access' in its "
-            "Agent Config — defaulting to MOUNTED for backwards "
-            "compatibility. Set the permission explicitly; this default will "
-            "become false.",
-            run_id, job.get("agent_id") or "?",
-        )
-        return True
+        return bool(_perms.get("workspace_access", False))
 
     def _mount(host_rel: str, container_path: str, ro: bool = False) -> None:
         host_path = f"{WORKSPACE_HOST_DIR.rstrip('/')}/{host_rel.lstrip('/')}"
