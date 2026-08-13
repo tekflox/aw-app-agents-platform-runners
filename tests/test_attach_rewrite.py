@@ -364,6 +364,21 @@ class TestInboundWiring:
         assert "/.tmp/agent-inbound/run-5/p.png" in seen["prompt"]
 
 
+def _attach_mod():
+    """Load agent-images/shared/aw_attach.py by path.
+
+    It ships into the container at /usr/local/bin/aw_attach.py and is not an
+    importable package from the repo root, so these tests must not rely on
+    sys.path happening to contain agent-images/shared.
+    """
+    import importlib.util
+    spec = importlib.util.spec_from_file_location(
+        "aw_attach_under_test", ROOT / "agent-images" / "shared" / "aw_attach.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
 class TestCodexEventShape:
     """codex emits item.completed/agent_message, which matched neither branch
     of rewrite_stream_line — so a codex agent's [[ATTACH: /local/path]] was
@@ -372,23 +387,19 @@ class TestCodexEventShape:
     the user got a message announcing images and no images."""
 
     def test_an_attach_in_a_codex_message_is_rewritten(self, tmp_path, monkeypatch):
-        import json
-        from aw_attach import rewrite_stream_line
-        import aw_attach
-
+        mod = _attach_mod()
         photo = tmp_path / "p.png"
         photo.write_bytes(b"\x89PNG\r\n\x1a\n" + b"x" * 16)
-        monkeypatch.setattr(aw_attach, "_upload", lambda run_id, path, data: "p.png")
+        monkeypatch.setattr(mod, "_upload", lambda run_id, path, data: "p.png")
 
         line = json.dumps({"type": "item.completed",
                            "item": {"type": "agent_message",
                                     "text": f"aqui esta [[ATTACH: {photo}]]"}})
-        out = rewrite_stream_line(line, "run-9")
+        out = mod.rewrite_stream_line(line, "run-9")
         assert "artefact://run-9/p.png" in out, out
 
     def test_a_codex_line_without_attach_is_untouched(self):
-        import json
-        from aw_attach import rewrite_stream_line
+        mod = _attach_mod()
         line = json.dumps({"type": "item.completed",
                            "item": {"type": "agent_message", "text": "ola"}})
-        assert rewrite_stream_line(line, "run-9") == line
+        assert mod.rewrite_stream_line(line, "run-9") == line
