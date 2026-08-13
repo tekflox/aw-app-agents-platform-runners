@@ -154,6 +154,10 @@ CLI_SPECS: dict[str, dict] = {
         "allowed_tools_flag": "--allowed-tools",
         "disallowed_tools_flag": "--disallowed-tools",
         "append_system_prompt_flag": "--append-system-prompt",
+        # Auth reaches the container as CLAUDE_CODE_OAUTH_TOKEN, so the CLI
+        # never has to READ the mounted creds — which is the only reason the
+        # uid mismatch below doesn't bite claude.
+        "env_token_auth": True,
         "creds_dir": ".claude", "creds_file": ".claude.json",
     },
     "codex": {
@@ -167,6 +171,9 @@ CLI_SPECS: dict[str, dict] = {
         "allowed_tools_flag": None,
         "disallowed_tools_flag": None,
         "append_system_prompt_flag": None,
+        # auth_mode "chatgpt" has no API key to inject — codex MUST read
+        # auth.json off disk, and write its session state back.
+        "env_token_auth": False,
         "creds_dir": ".codex", "creds_file": None,
     },
     "copilot": {
@@ -359,6 +366,50 @@ def _build_container_kwargs(job: dict) -> tuple[str, list[str], dict, str | None
 
     creds_dir = spec["creds_dir"]
     creds_file = spec.get("creds_file")
+
+    # The spawned image runs as uid 1000; this workspace runs as uid 1001, and
+    # a CLI login writes its creds 0600. Mounting $HOME/<creds_dir> straight
+    # in therefore hands the container files it can neither read nor write:
+    #
+    #   $ podman run -v .../.codex:/home/ubuntu/.codex <img> sh -c 'id; cat ...'
+    #   uid=1000(ubuntu) ...
+    #   -rw------- 1 1001 1001 auth.json
+    #   cat: /home/ubuntu/.codex/config.toml: Permission denied
+    #
+    # claude never noticed because its auth arrives as an env token and it
+    # never reads those files. codex (auth_mode "chatgpt", no API key to
+    # inject) must read auth.json AND write session state — so it started a
+    # thread, failed to load config/auth, and exited without ever running a
+    # turn, which surfaced as a green run with empty output.
+    #
+    # For a CLI without env-token auth, hand the container its OWN per-run
+    # COPY of the creds, mode 0777/0666, instead of the live dir. Cost: a
+    # token refresh inside the container does not persist (same limitation
+    # the fallback branch below already documents) — the workspace's own
+    # `codex login` remains the source of truth.
+    if direct_home_mount and not spec.get("env_token_auth"):
+        creds_copy = isolated_host_dir / "creds"
+        try:
+            if creds_copy.exists():
+                shutil.rmtree(creds_copy, ignore_errors=True)
+            shutil.copytree(_real_home / creds_dir, creds_copy,
+                            ignore=shutil.ignore_patterns("isolated", "sessions", "cache"))
+            for path in [creds_copy, *creds_copy.rglob("*")]:
+                path.chmod(0o777 if path.is_dir() else 0o666)
+            _host_creds = str(isolated_host_dir).replace(
+                str(_real_home), WORKSPACE_HOME_HOST_DIR.rstrip("/"), 1)
+            _mount_abs(f"{_host_creds}/creds", f"/home/ubuntu/{creds_dir}", ro=False)
+            # The run cwd cannot stay under <creds_dir>/isolated/ — that path
+            # is now shadowed by the creds mount above and would not exist in
+            # the container (podman refuses to start on a missing workdir).
+            # Give it its own neutral, world-writable mount instead.
+            isolated_container_path = f"/home/ubuntu/run-{run_id}"
+            isolated_host_dir.chmod(0o777)
+            _mount_abs(_host_creds, isolated_container_path, ro=False)
+            direct_home_mount = False  # creds handled; skip the live-mount branch
+        except Exception:
+            log.exception("execute: could not stage %s creds for run=%s — "
+                          "falling back to the live mount", creds_dir, run_id)
 
     if direct_home_mount:
         # Mount the LIVE $HOME/.claude rw straight in, exactly like

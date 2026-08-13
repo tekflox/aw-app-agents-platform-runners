@@ -29,3 +29,13 @@ def test_isolated_cwd_hangs_off_this_clis_creds_dir():
         rel = f"{spec['creds_dir']}/isolated/run123"
         assert rel.startswith(spec["creds_dir"] + "/"), cli
     assert CLI_SPECS["codex"]["creds_dir"] == ".codex"
+
+
+def test_only_claude_authenticates_via_an_injected_env_token():
+    """The spawned image runs as uid 1000 while this workspace runs as 1001
+    and a CLI login writes creds 0600 — so a CLI that must READ its creds off
+    the mounted dir cannot use the live-mount path. claude is exempt only
+    because its auth arrives as CLAUDE_CODE_OAUTH_TOKEN."""
+    from agents_platform_runners_app.execute import CLI_SPECS
+    assert CLI_SPECS["claude"]["env_token_auth"] is True
+    assert CLI_SPECS["codex"]["env_token_auth"] is False
