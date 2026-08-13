@@ -138,18 +138,20 @@ def test_tmp_access_mount_source_widens_an_existing_narrow_dir(tmp_path, monkeyp
     assert oct(os.stat(stale).st_mode & 0o777) == "0o777"
 
 
-def test_codex_home_is_persistent_and_keyed_by_session(tmp_path, monkeypatch):
-    """Staging the codex home inside the container made every follow-up turn
-    fail — the rollout files died with the container:
-        thread/resume failed: no rollout found for thread id <id>
-    so codex could not resume a session it had just created. The home must
-    live in the workspace tree and be keyed by session, not by run."""
-    from agents_platform_runners_app import execute
-    import inspect
-    src = inspect.getsource(execute._build_spawn) if hasattr(execute, "_build_spawn") else ""
-    if not src:
-        import pathlib
-        src = pathlib.Path(execute.__file__).read_text()
-    assert "/var/tmp/aw-" not in src, "codex home must not live inside the container"
-    assert "session_id or run_id" in src, "the home must be keyed by session first"
-    assert ".aw-workspace" in src
+def test_codex_home_is_shared_and_outside_the_container(tmp_path):
+    """Two separate bugs pinned here.
+
+    1. Staging the home inside the container made every follow-up turn fail —
+       the rollouts died with the container:
+           thread/resume failed: no rollout found for thread id <id>
+    2. Keying it by `session_id or run_id` did NOT fix it: the first turn of a
+       conversation has no session_id, so its rollout landed under the run id
+       while the follow-up looked under the session id — a different, empty
+       directory."""
+    from agents_platform_runners_app.execute import _cli_home_rel
+    a = _cli_home_rel(".codex")
+    b = _cli_home_rel(".codex")
+    assert a == b, "the same CLI must always get the same home"
+    assert a.startswith(".aw-workspace/"), a
+    assert "/var/tmp" not in a and "/tmp" not in a
+    assert _cli_home_rel(".claude") != a, "different CLIs must not share a home"

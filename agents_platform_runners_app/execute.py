@@ -231,6 +231,25 @@ STREAM_TTL_S = 86400
 
 
 
+
+def _cli_home_rel(creds_dir: str) -> str:
+    """Workspace-relative dir bind-mounted as this CLI's home (CODEX_HOME).
+
+    ONE shared home, deliberately — not one per session. Keying it by
+    ``session_id or run_id`` looked right and was not: the FIRST turn of a
+    conversation has no session_id yet, so its rollout landed under the run
+    id, and the follow-up — which finally HAS a session id — looked in a
+    different, empty directory and failed to resume exactly as before::
+
+        thread/resume failed: no rollout found for thread id <id>
+
+    codex already partitions conversations by thread id inside one home,
+    exactly like a normal ~/.codex install, so there is nothing to split.
+    """
+    return os.path.join(".aw-workspace", "data", "agents-platform-runners",
+                        f"{creds_dir.lstrip('.')}-home")
+
+
 def _prepare_tmp_mount_source() -> str:
     """Create the dir that gets bound over the container's /tmp, 0777, and
     return it RELATIVE to the workspace tree.
@@ -847,12 +866,16 @@ def _build_container_kwargs(job: dict) -> tuple[str, list[str], dict, str | None
         # creates itself, 0777, binds and works — verified end to end,
         # including `codex exec resume` recalling the previous turn.
         #
-        # Keyed by session so a conversation keeps its rollouts, and falls
-        # back to the run when there is no session (one-shot call).
+        # ONE shared home, not one per session. Keying it by
+        # `session_id or run_id` looked right and was not: the FIRST turn of a
+        # conversation has no session_id yet, so its rollout landed under the
+        # run id, and the follow-up — which finally HAS a session id — looked
+        # in a different, empty directory and failed to resume all the same.
+        # codex already separates conversations by thread id inside one home,
+        # exactly like a normal ~/.codex install, so there is nothing to
+        # partition here.
         import shlex
-        _key = session_id or run_id
-        _home_rel = os.path.join(".aw-workspace", "data", "agents-platform-runners",
-                                 f"{creds_dir.lstrip('.')}-home", _key)
+        _home_rel = _cli_home_rel(creds_dir)
         _home_abs = Path(WORKSPACE_CONTAINER_DIR) / _home_rel
         try:
             _home_abs.mkdir(parents=True, exist_ok=True)
