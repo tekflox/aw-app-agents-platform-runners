@@ -1,6 +1,6 @@
 ---
 name: aw-agents
-description: "Guided agent/workflow execution via the agent-mcp server. The conductor is a MANAGER who delegates to platform agents — never executes the work themselves. Use when the user wants you to deliver a task by orchestrating the local Agents Platform — discovery → exploration → decomposition → plan presentation on presentation (approval gate) → execution workflow → tester validation → iteration → final report. Trigger on phrases like 'use aw-agents', '/aw-agents', 'run this through the platform', 'orchestrate agents to do X', or any time you'd otherwise hand-craft a multi-step plan that the platform can run."
+description: "Guided agent/workflow execution via the agents-platform MCP tools. The conductor is a MANAGER who delegates to platform agents — never executes the work themselves. Use when the user wants you to deliver a task by orchestrating the local Agents Platform — discovery → exploration → decomposition → plan presentation on presentation (approval gate) → execution workflow → tester validation → iteration → final report. Trigger on phrases like 'use aw-agents', '/aw-agents', 'run this through the platform', 'orchestrate agents to do X', or any time you'd otherwise hand-craft a multi-step plan that the platform can run."
 ---
 
 # aw-agents — Manager-style SDD over the local Agents Platform
@@ -14,20 +14,26 @@ not edit files in the target project.
 If you catch yourself reaching for a `Bash` tool to do the work, stop —
 that's a sign you should be running an agent instead.
 
-You orchestrate via the `agent-mcp` MCP server. Each phase ends with
+You orchestrate via the agents-platform MCP tools. Each phase ends with
 **evidence on presentation** so the user can see (and approve / steer) your
 delegation.
 
-> **Reached through the gateway.** The agents-platform server is an upstream of
-> the **`aw-gateway`** MCP, so its tools are namespaced `agents_platform__<tool>`
-> — the bare names below (e.g. `run_workflow_async`, `list_tools`) resolve to
-> `mcp__aw-gateway__agents_platform__<tool>`.
+> **Reached through the gateway.** The agents-platform server is an upstream
+> of the workspace's MCP gateway, so the bare names used below (e.g.
+> `run_workflow_async`, `list_tools`) arrive prefixed:
+> **`aw__agents_platform_runners__<tool>`**.
+>
+> On top of that sits whatever *your* client calls the gateway server —
+> `mcp__aw-gateway__…` in an agent container, `mcp__workspace-gateway__…` in
+> some sessions. Don't match on that outer prefix; match on the tool name.
+> If you can't find a tool, list what you actually have rather than assuming
+> it is missing.
 
 ## Hard rules
 
 1. **You delegate; you do NOT execute.** The only direct tool calls you
    may make are:
-   - `agent-mcp` tools (list/get/create/update/run/observe agents +
+   - agents-platform tools (list/get/create/update/run/observe agents +
      workflows)
    - `aw-presentation` tools (present plans and reports), if installed
    - `AskUserQuestion` / `TaskCreate` etc. (manager-level coordination)
@@ -38,9 +44,11 @@ delegation.
    source files, driving playwright in your own session, running
    migrations, calling APIs that change state.
 
-2. **Always use the agent-mcp tools** for execution. If `agent-mcp`
-   isn't connected (no `mcp__agent-mcp__*` tools available), STOP and
-   tell the user to wire it up.
+2. **Always use the agents-platform tools** for execution. If none are
+   reachable — no `…agents_platform_runners__*` tool in this session at
+   all — STOP and tell the user to wire it up. Check before you conclude
+   that: the outer prefix varies by client, so search your tool list for
+   `agents_platform_runners` rather than for an exact full name.
 
 3. **This skill is static — the platform is live.** Never rely on a
    hardcoded list of agents or workflows. **Always call `list_agents`
@@ -86,7 +94,7 @@ delegation.
    shows up orphaned in the UI and the user will rightly call you out.
    Self-check before each dispatch: *"am I passing `target_slug`?"*
 
-   > **MCP enforcement:** The `agent-mcp` server enforces this at the
+   > **MCP enforcement:** the agents-platform MCP server enforces this at the
    > protocol level — any call to `run_agent_async`, `run_workflow_async`,
    > `run_agents_parallel`, `agent_<slug>`, or `workflow_<slug>` without
    > `target_slug` returns a **400 error**. You cannot bypass it. If you
@@ -175,7 +183,7 @@ choose here feed Phase 1.4's `search_lessons` / `lesson_forecast` calls.
 > of that — including a small task, a quick investigation, or a
 > single-agent dispatch — STILL gets a Target. Default is ON.
 
-Call `mcp__agent-mcp__create_target` with:
+Call `create_target` with:
 
 | Field | What goes here |
 |---|---|
@@ -192,17 +200,17 @@ Call `mcp__agent-mcp__create_target` with:
 (or `target_id`) on EVERY subsequent dispatch:**
 
 ```python
-mcp__agent-mcp__run_agent_async(
+run_agent_async(
     slug="...",
     input="...",
     target_slug="aw-docker-image",   # <- THIS, every time
 )
-mcp__agent-mcp__run_workflow_async(
+run_workflow_async(
     slug="...",
     input="...",
     target_slug="aw-docker-image",   # <- THIS, every time
 )
-mcp__agent-mcp__run_agents_parallel(
+run_agents_parallel(
     ...,
     target_slug="aw-docker-image",   # <- THIS, every time
 )
@@ -233,8 +241,8 @@ this last time" sitting in a table and actually being applied.
 1. Derive the **task category** from Phase 1 (Cat 1–7 per
    `project-manager`'s classification rules), and **domain tags** from
    the user's brief (e.g. `platform`, `sql`, `terraform`, `react`, etc.).
-2. Call `mcp__agent-mcp__search_lessons(tags="<cat>,<tag1>,<tag2>", limit=20)`.
-3. **Also call `mcp__agent-mcp__lesson_forecast(tags=..., category=...)`**
+2. Call `search_lessons(tags="<cat>,<tag1>,<tag2>", limit=20)`.
+3. **Also call `lesson_forecast(tags=..., category=...)`**
    when it exists — gives predicted cost/wall + top lessons.
 4. Triage the returned lessons:
    - **High-confidence + on-tag** → pass to PM verbatim. PM MUST
@@ -253,7 +261,7 @@ itself a finding — note that this is the first Target in its category.
 
 ### Phase 1.4.5 — Historical retro-score briefing
 
-Before dispatching to project-manager (Phase 1.5), for EACH agent on the inventory that the user's task plausibly maps to, call `mcp__agent-mcp__list_retro_scores` filtered to (last 30 days, that agent slug). Aggregate into a brief table:
+Before dispatching to project-manager (Phase 1.5), for EACH agent on the inventory that the user's task plausibly maps to, call `list_retro_scores` filtered to (last 30 days, that agent slug). Aggregate into a brief table:
 
 | agent | n | avg overall | avg accuracy | avg output_quality | flags |
 
@@ -564,5 +572,5 @@ Example:
 - Trivial single-turn requests that don't need orchestration. Just
   answer.
 - Tasks the user explicitly wants you to do yourself.
-- When `agent-mcp` isn't connected — tell the user how to wire it up
+- When no agents-platform MCP tools are reachable — tell the user how to wire it up
   instead of silently degrading.
