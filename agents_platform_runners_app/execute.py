@@ -967,7 +967,25 @@ ATTACH_HELPER_PATH = _SHARED_DIR / "aw_attach.py"
 # _build_warm_kwargs branch below — there is no generic implementation,
 # because each CLI's actual multi-turn wire protocol differs (claude: plain
 # stream-json lines; codex: stateful JSON-RPC over its app-server).
-WARM_CAPABLE_CLIS = frozenset({"claude", "codex"})
+#
+# codex is OFF again (2026-08-14, same day it went in): warm codex breaks
+# conversation continuity, live-verified through the aw-cris bot on Telegram.
+# Turn 1 answered and spawned aw-warm-<agent>-019ffb9b…; turn 2 of the SAME
+# chat arrived carrying a DIFFERENT session_id (01a0015c…), spawned a SECOND
+# warm container, and answered "não encontrei nenhum número secreto" to a
+# number it had just been told. The same test on the cold path answers
+# correctly. Cost is compounding: one leaked warm container per message, and
+# no memory between them.
+#
+# Cause is the shape of what reaches agents-platform: it learns a session id
+# by reading the run's own output stream (its models/cli.py captures it from
+# the CLI's events), and aw-warm-relay-codex.py republishes codex
+# APP-SERVER JSON-RPC frames — not the `codex exec --json` events that
+# parser knows. No thread id is ever captured, so every turn looks like a new
+# conversation. Re-enabling codex means making the relay emit (or the
+# consumer understand) a thread id, and proving turn 2 lands in turn 1's
+# container before it goes anywhere near real traffic.
+WARM_CAPABLE_CLIS = frozenset({"claude"})
 
 
 def _host_path_for(container_side_path: Path) -> str:
