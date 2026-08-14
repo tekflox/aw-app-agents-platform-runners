@@ -10,13 +10,15 @@ agents-platform-multitenant::
     POST /api/agent-configs   -> AgentConfig
     POST /api/agent-groups    -> AgentGroup
     POST /api/agents          -> Agent
+    POST /api/agent-flows     -> AgentFlow
 
 **The order above is the contract, not an implementation detail.** An Agent
-carries ``model_slug``, ``agent_config_slug`` and ``group_slug``, and the
-platform stores them as plain slug references — a wrong order doesn't error,
-it produces an agent pointing at three things that don't exist yet. Doing
-the sequencing here is the whole reason the provider takes the entire
-declaration in one call instead of one object at a time.
+carries ``model_slug``, ``agent_config_slug`` and ``group_slug``, and an
+AgentFlow's ``graph`` names agents by slug — the platform stores all of
+these as plain slug references, so a wrong order doesn't error, it produces
+an object pointing at things that don't exist yet. Doing the sequencing
+here is the whole reason the provider takes the entire declaration in one
+call instead of one object at a time.
 
 Create-if-absent, matched by slug, never updated
 ------------------------------------------------
@@ -73,10 +75,15 @@ ENDPOINTS: dict[str, tuple[str, frozenset[str]]] = {
         "tool_specs", "skill_slugs", "params", "mcp_config", "extra_volumes",
         "permissions", "icon", "color",
     })),
+    "agent_flows": ("/api/agent-flows", frozenset({
+        "slug", "name", "description", "enabled", "graph", "max_hops",
+        "budget_tokens", "budget_usd",
+    })),
 }
 
-#: Creation order — an Agent references the other three by slug.
-ORDER = ("models", "agent_configs", "groups", "agents")
+#: Creation order — an Agent references the other three by slug, and an
+#: AgentFlow's graph references agents by slug, so it goes last.
+ORDER = ("models", "agent_configs", "groups", "agents", "agent_flows")
 
 #: ``display_name`` is required by the platform's ModelIn but is pure
 #: presentation; defaulting it from the slug spares every manifest a field

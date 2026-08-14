@@ -3,8 +3,8 @@
 Exercises the whole seed against a stubbed agents-platform — no network, no
 running instance. What matters and is asserted here:
 
-* the four kinds are created in dependency order (an Agent's model/config/
-  group slugs must already exist),
+* the five kinds are created in dependency order (an Agent's model/config/
+  group slugs must already exist; an AgentFlow's graph names agents),
 * an existing slug is never POSTed and never updated,
 * a 409 is already-there, not a failure,
 * an unreachable platform degrades to logs instead of raising into the app
@@ -28,6 +28,15 @@ SPEC = {
     "agents": [{"slug": "sec-reviewer", "name": "Security Reviewer",
                 "model_slug": "sonnet", "agent_config_slug": "rev-cfg",
                 "group_slug": "reviewers"}],
+    "agent_flows": [{"slug": "sec-flow", "name": "Security Flow",
+                     "enabled": True, "graph": {
+                         "nodes": [
+                             {"id": "source", "type": "source", "label": "Source"},
+                             {"id": "a", "type": "agent",
+                              "agent_slug": "sec-reviewer", "label": "Reviewer"},
+                         ],
+                         "edges": [{"source": "source", "target": "a"}],
+                     }}],
 }
 
 
@@ -66,17 +75,33 @@ def _seed(platform, spec=SPEC, **kw):
 def test_creates_every_declared_object():
     platform = FakePlatform()
     assert _seed(platform) == {
-        "models": 1, "agent_configs": 1, "groups": 1, "agents": 1}
+        "models": 1, "agent_configs": 1, "groups": 1, "agents": 1,
+        "agent_flows": 1}
 
 
-def test_creation_order_puts_the_agent_last():
+def test_creation_order_puts_the_flow_last_and_the_agent_before_it():
     # A wrong order doesn't error — agents-platform stores model_slug /
-    # agent_config_slug / group_slug as plain strings. It just produces an
-    # agent pointing at three things that don't exist. Hence this test.
+    # agent_config_slug / group_slug as plain strings, and an AgentFlow's
+    # graph names agents the same way. It just produces objects pointing at
+    # things that don't exist. Hence this test.
     platform = FakePlatform()
     _seed(platform)
     assert [path for path, _ in platform.posts] == [
-        "/api/models", "/api/agent-configs", "/api/agent-groups", "/api/agents"]
+        "/api/models", "/api/agent-configs", "/api/agent-groups",
+        "/api/agents", "/api/agent-flows"]
+
+
+def test_a_flow_keeps_its_graph_and_enabled_flag():
+    # The graph is the whole point of a flow, and `enabled` is what makes
+    # the platform inject flow context into its member agents at dispatch —
+    # a flow seeded with either dropped is a flow that does nothing.
+    platform = FakePlatform()
+    _seed(platform)
+    path, body = platform.posts[-1]
+    assert path == "/api/agent-flows"
+    assert body["enabled"] is True
+    assert [n["id"] for n in body["graph"]["nodes"]] == ["source", "a"]
+    assert body["graph"]["edges"] == [{"source": "source", "target": "a"}]
 
 
 def test_an_existing_slug_is_never_posted():

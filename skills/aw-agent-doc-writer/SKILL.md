@@ -15,8 +15,10 @@ wrote.
 ## Mandatory: search the knowledge base before starting
 
 **Before doing anything else on any non-trivial task, call
-`search_knowledge_base`** (via the `aw-knowledge-base` MCP, if available in
-this session) using the task description as the query. Run 2–3 searches
+`search_knowledge_base`** using the task description as the query. The tool
+name depends on how the KB reaches this session: `search_knowledge_base`
+directly, or `aw__kb__search_knowledge_base` when routed through the
+`aw-gateway` MCP server — both are the same tool. Run 2–3 searches
 with different angles if the first pass comes back thin. This surfaces
 prior decisions, existing docs covering the same area, and gotchas specific
 to this codebase.
