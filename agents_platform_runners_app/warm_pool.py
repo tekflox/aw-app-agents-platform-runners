@@ -53,6 +53,20 @@ EPOCH_LABEL = "aw.epoch"
 # never polled or enforced from out here.
 WARM_TTL_S = 21600
 
+# How long drain() waits for a drained container to stop before leaving it to
+# the periodic sweep. Comfortably longer than a normal turn; a genuinely long
+# one just gets collected by reap() instead.
+DRAIN_COLLECT_S = 900
+
+# A `-draining-<ts>` container still running this long after being asked to
+# leave is not going to leave on its own (its wrapper is wedged, or its turn
+# never ended). reap() force-removes it then — a garbage-collection backstop,
+# deliberately far outside any real turn's lifetime.
+DRAIN_GRACE_S = 3600
+
+# Minimum spacing between the sweeps maybe_reap() actually runs.
+REAP_INTERVAL_S = 600
+
 # Mirrors agents-platform's warm_pool.GENERATION_KEY exactly — deliberately
 # the SAME Redis key, on the SAME shared Redis instance (this app's
 # shared_redis_url secret talks to the same instance as agents-platform's
@@ -205,12 +219,100 @@ def drain(client, name: str) -> None:
     solely to the hard-abort path, and mixing the two was explicitly
     rejected there after a "gracefully cancelled" container once survived
     16+ minutes. Keep this function free of kill/stop against docker,
-    forever."""
+    forever.
+
+    Once the wrapper HAS exited on its own, the stopped container is pure
+    garbage — `get_or_create` spawns with ``remove=False`` (it must: a warm
+    container outlives the run that created it), so nothing ever cleaned
+    these up and they accumulated one per drain. 49 warm containers, 33 of
+    them ``-draining-``, all long dead, were sitting on the podman host on
+    2026-08-14. Removing a container that has already stopped is not the
+    kill/stop this docstring forbids — that prohibition is about ending a
+    RUNNING container, which this still never does."""
     try:
         c = client.containers.get(name)
         c.exec_run(["touch", "/home/ubuntu/.aw-warm/drain"])
     except Exception:
         log.warning("warm_pool.drain: touch drain flag failed for %s", name, exc_info=True)
+        return
+    # Bounded wait for the wrapper's own exit, then collect the corpse. A turn
+    # still in flight is uncapped by design, so a container that outlasts this
+    # is simply left to reap()'s later sweep rather than hurried along.
+    deadline = time.monotonic() + DRAIN_COLLECT_S
+    while time.monotonic() < deadline:
+        time.sleep(5)
+        try:
+            c.reload()
+            if c.status == "running":
+                continue
+            c.remove(force=False)
+            log.info("warm_pool.drain: %s exited and was removed", name)
+        except Exception:
+            log.debug("warm_pool.drain: post-exit removal of %s failed", name, exc_info=True)
+        return
+
+
+_last_reap = 0.0
+_reap_lock = threading.Lock()
+
+
+def reap(client, *, drain_grace_s: int = DRAIN_GRACE_S) -> int:
+    """Remove warm containers that can never serve another turn, and return
+    how many went.
+
+    Two kinds of garbage, both created by the normal happy path:
+      * **stopped** warm containers — every drained or TTL-expired one, since
+        they are spawned with ``remove=False``;
+      * **wedged drainers** — a `-draining-<ts>` container still running an
+        hour after it was asked to exit.
+
+    Never touches a live, correctly-named warm container: those are the whole
+    point of the pool, and one sitting idle between turns is indistinguishable
+    from one about to receive the next message."""
+    removed = 0
+    try:
+        containers = client.containers.list(all=True, filters={"label": f"{WARM_LABEL}=1"})
+    except Exception:
+        log.warning("warm_pool.reap: could not list warm containers", exc_info=True)
+        return 0
+    now = time.time()
+    for c in containers:
+        name = getattr(c, "name", "") or ""
+        try:
+            if c.status != "running":
+                c.remove(force=True)
+                removed += 1
+                continue
+            if "-draining-" not in name:
+                continue
+            try:
+                started = int(name.rsplit("-draining-", 1)[1])
+            except (IndexError, ValueError):
+                continue
+            if now - started > drain_grace_s:
+                c.remove(force=True)
+                removed += 1
+                log.warning("warm_pool.reap: force-removed %s — still running %.0fs after drain",
+                            name, now - started)
+        except Exception:
+            log.debug("warm_pool.reap: removal of %s failed", name, exc_info=True)
+    if removed:
+        log.info("warm_pool.reap: removed %d dead warm container(s)", removed)
+    return removed
+
+
+def maybe_reap(client) -> None:
+    """Throttled, fire-and-forget reap() — safe to call on every dispatch.
+
+    The sweep is a handful of API calls against the podman socket, but a
+    dispatch is on the turn's critical path, so it runs at most every
+    REAP_INTERVAL_S and always on a background thread."""
+    global _last_reap
+    with _reap_lock:
+        if time.monotonic() - _last_reap < REAP_INTERVAL_S:
+            return
+        _last_reap = time.monotonic()
+    threading.Thread(target=lambda: reap(client), name="warm-reap", daemon=True).start()
 
 
 def _wait_ready(client, name: str, timeout_s: float = 10.0) -> None:

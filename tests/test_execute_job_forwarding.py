@@ -116,6 +116,13 @@ def test_no_field_execute_py_reads_is_dropped_by_the_route():
     # `body.get(...)` forwarding, so exempt it from the contract.
     consumed -= {"run_id"}
 
+    # `_`-prefixed keys are execute.py's own scratch space on the job dict
+    # (e.g. _warm_minted_session, set by _run_job_blocking and read back by
+    # _build_warm_kwargs). They are deliberately NOT request fields — a
+    # caller sending one would be a client forging internal state — so the
+    # forwarding contract must not demand routes.py pass them through.
+    consumed = {k for k in consumed if not k.startswith("_")}
+
     missing = consumed - forwarded
     assert not missing, (
         f"execute.py reads job[{missing!r}] but routes.py's job dict literal "

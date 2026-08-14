@@ -28,9 +28,11 @@ import asyncio
 import json
 import logging
 import os
+import threading
 from pathlib import Path
 
 from . import agent_provisioner as agent_provisioner_mod
+from . import execute as execute_mod
 from . import routes as routes_mod
 from . import shared_redis as shared_redis_mod
 from . import skills_sync as skills_sync_mod
@@ -153,6 +155,13 @@ class AgentsPlatformRunnersAppPlugin:
             redis_url = shared_redis_mod.resolve(config)
             if redis_url:
                 warm_pool_mod.bump_generation(redis_url)
+
+            # ...and since that bump condemns every existing warm container,
+            # boot is also the cheapest moment to clear the ones that already
+            # died. Backgrounded: a podman socket that is slow (or absent)
+            # must never hold up activation.
+            threading.Thread(target=execute_mod.reap_dead_warm_containers,
+                             name="warm-reap-boot", daemon=True).start()
 
         log.info(
             "aw-app-agents-platform-runners activated: mcp.json servers=%s, routes mounted",

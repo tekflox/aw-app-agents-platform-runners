@@ -1018,7 +1018,12 @@ def _build_warm_kwargs(job: dict, epoch_hash: str, redis_url: str) -> tuple[str,
 
     kwargs["entrypoint"] = ["/usr/local/bin/aw-warm-wrapper"]
     claude_argv = [spec["bin"], "--input-format", "stream-json", *spec["default_extra"]]
-    claude_argv += ["--resume", session_id]
+    # A session_id minted by _run_job_blocking names a session that does not
+    # exist yet — `--resume` on it fails ("no conversation found"). `--session-id`
+    # is the create-with-this-id form; every later turn of the same session
+    # arrives with the id from the caller and resumes normally.
+    claude_argv += (["--session-id", session_id] if job.get("_warm_minted_session")
+                    else ["--resume", session_id])
     model = job.get("model")
     if model and spec.get("model_flag"):
         claude_argv += [spec["model_flag"], model]
@@ -1086,6 +1091,64 @@ def _dispatch_warm_turn(client, job: dict, redis_url: str) -> None:
         client=client, name=name, run_id=run_id, prompt=job.get("prompt") or "",
         notion_task_id=job.get("notion_task_id"), source_device=job.get("source_device"),
     )
+    # Dead warm containers are only ever produced BY this path (drain, TTL
+    # expiry), so this is where it costs least to notice them. Throttled and
+    # backgrounded — the turn is already on its way.
+    warm_pool.maybe_reap(client)
+
+
+def mint_warm_session_id(job: dict) -> bool:
+    """Give a first-turn job a session id of our own, so it can go warm too.
+    Mutates `job` and returns whether it did.
+
+    Turn 1 of a session used to be COLD by construction: a warm container is
+    keyed by session_id, and the caller has none to send until claude itself
+    invents one on that first turn — so every new conversation paid a full
+    container spawn, 39% of all dispatches measured live on 2026-08-14. The
+    chicken-and-egg is only real while claude is the one choosing the id:
+    mint it here instead and hand it over as `--session-id <uuid>` (see
+    _build_warm_kwargs) and turn 1 is warmable like any other.
+
+    Nothing downstream has to learn about this. The id still reaches
+    agents-platform exactly as before — claude echoes it in its own
+    system/init event, which aw-warm-relay.py republishes verbatim — so
+    RunnerLLM keeps reading the session id off the stream and sends it back
+    as session_id on turn 2, which then names this same container.
+
+    Only ever mints where the job would otherwise fall through to the cold
+    path, so a caller that does send a session_id is never second-guessed.
+    """
+    if not (warm_pool.enabled()
+            and (job.get("cli") or "claude") == "claude"
+            # agent_id is the other half of the container name — without one
+            # every agent's first turns would share `aw-warm-None-<uuid>`.
+            and job.get("agent_id")
+            and not job.get("session_id")):
+        return False
+    job["session_id"] = str(uuid.uuid4())
+    # Read back by _build_warm_kwargs: this session does not exist yet, so its
+    # argv must be `--session-id` (create) and NOT `--resume`, which would
+    # fail outright — there is no rollout to resume.
+    job["_warm_minted_session"] = True
+    return True
+
+
+def reap_dead_warm_containers() -> int:
+    """Boot-time sweep of dead warm containers, for plugin.activate to call.
+
+    Every restart of this app bumps the warm generation, so each live warm
+    container is about to be drained-and-replaced anyway — boot is exactly
+    when yesterday's corpses are worth clearing. Returns 0 (never raises)
+    when there's no podman socket to talk to."""
+    if not CONTAINER_SOCKET:
+        return 0
+    try:
+        import docker as docker_sdk
+        client = docker_sdk.DockerClient(base_url="unix://" + CONTAINER_SOCKET)
+        return warm_pool.reap(client)
+    except Exception:
+        log.warning("execute: boot-time warm reap failed", exc_info=True)
+        return 0
 
 
 def _run_job_blocking(job: dict, redis_url: str) -> None:
@@ -1116,6 +1179,10 @@ def _run_job_blocking(job: dict, redis_url: str) -> None:
                       "(prompt left with its URLs)", run_id)
 
     import docker as docker_sdk
+
+    if mint_warm_session_id(job):
+        log.info("execute: minted session_id=%s for run=%s — first turn goes warm",
+                 job["session_id"], run_id)
 
     # Warm path (ON by default since 0.32.0, switched off with the
     # warm_container config field — see warm_pool.enabled()/configure()):
