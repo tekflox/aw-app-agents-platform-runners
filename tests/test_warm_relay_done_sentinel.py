@@ -29,6 +29,17 @@ RELAY_PATH = ROOT / "agent-images" / "shared" / "aw-warm-relay.py"
 
 
 def _load_relay():
+    """Import the relay by path (its filename has dashes).
+
+    `redis` is stubbed rather than required: the relay only ever runs inside
+    an agent container, which has it — CI does not, and these tests replace
+    `from_url` anyway, so depending on the real package would only make them
+    fail somewhere the code never runs.
+    """
+    if "redis" not in sys.modules:
+        stub = type(sys)("redis")
+        stub.from_url = lambda *_a, **_kw: None  # always monkeypatched below
+        sys.modules["redis"] = stub
     spec = importlib.util.spec_from_file_location("aw_warm_relay", str(RELAY_PATH))
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
