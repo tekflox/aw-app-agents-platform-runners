@@ -163,3 +163,79 @@ def test_a_transport_error_does_not_escape():
     p = AgentProvisioner(base="http://ap.test", token="tok",
                          transport=httpx.MockTransport(explode))
     assert p.seed("sec-app", SPEC) == {}
+
+
+# --- credential refresh on an object that already exists ---------------------
+#
+# Seed-once protects what a user tunes. A gateway token is not that: nobody
+# types it, and it dies when the gateway rotates. Freezing it at first install
+# is what produced agents with a perfect-looking config and zero MCP tools.
+
+REF_SPEC = {"agent_configs": [{"slug": "rev-cfg", "name": "Reviewer Config",
+                               "mcp_servers": ["aw-gateway"]}]}
+_GW = {"aw-gateway": {"url": "http://gw:9200/mcp",
+                      "headers": {"Authorization": "Bearer fresh"}}}
+
+
+def _seed_with_gateway(platform, spec=REF_SPEC, servers=None):
+    import agents_platform_runners_app.agent_provisioner as mod
+    orig = mod.resolve_mcp_servers
+    mod.resolve_mcp_servers = lambda names, **kw: dict(servers or _GW)
+    try:
+        return _seed(platform, spec)
+    finally:
+        mod.resolve_mcp_servers = orig
+
+
+class RecordingPlatform(FakePlatform):
+    def __init__(self, *a, **kw):
+        super().__init__(*a, **kw)
+        self.puts: list[tuple[str, dict]] = []
+
+    def handler(self, request):
+        if request.method == "PUT":
+            self.puts.append((request.url.path, json.loads(request.content)))
+            return httpx.Response(200, json={})
+        return super().handler(request)
+
+
+def test_an_existing_config_gets_its_credentials_refreshed():
+    platform = RecordingPlatform(existing={"/api/agent-configs": ["rev-cfg"]})
+    _seed_with_gateway(platform)
+    assert platform.puts == [("/api/agent-configs/rev-cfg",
+                              {"mcp_config": {"servers": _GW}})]
+
+
+def test_the_refresh_touches_only_mcp_config():
+    # A user who retuned a name/description keeps it — we PUT one field.
+    platform = RecordingPlatform(existing={"/api/agent-configs": ["rev-cfg"]})
+    _seed_with_gateway(platform)
+    _, body = platform.puts[0]
+    assert list(body) == ["mcp_config"]
+
+
+def test_a_hand_written_mcp_config_is_never_refreshed():
+    # The app spelled it out itself, so it owns it — and a user's hand-edit
+    # in the UI has to survive.
+    platform = RecordingPlatform(existing={"/api/agent-configs": ["rev-cfg"]})
+    _seed(platform, {"agent_configs": [{"slug": "rev-cfg", "name": "R",
+                                        "mcp_config": {"servers": {}}}]})
+    assert platform.puts == []
+
+
+def test_the_internal_marker_never_reaches_the_platform():
+    # agents-platform 422s on an unknown field.
+    platform = RecordingPlatform()
+    _seed_with_gateway(platform)
+    _, body = platform.posts[0]
+    assert "_mcp_by_reference" not in body
+    assert body["mcp_config"] == {"servers": _GW}
+
+
+def test_a_failed_refresh_never_raises():
+    class Failing(RecordingPlatform):
+        def handler(self, request):
+            if request.method == "PUT":
+                return httpx.Response(500, text="boom")
+            return FakePlatform.handler(self, request)
+    _seed_with_gateway(Failing(existing={"/api/agent-configs": ["rev-cfg"]}))

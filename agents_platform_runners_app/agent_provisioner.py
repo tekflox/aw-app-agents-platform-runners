@@ -147,6 +147,9 @@ class AgentProvisioner:
             if not slug:
                 continue
             if slug in existing:
+                # Content is seeded once and never rewritten — but a
+                # CREDENTIAL is not content. See _refresh_credentials.
+                self._refresh_credentials(client, app_id, kind, path, slug, entry)
                 log.debug("%s %r already exists, leaving it alone", kind, slug)
                 continue
             body = _payload(kind, entry, allowed)
@@ -167,6 +170,44 @@ class AgentProvisioner:
             count += 1
             log.info("seeded %s %r from %s", kind, slug, app_id)
         return count
+
+    def _refresh_credentials(self, client: httpx.Client, app_id: str, kind: str,
+                             path: str, slug: str, entry: dict[str, Any]) -> None:
+        """Re-assert the resolved ``mcp_config`` on an object that already exists.
+
+        Seed-once protects what a USER tunes — a system prompt, a model
+        choice, a flow graph. A gateway bearer token is not that. It is
+        derived by this machine at resolve time, nobody types it, and it
+        stops working the moment the gateway rotates it. Freezing it at
+        first install produces an agent whose config looks perfect in the UI
+        and has no MCP surface at all: the gateway 401s, the client
+        registers zero tools, and nothing anywhere reports it.
+
+        So the rule this provider implements is narrower than "never
+        update": **content is seeded once, credentials are re-asserted on
+        every activation.** Only entries that declared ``mcp_servers``
+        (by-name, credential-free — see apply_mcp_references) are touched,
+        and only their ``mcp_config`` field, so a user who edited a prompt
+        or swapped a model keeps that edit.
+
+        Failure is logged and swallowed: a stale token is bad, an app that
+        won't activate is worse.
+        """
+        # Only by-reference declarations. An app that spelled mcp_config out
+        # by hand owns it, and a user's hand-edit must survive.
+        if not entry.get("_mcp_by_reference") or not entry.get("mcp_config"):
+            return
+        try:
+            resp = client.put(f"{path}/{slug}", json={"mcp_config": entry["mcp_config"]})
+        except httpx.HTTPError as exc:
+            log.warning("could not refresh mcp credentials on %s %r from %s: %s",
+                        kind, slug, app_id, exc)
+            return
+        if resp.status_code >= 400:
+            log.warning("could not refresh mcp credentials on %s %r from %s: HTTP %s",
+                        kind, slug, app_id, resp.status_code)
+            return
+        log.info("refreshed mcp credentials on %s %r from %s", kind, slug, app_id)
 
     def _existing_slugs(self, client: httpx.Client, path: str, kind: str) -> set[str]:
         """Slugs already present. An unreadable list yields the empty set —
@@ -299,6 +340,11 @@ def apply_mcp_references(
             new = {k: v for k, v in entry.items() if k != "mcp_servers"}
             if servers:
                 new["mcp_config"] = {"servers": servers}
+                # Marks this mcp_config as machine-derived, so _refresh_
+                # credentials may re-assert it on an object that already
+                # exists. Stripped before the POST by _payload (it is not in
+                # any kind's allowed set), so it never reaches the platform.
+                new["_mcp_by_reference"] = True
             expanded.append(new)
         out[kind] = expanded
     return out
