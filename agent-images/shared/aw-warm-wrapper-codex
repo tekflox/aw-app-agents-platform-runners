@@ -6,16 +6,19 @@
 # dispatch_turn) is shared by both CLIs and needs zero changes either way.
 #
 # The difference is entirely on WHAT reads the FIFO. claude speaks simple
-# stream-json lines with no request/response correlation, so its wrapper
-# pipes the FIFO straight into claude's own stdin. codex's app-server speaks
-# real JSON-RPC (initialize once, thread/start once, then turn/start per
-# turn, completion signalled by an ASYNC turn/completed notification) — that
-# needs a stateful process on both ends of the pipe, not a blind byte
-# passthrough. So this wrapper hands the FIFO to aw-warm-relay-codex.py,
-# which owns the `codex app-server --stdio` child process itself and does
-# both the JSON-RPC bookkeeping AND the Redis publish in one place (unlike
-# claude, where aw-warm-wrapper owns the CLI process and a separate
-# aw-warm-relay.py only reads its stdout).
+# stream-json lines on the stdin of ONE long-lived process, so its wrapper
+# pipes the FIFO straight into claude's own stdin and never thinks about
+# turns. codex has no such stdin turn protocol, so this wrapper hands the
+# FIFO to aw-warm-relay-codex.py, which runs one `codex exec resume` per
+# turn and publishes its output itself (unlike claude, where aw-warm-wrapper
+# owns the CLI process and a separate aw-warm-relay.py only reads stdout).
+#
+# What stays warm here is the container, not a CLI process: create/start,
+# the image check, every mount and the creds copy into $HOME all happen
+# once instead of per turn. See the relay's own docstring for why the
+# app-server route this file originally described was abandoned — its
+# JSON-RPC frames are the wrong shape for agents-platform's consumer, which
+# only understands `codex exec --json` events.
 #
 # Runtime files live under $RUNDIR ($HOME-relative, NOT /aw/ — see
 # aw-warm-wrapper's own comment for why):
@@ -25,8 +28,8 @@
 #                             each turn, so the relay tags published lines
 #                             with the right run_id
 #   $RUNDIR/drain           — touched by warm_pool.drain()
-#   $RUNDIR/ready           — touched once the relay's app-server child is
-#                             spawned; warm_pool polls for this after create
+#   $RUNDIR/ready           — touched once the relay is spawned and reading
+#                             the FIFO; warm_pool polls for this after create
 set -e
 
 RUNDIR="$HOME/.aw-warm"
