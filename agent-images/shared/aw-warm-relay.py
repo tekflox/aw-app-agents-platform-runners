@@ -12,11 +12,35 @@ and published exactly like aw-connector-redis does:
 cli.py's existing Redis-stream consumer (``consume_stream_into_queue``)
 therefore needs zero changes to read a warm turn's output.
 
-A claude stream-json turn ends with a ``{"type":"result",...}`` event. The
-moment one is seen, this also publishes that stream's "done" sentinel
-(``{"done": "1", "returncode": "0"}``) so the consumer — which is waiting
-for exactly that — finalises the run normally. The relay process itself
-never exits between turns; only the wrapper's drain/TTL logic ends it.
+A claude stream-json turn ends with a ``{"type":"result",...}`` event. On
+the result that ends the DISPATCHED turn, this also publishes that stream's
+"done" sentinel (``{"done": "1", "returncode": "0"}``) so the consumer —
+which is waiting for exactly that — finalises the run normally. The relay
+process itself never exits between turns; only the wrapper's drain/TTL
+logic ends it.
+
+**Not every result ends a dispatch.** claude re-invokes itself when work it
+backgrounded finishes (a `run_in_background` Agent/Bash task, a scheduled
+wakeup), and each of those continuations emits its own `result` — tagged
+``"origin": {"kind": "task-notification"}`` (or another harness kind). The
+turn fed in over the FIFO is the only one with no ``origin`` at all.
+
+Treating every result as terminal, which this did until 2026-08-14, breaks
+the NEXT run rather than the one that continued. The container is warm and
+outlives the dispatch, so a continuation's lines are tagged with whatever
+``current_run_id`` holds when they arrive — and if a new turn has been
+dispatched by then, that stale continuation's `result` publishes a "done"
+onto the LIVE run's stream. agents-platform's consumer stops at the first
+done it sees (`core/redis_streams.py`, `if fields.get("done"): return`), so
+the innocent run is finalised early with a truncated answer and everything
+it goes on to produce is written to a stream nobody is reading. Observed
+live: run 15032895… published two done sentinels 6 minutes apart, the second
+after a background agent came back.
+
+So: publish the sentinel only for a result with no ``origin``, and only once
+per run_id. A dispatched turn always emits exactly one such result, so this
+can never leave a run unfinalised — it only withholds the sentinels that
+were never ours to send.
 
 Under the per-session warm-pool redesign (2026-07-24), the container's own
 session_id is known BEFORE spawn (it's the container's key —
@@ -74,6 +98,10 @@ def main() -> int:
         except OSError:
             return "unknown"
 
+    # run_ids already finalised. The relay outlives every run it serves, so
+    # this is what makes the sentinel idempotent across turns.
+    finalised: set[str] = set()
+
     for raw in sys.stdin:
         line = raw.rstrip("\n")
         if not line:
@@ -98,12 +126,26 @@ def main() -> int:
             evt = json.loads(line)
         except json.JSONDecodeError:
             continue
-        if evt.get("type") == "result":
-            try:
-                r.xadd(stream_key, {"done": "1", "returncode": "0"}, maxlen=50_000, approximate=True)
-                r.expire(stream_key, 86400)
-            except Exception as e:
-                print(f"aw-warm-relay: done-sentinel XADD failed ({e})", file=sys.stderr)
+        if evt.get("type") != "result":
+            continue
+        # A continuation claude started on its own (background task finished,
+        # wakeup fired) — the dispatch it belongs to is already over, and
+        # run_id here may well name somebody else's live run. Never ours to
+        # finalise. See the module docstring.
+        if evt.get("origin") is not None:
+            print(f"aw-warm-relay: continuation result ({evt['origin']}) — "
+                  f"not finalising run={run_id}", file=sys.stderr)
+            continue
+        if run_id in finalised:
+            print(f"aw-warm-relay: run={run_id} already finalised — "
+                  f"skipping duplicate done", file=sys.stderr)
+            continue
+        try:
+            r.xadd(stream_key, {"done": "1", "returncode": "0"}, maxlen=50_000, approximate=True)
+            r.expire(stream_key, 86400)
+            finalised.add(run_id)
+        except Exception as e:
+            print(f"aw-warm-relay: done-sentinel XADD failed ({e})", file=sys.stderr)
     return 0
 
 
