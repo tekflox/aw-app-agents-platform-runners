@@ -1,0 +1,70 @@
+#!/bin/sh
+# aw-warm-wrapper-codex — entrypoint for a persistent ("warm") codex container.
+#
+# Same RUNDIR/fifo_in/drain/ready/TTL contract as aw-warm-wrapper (claude's
+# wrapper) — warm_pool.py's host-side code (get_or_create/_wait_ready/drain/
+# dispatch_turn) is shared by both CLIs and needs zero changes either way.
+#
+# The difference is entirely on WHAT reads the FIFO. claude speaks simple
+# stream-json lines with no request/response correlation, so its wrapper
+# pipes the FIFO straight into claude's own stdin. codex's app-server speaks
+# real JSON-RPC (initialize once, thread/start once, then turn/start per
+# turn, completion signalled by an ASYNC turn/completed notification) — that
+# needs a stateful process on both ends of the pipe, not a blind byte
+# passthrough. So this wrapper hands the FIFO to aw-warm-relay-codex.py,
+# which owns the `codex app-server --stdio` child process itself and does
+# both the JSON-RPC bookkeeping AND the Redis publish in one place (unlike
+# claude, where aw-warm-wrapper owns the CLI process and a separate
+# aw-warm-relay.py only reads its stdout).
+#
+# Runtime files live under $RUNDIR ($HOME-relative, NOT /aw/ — see
+# aw-warm-wrapper's own comment for why):
+#   $RUNDIR/fifo_in         — one JSON line per turn (see warm_pool.dispatch_turn's
+#                             codex branch), fed in via `docker exec`
+#   $RUNDIR/current_run_id  — written by warm_pool.dispatch_turn() BEFORE
+#                             each turn, so the relay tags published lines
+#                             with the right run_id
+#   $RUNDIR/drain           — touched by warm_pool.drain()
+#   $RUNDIR/ready           — touched once the relay's app-server child is
+#                             spawned; warm_pool polls for this after create
+set -e
+
+RUNDIR="$HOME/.aw-warm"
+mkdir -p "$RUNDIR"
+FIFO_IN="$RUNDIR/fifo_in"
+rm -f "$FIFO_IN" "$RUNDIR/drain" "$RUNDIR/ready"
+mkfifo "$FIFO_IN"
+
+# Same fd-holding trick as aw-warm-wrapper (see its comment in full): fd 3
+# keeps the FIFO from seeing EOF between separate `docker exec` writers, fd 5
+# is the separate read-only descriptor actually handed to the relay so
+# closing fd 3 alone (drain) is what lets it see a real EOF and exit.
+exec 3<>"$FIFO_IN"
+exec 5<"$FIFO_IN"
+
+python3 /usr/local/bin/aw-warm-relay-codex.py "$RUNDIR" <&5 3<&- &
+RELAY_PID=$!
+echo "$RELAY_PID" > "$RUNDIR/codex.pid"
+
+touch "$RUNDIR/ready"
+echo "aw-warm-wrapper-codex: ready, relay pid=$RELAY_PID" >&2
+
+# 6h TTL backstop — same constant/reasoning as aw-warm-wrapper's own watcher.
+( exec 3<&- 5<&-; sleep 21600; kill "$RELAY_PID" 2>/dev/null || true ) &
+TTL_WATCHER_PID=$!
+
+# Graceful drain — same polling contract as aw-warm-wrapper. Closing fd 3
+# (the only remaining writer) lets the relay's stdin read hit real EOF once
+# it's between turns; no signal is ever sent here.
+while kill -0 "$RELAY_PID" 2>/dev/null; do
+    if [ -f "$RUNDIR/drain" ]; then
+        echo "aw-warm-wrapper-codex: drain flag seen — closing stdin, relay exits after its current turn (if any)" >&2
+        exec 3<&-
+        break
+    fi
+    sleep 15
+done
+
+wait "$RELAY_PID" 2>/dev/null || true
+kill "$TTL_WATCHER_PID" 2>/dev/null || true
+exit 0

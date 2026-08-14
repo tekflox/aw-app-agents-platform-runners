@@ -958,7 +958,16 @@ def _build_container_kwargs(job: dict) -> tuple[str, list[str], dict, str | None
 _SHARED_DIR = Path(__file__).resolve().parent.parent / "agent-images" / "shared"
 WARM_WRAPPER_PATH = _SHARED_DIR / "aw-warm-wrapper"
 WARM_RELAY_PATH = _SHARED_DIR / "aw-warm-relay.py"
+WARM_WRAPPER_CODEX_PATH = _SHARED_DIR / "aw-warm-wrapper-codex"
+WARM_RELAY_CODEX_PATH = _SHARED_DIR / "aw-warm-relay-codex.py"
 ATTACH_HELPER_PATH = _SHARED_DIR / "aw_attach.py"
+
+# CLIs the warm pool knows how to keep alive across turns. Extending this
+# list means writing that CLI's own aw-warm-wrapper-<cli>/relay pair AND a
+# _build_warm_kwargs branch below — there is no generic implementation,
+# because each CLI's actual multi-turn wire protocol differs (claude: plain
+# stream-json lines; codex: stateful JSON-RPC over its app-server).
+WARM_CAPABLE_CLIS = frozenset({"claude", "codex"})
 
 
 def _host_path_for(container_side_path: Path) -> str:
@@ -971,6 +980,16 @@ def _host_path_for(container_side_path: Path) -> str:
 
 
 def _build_warm_kwargs(job: dict, epoch_hash: str, redis_url: str) -> tuple[str, dict]:
+    """Dispatch to this job's CLI-specific warm-container builder — see
+    WARM_CAPABLE_CLIS's own comment for why there's no generic
+    implementation shared across CLIs."""
+    cli = job.get("cli") or "claude"
+    if cli == "codex":
+        return _build_warm_kwargs_codex(job, epoch_hash, redis_url)
+    return _build_warm_kwargs_claude(job, epoch_hash, redis_url)
+
+
+def _build_warm_kwargs_claude(job: dict, epoch_hash: str, redis_url: str) -> tuple[str, dict]:
     """(image, docker-SDK run kwargs) for a FRESH warm container — the
     ``build_kwargs`` callback ``warm_pool.get_or_create()`` calls only on a
     cold/stale session. Reuses ``_build_container_kwargs()``'s mount/env/
@@ -1057,6 +1076,52 @@ def _build_warm_kwargs(job: dict, epoch_hash: str, redis_url: str) -> tuple[str,
     return image, kwargs
 
 
+def _build_warm_kwargs_codex(job: dict, epoch_hash: str, redis_url: str) -> tuple[str, dict]:
+    """(image, docker-SDK run kwargs) for a FRESH warm codex container.
+
+    Much thinner than the claude branch: codex's app-server already reads
+    its MCP server config, model, and persona straight off the mounted
+    $CODEX_HOME (config.toml) — there is no argv-level --mcp-config/--model
+    equivalent to build here the way claude needs one (see CLI_SPECS's own
+    ``mcp_config_flag: None`` for codex). The entrypoint is a thin sh
+    wrapper (aw-warm-wrapper-codex) that hands the FIFO straight to
+    aw-warm-relay-codex.py, which owns codex's app-server connection
+    itself — so there is no argv to build at all; ``command`` stays empty.
+
+    system_prompt has no codex-CLI-flag equivalent (same reason the cold
+    path prepends it into the prompt text instead — see
+    _build_container_kwargs's own comment on this), so it's prepended here
+    too, once, rather than per-turn in dispatch_turn.
+    """
+    agent_id = job["agent_id"]
+    session_id = job["session_id"]
+
+    image, _argv, kwargs, _mcp_config_container_path = _build_container_kwargs(job)
+    kwargs = dict(kwargs)
+
+    volumes = dict(kwargs.get("volumes") or {})
+    volumes[_host_path_for(WARM_WRAPPER_CODEX_PATH)] = {"bind": "/usr/local/bin/aw-warm-wrapper-codex", "mode": "ro"}
+    volumes[_host_path_for(WARM_RELAY_CODEX_PATH)] = {"bind": "/usr/local/bin/aw-warm-relay-codex.py", "mode": "ro"}
+    volumes[_host_path_for(ATTACH_HELPER_PATH)] = {"bind": "/usr/local/bin/aw_attach.py", "mode": "ro"}
+    kwargs["volumes"] = volumes
+
+    env = dict(kwargs.get("environment") or {})
+    env["AW_REDIS_URL"] = redis_url
+    env["AW_CODEX_CWD"] = "/opt/aw-workspace"
+    kwargs["environment"] = env
+
+    kwargs["entrypoint"] = ["/usr/local/bin/aw-warm-wrapper-codex"]
+    kwargs["command"] = []
+
+    kwargs["labels"] = {
+        warm_pool.WARM_LABEL: "1",
+        warm_pool.AGENT_ID_LABEL: agent_id,
+        warm_pool.SESSION_ID_LABEL: session_id,
+        warm_pool.EPOCH_LABEL: epoch_hash,
+    }
+    return image, kwargs
+
+
 def _dispatch_warm_turn(client, job: dict, redis_url: str) -> None:
     """RUNNER_WARM_CONTAINER=1 path: get-or-create this session's persistent
     container (spawning + pulling only on a cold/stale session) and feed the
@@ -1071,9 +1136,10 @@ def _dispatch_warm_turn(client, job: dict, redis_url: str) -> None:
     agent_id = job["agent_id"]
     session_id = job["session_id"]
     run_id = job["run_id"]
+    cli = job.get("cli") or "claude"
     epoch = warm_pool.get_generation(redis_url)
 
-    image = f"{REGISTRY}/{IMAGE_PREFIX}-claude:{DEFAULT_TAG}"
+    image = f"{REGISTRY}/{IMAGE_PREFIX}-{cli}:{DEFAULT_TAG}"
     try:
         log.info("execute: pulling %s for warm run=%s", image, run_id)
         client.images.pull(image)
@@ -1086,9 +1152,18 @@ def _dispatch_warm_turn(client, job: dict, redis_url: str) -> None:
         client=client, agent_id=agent_id, session_id=session_id, epoch_hash=epoch,
         build_kwargs=lambda _name, _epoch: _build_warm_kwargs(job, _epoch, redis_url),
     )
+    prompt = job.get("prompt") or ""
+    # codex has no --append-system-prompt equivalent — same reason the cold
+    # path prepends it into the prompt text (_build_container_kwargs's own
+    # comment on this). Only done once here, not per CLI_SPECS lookup,
+    # since the warm path never touches CLI_SPECS/argv for codex at all
+    # (see _build_warm_kwargs_codex's own docstring).
+    sys_prompt = job.get("append_system_prompt")
+    if sys_prompt and cli == "codex":
+        prompt = f"{sys_prompt}\n\n---\n\n{prompt}" if prompt else sys_prompt
     log.info("execute: dispatching run=%s to warm container %s", run_id, name)
     warm_pool.dispatch_turn(
-        client=client, name=name, run_id=run_id, prompt=job.get("prompt") or "",
+        client=client, name=name, run_id=run_id, prompt=prompt, cli=cli,
         notion_task_id=job.get("notion_task_id"), source_device=job.get("source_device"),
     )
     # Dead warm containers are only ever produced BY this path (drain, TTL
@@ -1186,11 +1261,20 @@ def _run_job_blocking(job: dict, redis_url: str) -> None:
 
     # Warm path (ON by default since 0.32.0, switched off with the
     # warm_container config field — see warm_pool.enabled()/configure()):
-    # only for claude, and only once the caller sends agent_id (the other
-    # half of a warm container's stable name alongside session_id — see
-    # RunnerLLM._dispatch in agents-platform-multitenant). Any job missing
-    # either falls straight through to the unchanged ephemeral path below.
-    if (warm_pool.enabled() and (job.get("cli") or "claude") == "claude"
+    # for any WARM_CAPABLE_CLIS member, and only once the caller sends
+    # agent_id (the other half of a warm container's stable name alongside
+    # session_id — see RunnerLLM._dispatch in agents-platform-multitenant).
+    # Any job missing either falls straight through to the unchanged
+    # ephemeral path below.
+    #
+    # codex (2026-08-14): unlike claude, mint_warm_session_id() above stays
+    # claude-only — codex's app-server generates its OWN thread id
+    # server-side and there is no confirmed path yet for that id to reach
+    # back to agents-platform's session tracking the way claude's echoed
+    # system/init event does (see that function's docstring). So codex's
+    # turn 1 still goes cold, same as before; turn 2 onward — once a real
+    # session_id exists — is warmable exactly like claude.
+    if (warm_pool.enabled() and (job.get("cli") or "claude") in WARM_CAPABLE_CLIS
             and job.get("agent_id") and job.get("session_id")):
         try:
             client = docker_sdk.DockerClient(base_url="unix://" + CONTAINER_SOCKET)

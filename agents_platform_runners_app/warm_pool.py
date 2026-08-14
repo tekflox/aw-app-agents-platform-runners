@@ -1,4 +1,11 @@
-"""warm_pool.py — persistent ("warm") claude container mode for THIS Runner.
+"""warm_pool.py — persistent ("warm") container mode for THIS Runner.
+
+Supports claude and codex (2026-08-14 — see aw-warm-wrapper-codex /
+aw-warm-relay-codex.py for codex's own JSON-RPC app-server wrapper; claude
+keeps using aw-warm-wrapper / aw-warm-relay.py's simpler stream-json
+passthrough). This module's own logic (get_or_create/drain/reap/generation
+invalidation) is entirely CLI-agnostic — only `dispatch_turn`'s FIFO
+payload shape branches on `cli`.
 
 Ported from agents-platform-multitenant's ``backend/app/core/warm_pool.py``
 (read that file's docstring for the full design rationale: session-keyed
@@ -19,9 +26,9 @@ app's own persisted config (``warm_container: false``) — see `enabled()` /
 `configure()` for the precedence rules and for why the previous
 host-env-only gate (``RUNNER_WARM_CONTAINER=1``, default OFF) could not be
 kept. Callers (execute.py) must never invoke anything here unless
-`enabled()` is true AND the job is for the "claude" CLI with both agent_id
-and session_id set (warm containers are keyed by both, same as the
-original).
+`enabled()` is true AND the job is for a warm-capable CLI (claude or codex)
+with both agent_id and session_id set (warm containers are keyed by both,
+same as the original).
 
 **Not yet validated against a live podman socket** (ported 2026-08-08) —
 this app's own containers:manage capability is only reachable from its own
@@ -393,20 +400,24 @@ def _sh(s: str | None) -> str:
     return shlex.quote(s or "")
 
 
-def dispatch_turn(*, client, name: str, run_id: str, prompt: str,
+def dispatch_turn(*, client, name: str, run_id: str, prompt: str, cli: str = "claude",
                   notion_task_id: str | None = None,
                   source_device: str | None = None) -> None:
     """Feed one turn's prompt into the warm container's FIFO.
 
     Writes current_run_id + turn_env FIRST (so the relay tags the very next
-    lines it reads with the right Redis stream key), then writes the
-    stream-json payload into the FIFO. The relay (aw-warm-relay.py) publishes
-    directly to ``run:{run_id}:events`` — the SAME stream key/schema
-    execute.py's ephemeral path publishes to — so agents-platform's existing
-    Redis-stream consumer needs zero changes to read a warm turn's output,
-    INCLUDING its "done" sentinel: this function does not wait for the turn
-    to finish, and doesn't need to — the relay publishes that sentinel
-    itself the moment it sees claude's own ``{"type":"result",...}`` event.
+    lines it reads with the right Redis stream key), then writes the turn
+    payload into the FIFO — shaped per `cli`, since each CLI's in-container
+    reader expects a different envelope (see the branch below). Either
+    relay (aw-warm-relay.py for claude, aw-warm-relay-codex.py for codex)
+    publishes directly to ``run:{run_id}:events`` — the SAME stream key/
+    schema execute.py's ephemeral path publishes to — so agents-platform's
+    existing Redis-stream consumer needs zero changes to read a warm turn's
+    output, INCLUDING its "done" sentinel: this function does not wait for
+    the turn to finish, and doesn't need to — the relay publishes that
+    sentinel itself the moment it sees the CLI's own turn-complete event
+    (claude: ``{"type":"result",...}``; codex: a ``turn/completed``
+    notification for this container's thread).
 
     Uses the docker-py exec API's raw socket mode for the FIFO write (the
     original's subprocess `docker exec -i ... | cat > fifo_in` translated to
@@ -425,7 +436,15 @@ def dispatch_turn(*, client, name: str, run_id: str, prompt: str,
             f"warm_pool.dispatch_turn: failed to set current_run_id/turn_env on {name}: "
             f"{(out or b'').decode(errors='replace')}")
 
-    payload = (json.dumps({"type": "user", "message": {"role": "user", "content": prompt}}) + "\n").encode("utf-8")
+    if cli == "codex":
+        # Plain JSON object, not claude's stream-json envelope — read one
+        # line at a time by aw-warm-relay-codex.py, which owns codex's
+        # app-server connection itself and turns this into a turn/start
+        # JSON-RPC call (see that script's module docstring for why the
+        # request/response correlation has to live there instead of here).
+        payload = (json.dumps({"prompt": prompt}) + "\n").encode("utf-8")
+    else:
+        payload = (json.dumps({"type": "user", "message": {"role": "user", "content": prompt}}) + "\n").encode("utf-8")
     exec_id = client.api.exec_create(
         c.id, ["sh", "-c", "cat > /home/ubuntu/.aw-warm/fifo_in"], stdin=True,
     )["Id"]
