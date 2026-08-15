@@ -1548,6 +1548,13 @@ async def _call_tool(name: str, arguments: dict[str, Any] | None) -> list[TextCo
             # this one — not something the calling LLM sets, see _caller_run_id.
             if _rid := _caller_run_id(args):
                 body["caller_run_id"] = _rid
+            # Forward the caller's call-me-back INTENT so the dispatched run
+            # carries it from creation. The callback is still armed later, by
+            # the caller's own turn — but the child builds its system prompt
+            # immediately, and reads this to learn whether anyone is waiting
+            # for its result. Without it every child was told "no one is
+            # waiting" and pointed at a return_to_caller_agent it didn't need.
+            body["call_me_back"] = args.get("call_me_back") is not False
             r = await c.post(f"{BASE}/api/agents/{args['slug']}/run", json=body)
             return _err(r.status_code, r.text) if r.status_code != 200 else _ok(r.json())
         if name == "run_workflow_async":
