@@ -17,6 +17,14 @@ Use this app when an AW Workspace should be able to receive agent jobs from Agen
 
 Install the app in the workspace, open its settings, and connect it to the Agents Platform instance that should dispatch work here. Once configured, the platform can launch runs through this workspace and agents can use the contributed tools from their normal sessions.
 
+### Kanban dispatch
+
+Two tools bridge a Notion Kanban card to a run: `run_ready_cards` fires an agent for every card in `Ready`, and `invoke_kanban_agent` sends a message into the session of the agent already working a card.
+
+They live here rather than in aw-app-notion on purpose. That app owns "a Notion database used as a Kanban board" and deliberately does not talk to an orchestrator — dispatch there would hardcode it to one. This app already *is* the orchestrator client, so the bridge costs it one new dependency (the board, over the workspace API) instead of the harder one. See `agents_platform_runners_app/kanban_dispatch.py`.
+
+aw-app-notion is **not** a required dependency: without it these two tools return a clear "not installed" error and everything else works unchanged.
+
 ## What It Delivers
 
 The app turns the workspace into an active execution target for agent work. Instead of treating the workspace as only a place to store code and data, it makes the workspace available as a controlled runner that can accept tasks, expose progress, and keep agent workflows close to the files and services they need.

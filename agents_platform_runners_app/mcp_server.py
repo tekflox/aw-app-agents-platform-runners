@@ -76,6 +76,21 @@ class _NoopServer:
 
 BASE = os.environ.get("AGENTS_BASE", "http://127.0.0.1:8765")
 
+# The Kanban dispatch bridge — the half of the monolith's notion_kanban.py that
+# aw-app-notion deliberately refused, because it needs an orchestrator. Imported
+# lazily-ish (module-level is fine; it is stdlib-only) so this file keeps its
+# "no third-party imports" property.
+from . import kanban_dispatch  # noqa: E402
+
+_BOARD: "kanban_dispatch.BoardClient | None" = None
+
+
+def _board_client() -> "kanban_dispatch.BoardClient":
+    global _BOARD
+    if _BOARD is None:
+        _BOARD = kanban_dispatch.BoardClient()
+    return _BOARD
+
 # agents-platform_multitenant's require_identity() rejects every request
 # without an aw-backend-issued identity JWT (401 unauthorized) — this token
 # is that credential, provided via config (AGENTS_PLATFORM_TOKEN) so every
@@ -622,6 +637,52 @@ async def _list_tools() -> list[Tool]:
                           "properties": {"summary": {"type": "string",
                                                      "description": "Summary of what was planned — becomes the Kanban card comment if there's a card."}},
                           "required": []}),
+        Tool(name="run_ready_cards",
+             description=("Fire an agents-platform run for every Kanban card sitting in "
+                          "`Ready`. The board half runs against aw-app-notion, the dispatch "
+                          "half against this platform — that split is why this tool lives "
+                          "here and not in the Notion app.\n\n"
+                          "Per card: skips it if it already has a pending/running run (so "
+                          "calling this twice does not double-dispatch), otherwise moves it "
+                          "to `running`, builds the prompt from the card's BODY plus its "
+                          "comment history, fires the card's AgentSlug (or WorkflowSlug), "
+                          "and stamps the run id onto AgentRunId so a human can jump from "
+                          "the card to the run.\n\n"
+                          "A card naming neither an agent nor a workflow is reported as "
+                          "skipped, not failed — it just isn't dispatchable yet. Returns one "
+                          "row per card, so a partly-failed sweep tells you exactly which "
+                          "cards moved."),
+             inputSchema={"type": "object",
+                          "properties": {
+                              "status": {"type": "string", "default": "ready",
+                                         "description": "Logical status to sweep. Defaults to 'ready'; pass another key to re-run a different column."},
+                              "limit": {"type": "integer", "default": 50,
+                                        "description": "Max cards to consider in one sweep."},
+                              "dry_run": {"type": "boolean", "default": False,
+                                          "description": "Report what WOULD be dispatched without moving any card or firing anything. Do this first on a board you haven't swept before."},
+                          },
+                          "required": []}),
+        Tool(name="invoke_kanban_agent",
+             description=("Send a message into the CLI session of the agent already working a "
+                          "Kanban card — resumes its existing session rather than starting a "
+                          "fresh run, so it keeps the context it built.\n\n"
+                          "Finds the most recent run tied to the card, and reuses that run's "
+                          "agent + session. Fails with a plain reason (not an error) when the "
+                          "card has no run yet, or when its last run never opened a resumable "
+                          "session.\n\n"
+                          "This is the ONLY way an agent gets resumed on a card — commenting "
+                          "on the card does not do it. That auto-resume was deliberately "
+                          "disabled in 2026-07: a comment could silently make the agent pick "
+                          "the card back up and sign it off within seconds, with no human "
+                          "checkpoint in between. Calling this is the checkpoint."),
+             inputSchema={"type": "object",
+                          "properties": {
+                              "page_id": {"type": "string",
+                                          "description": "Notion page id of the card. Optional — falls back to this run's own NOTION_TASK_ID context."},
+                              "message": {"type": "string",
+                                          "description": "What to say to the agent. Becomes its next turn's input."},
+                          },
+                          "required": ["message"]}),
         Tool(name="register_callback",
              description=("Retroactively subscribe to a run's completion — for when you "
                           "dispatched `run_agent_async`/`run_workflow_async` with "
@@ -1634,6 +1695,118 @@ async def _call_tool(name: str, arguments: dict[str, Any] | None) -> list[TextCo
             r = await c.post(f"{BASE}/api/runs/{own_run_id}/mark-planned",
                              json={"summary": args.get("summary") or ""})
             return _err(r.status_code, r.text) if r.status_code != 200 else _ok(r.json())
+        if name == "run_ready_cards":
+            board = _board_client()
+            dry_run = bool(args.get("dry_run"))
+            try:
+                cards = await asyncio.to_thread(
+                    board.ready_cards, args.get("status") or "ready",
+                    int(args.get("limit") or 50))
+            except kanban_dispatch.BoardUnavailable as exc:
+                return _err(503, f"could not read the Kanban board — {exc}")
+
+            results: list[dict] = []
+            for summary in cards:
+                page_id = summary.get("page_id") or ""
+                row: dict[str, Any] = {"page_id": page_id, "title": summary.get("title")}
+
+                # Skip before doing anything else: this tool is a manual
+                # catch-all, so it gets called on boards the webhook already
+                # dispatched from. Double-firing a card is the failure mode.
+                existing = await c.get(f"{BASE}/api/runs",
+                                       params={"notion_task_id": page_id, "limit": 1})
+                latest = (existing.json() or [None])[0] if existing.status_code == 200 else None
+                if latest and latest.get("status") in ("pending", "running"):
+                    results.append({**row, "skipped": "run-already-in-flight",
+                                    "run_id": latest.get("id")})
+                    continue
+
+                try:
+                    card = await asyncio.to_thread(board.card, page_id)
+                except kanban_dispatch.BoardUnavailable as exc:
+                    results.append({**row, "error": f"could not read the card — {exc}"})
+                    continue
+
+                # list_cards' summary lacks body/comments; card() has them but
+                # is one page's worth. Merge so the prompt sees everything.
+                card = {**summary, **card}
+                planned = kanban_dispatch.dispatch_payload(
+                    card, kanban_dispatch.build_run_input(card))
+                if planned is None:
+                    results.append({**row, "skipped": "card names no agent_slug or workflow_slug"})
+                    continue
+                path, payload = planned
+                if dry_run:
+                    results.append({**row, "would_dispatch": path,
+                                    "target_slug": payload["target_slug"]})
+                    continue
+
+                # Move first, dispatch second — the monolith's order. A card
+                # left in Ready after a successful dispatch gets swept again by
+                # the next call; one moved to running after a failed dispatch
+                # just sits there, which is the quieter of the two wrongs.
+                try:
+                    await asyncio.to_thread(board.move, page_id, "running")
+                except kanban_dispatch.BoardUnavailable as exc:
+                    results.append({**row, "error": f"could not move the card — {exc}"})
+                    continue
+
+                r = await c.post(f"{BASE}{path}", json=payload)
+                if r.status_code != 200:
+                    results.append({**row, "error": f"dispatch failed: {r.status_code} {r.text[:200]}"})
+                    continue
+                run = r.json()
+                run_id = run.get("run_id") or run.get("id") or ""
+                if run_id:
+                    try:
+                        await asyncio.to_thread(board.set_property, page_id,
+                                                kanban_dispatch.RUN_ID_PROPERTY, run_id)
+                    except kanban_dispatch.BoardUnavailable as exc:
+                        # The run is already flying; a missing back-reference is
+                        # a navigation annoyance, not a reason to report failure.
+                        row["run_id_stamp_failed"] = str(exc)
+                results.append({**row, "run_id": run_id,
+                                "target_slug": payload["target_slug"]})
+
+            dispatched = sum(1 for r in results if r.get("run_id") and not r.get("skipped"))
+            return _ok({"considered": len(results), "dispatched": dispatched,
+                        "dry_run": dry_run, "results": results})
+
+        if name == "invoke_kanban_agent":
+            message = (args.get("message") or "").strip()
+            if not message:
+                return _err(400, "message is required")
+            page_id = (args.get("page_id") or "").strip()
+            if not page_id:
+                # Fall back to the card this run is already tied to — the
+                # backend knows it, the calling model shouldn't have to.
+                own_run_id = _caller_run_id(args)
+                if own_run_id:
+                    own = await c.get(f"{BASE}/api/runs/{own_run_id}")
+                    if own.status_code == 200:
+                        page_id = (own.json() or {}).get("notion_task_id") or ""
+            if not page_id:
+                return _err(400, "page_id is required — this run is not tied to a Kanban card, "
+                                 "so there is nothing to infer it from.")
+
+            r = await c.get(f"{BASE}/api/runs", params={"notion_task_id": page_id, "limit": 1})
+            if r.status_code != 200:
+                return _err(r.status_code, r.text)
+            runs = r.json() or []
+            if not runs:
+                return _err(404, f"no agents-platform run found for card {page_id} — nothing to "
+                                 "resume. Dispatch one first (run_ready_cards, or move the card "
+                                 "to Ready).")
+            planned = kanban_dispatch.resume_payload(runs[0], page_id, message)
+            if isinstance(planned, str):
+                return _err(409, planned)
+            path, payload = planned
+            resumed = await c.post(f"{BASE}{path}", json=payload)
+            if resumed.status_code != 200:
+                return _err(resumed.status_code, resumed.text)
+            return _ok({"page_id": page_id, "resumed_session": payload["session_id"],
+                        **resumed.json()})
+
         if name == "register_callback":
             own_run_id = _caller_run_id(args)
             if not own_run_id:
