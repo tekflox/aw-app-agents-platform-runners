@@ -122,12 +122,49 @@ def test_a_run_with_no_agent_explains_itself():
 
 # ── the board client's own failure surface ──────────────────────────────
 
-def test_board_calls_go_over_loopback(monkeypatch):
-    """Both apps are in-process; going out through the published URL would put
-    the tunnel edge between a call and the server making it."""
+def test_board_prefers_the_published_url_over_loopback(monkeypatch):
+    """Both apps are `tier: inprocess`, which makes loopback look right and
+    isn't: this module is imported by an MCP server the gateway spawns inside
+    ITS OWN container, where 127.0.0.1 is the gateway. Loopback-first there
+    doesn't fail loudly — it talks to the wrong server."""
     monkeypatch.delenv("AW_LOCAL_API_URL", raising=False)
+    monkeypatch.setenv("AW_WORKSPACE_API_URL", "https://aw.example")
+    assert kd.board_base_url() == "https://aw.example"
+
+
+def test_board_falls_back_to_loopback_only_as_a_last_resort(monkeypatch):
+    """Kept for running inside the server itself — tests, a REPL."""
+    monkeypatch.delenv("AW_LOCAL_API_URL", raising=False)
+    monkeypatch.delenv("AW_WORKSPACE_API_URL", raising=False)
     monkeypatch.delenv("AW_PORT", raising=False)
+    monkeypatch.setattr(kd, "_from_env_file", lambda _n: None)
     assert kd.board_base_url() == "http://127.0.0.1:9030"
+
+
+def test_the_upstream_env_carries_the_workspace_credentials(monkeypatch):
+    """The bug this pair exists to prevent: the tools shipped, registered, and
+    returned 503 on the first real call because the gateway's stdio child
+    inherits nothing from the workspace server."""
+    from agents_platform_runners_app import plugin
+
+    monkeypatch.setenv("AW_WORKSPACE_API_URL", "https://aw.example")
+    monkeypatch.setenv("AW_WORKSPACE_API_KEY", "k-123")
+    env = plugin.build_mcp_servers({})["agents-platform-runners"]["env"]
+    assert env["AW_WORKSPACE_API_URL"] == "https://aw.example"
+    assert env["AW_WORKSPACE_API_KEY"] == "k-123"
+
+
+def test_a_missing_credential_is_omitted_not_written_blank(monkeypatch):
+    """A blank value would reach the board as a 401 nobody can place; absent,
+    the upstream raises its own "not set" error naming where it comes from."""
+    from agents_platform_runners_app import plugin
+
+    monkeypatch.delenv("AW_WORKSPACE_API_KEY", raising=False)
+    monkeypatch.setattr(plugin, "_workspace_env",
+                        lambda n: "" if n == "AW_WORKSPACE_API_KEY" else "https://aw.example")
+    env = plugin.build_mcp_servers({})["agents-platform-runners"]["env"]
+    assert "AW_WORKSPACE_API_KEY" not in env
+    assert env["AGENTS_BASE"]
 
 
 def test_board_names_itself_when_it_cannot_be_reached(monkeypatch):

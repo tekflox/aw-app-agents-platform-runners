@@ -16,9 +16,19 @@ Split, concretely:
   resuming a session — goes to agents-platform, the same ``BASE`` every other
   tool in this app uses.
 
-Both are in-process Tier-1 apps, so the board calls go over loopback. The
-alternative — importing aw-app-notion's ``KanbanBoard`` — would reach into
-another app's object graph and break the first time it rewires.
+**Where this actually runs matters.** Both apps are ``tier: inprocess``, which
+makes it tempting to call the board over loopback — and wrong. This module is
+imported by ``mcp_server.py``, which aw-mcp-gateway spawns as a *stdio child of
+its own container*: ``127.0.0.1`` there is the gateway, not the workspace, and
+the workspace's environment (including its API key) is not inherited. So the
+address comes from ``AW_WORKSPACE_API_URL`` and the key is baked into the
+upstream's env by ``plugin.build_mcp_servers``, the same way
+``AGENTS_PLATFORM_TOKEN`` already is. Loopback stays as a last-resort fallback
+for running this module inside the server (tests, a REPL), not as the norm.
+
+Importing aw-app-notion's ``KanbanBoard`` directly would sidestep all of that
+and is worse: it reaches into another app's object graph, and from the gateway
+container it isn't even importable.
 """
 from __future__ import annotations
 
@@ -81,8 +91,16 @@ def _from_env_file(name: str) -> str | None:
 
 
 def board_base_url() -> str:
-    """Loopback: aw-app-notion is mounted in this same server."""
+    """Where to reach the workspace API — see the module docstring.
+
+    Published URL first, loopback last. This process is normally a stdio child
+    of the gateway's container, where loopback is the gateway itself; a
+    loopback-first order there doesn't fail loudly, it just talks to the wrong
+    server.
+    """
     return (os.environ.get("AW_LOCAL_API_URL")
+            or os.environ.get(API_URL_VAR)
+            or _from_env_file(API_URL_VAR)
             or f"http://127.0.0.1:{os.environ.get('AW_PORT', '9030')}").rstrip("/")
 
 
@@ -98,8 +116,10 @@ class BoardClient:
         key = os.environ.get(API_KEY_VAR) or _from_env_file(API_KEY_VAR)
         if not key:
             raise BoardUnavailable(
-                f"{API_KEY_VAR} not found in the environment or {_env_file()} — "
-                "cannot authenticate against the workspace API")
+                f"{API_KEY_VAR} is not set for this MCP upstream. It is baked into the "
+                "stdio env by the app's plugin.build_mcp_servers() — an upstream missing "
+                "it was registered by an older version of this app, so restart the "
+                "workspace (which rewrites mcp.json) and then the mcp-gateway.")
         data = json.dumps(body).encode() if body is not None else None
         headers = {"X-Api-Key": key}
         if data:

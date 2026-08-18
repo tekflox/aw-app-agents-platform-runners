@@ -62,6 +62,26 @@ RECONCILE_INTERVAL_S = 360.0
 DEFAULT_AGENTS_PLATFORM_BASE = "http://172.18.0.1:10014"
 
 
+def _workspace_env(name: str) -> str:
+    """A workspace-published env var, from this process or from the .env the
+    server mirrors it into (0600, written at boot). Read at mcp.json-write
+    time because the *reader* — a stdio child of the gateway's container —
+    has neither."""
+    value = os.environ.get(name)
+    if value:
+        return value
+    home = os.environ.get("AW_WORKSPACE_HOME") or os.path.join(
+        os.environ.get("AW_WORKSPACE_CONTAINER_DIR", "/opt/aw-workspace"), ".aw-workspace")
+    try:
+        with open(os.path.join(home, ".env"), "r", encoding="utf-8") as fh:
+            for line in fh:
+                if line.startswith(f"{name}="):
+                    return line.split("=", 1)[1].strip()
+    except OSError:
+        pass
+    return ""
+
+
 def build_mcp_servers(config: dict) -> dict:
     """The ``mcpServers`` object this app's own root mcp.json should
     contain — one server, the ported agent_mcp.py, pointed at
@@ -82,7 +102,20 @@ def build_mcp_servers(config: dict) -> dict:
             # that credential (mcp_server.py sends it as Authorization:
             # Bearer on every call). Mint one with aw-backend's
             # create_identity_jwt(); see this app's README for the command.
-            "env": {"AGENTS_BASE": str(base), "AGENTS_PLATFORM_TOKEN": str(token)},
+            # AW_WORKSPACE_* are for the Kanban dispatch tools, which call
+            # aw-app-notion over the workspace API. They have to be baked in
+            # for the same reason AGENTS_PLATFORM_TOKEN does: the gateway
+            # spawns this upstream inside ITS container, so nothing from the
+            # workspace server's environment reaches it — and loopback there
+            # is the gateway, not the workspace. Empty values are omitted
+            # rather than written blank, so a missing one surfaces as the
+            # upstream's own "not set" error instead of a 401 nobody can place.
+            "env": {k: v for k, v in {
+                "AGENTS_BASE": str(base),
+                "AGENTS_PLATFORM_TOKEN": str(token),
+                "AW_WORKSPACE_API_URL": _workspace_env("AW_WORKSPACE_API_URL"),
+                "AW_WORKSPACE_API_KEY": _workspace_env("AW_WORKSPACE_API_KEY"),
+            }.items() if v},
             # aw-mcp-gateway spawns stdio upstreams with cwd defaulting to its
             # own BASE_DIR (/app), which doesn't have this app's package on
             # sys.path — explicit cwd is required so `python3 -m
