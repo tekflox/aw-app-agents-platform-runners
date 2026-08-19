@@ -28,34 +28,39 @@ SESSION = "710ca728-30a6-4aed-b4ec-ce16815fde5d"
 BASE_JOB = {"run_id": "r1", "cli": "claude", "agent_id": "agent-1", "prompt": "hi"}
 
 
-def _argv(job: dict) -> list[str]:
+def _argv(job: dict, tmp_path, monkeypatch) -> list[str]:
+    # Same isolation the warm suite uses: this builder MAKES the run's scratch
+    # dir on disk, so without redirecting it the test writes into the real
+    # workspace (and fails outright on a CI runner that has no /opt/aw-workspace).
+    monkeypatch.setattr(execute_mod, "WORKSPACE_CONTAINER_DIR", str(tmp_path / "ws"))
+    monkeypatch.setattr(execute_mod, "WORKSPACE_HOST_DIR", "/host/aw-workspace")
     _image, argv, _kwargs, _x = execute_mod._build_container_kwargs(job)
     return argv
 
 
-def test_a_minted_session_is_created_on_the_cold_path():
-    argv = _argv({**BASE_JOB, "session_id": SESSION, "new_session": True})
+def test_a_minted_session_is_created_on_the_cold_path(tmp_path, monkeypatch):
+    argv = _argv({**BASE_JOB, "session_id": SESSION, "new_session": True}, tmp_path, monkeypatch)
     assert "--session-id" in argv
     assert argv[argv.index("--session-id") + 1] == SESSION
     assert "--resume" not in argv
 
 
-def test_an_existing_session_still_resumes():
+def test_an_existing_session_still_resumes(tmp_path, monkeypatch):
     """Turn 2+ must resume, or the conversation silently restarts empty."""
-    argv = _argv({**BASE_JOB, "session_id": SESSION})
+    argv = _argv({**BASE_JOB, "session_id": SESSION}, tmp_path, monkeypatch)
     assert "--resume" in argv
     assert argv[argv.index("--resume") + 1] == SESSION
     assert "--session-id" not in argv
 
 
-def test_no_session_emits_neither_flag():
-    argv = _argv(dict(BASE_JOB))
+def test_no_session_emits_neither_flag(tmp_path, monkeypatch):
+    argv = _argv(dict(BASE_JOB), tmp_path, monkeypatch)
     assert "--resume" not in argv and "--session-id" not in argv
 
 
-def test_codex_ignores_the_flag():
+def test_codex_ignores_the_flag(tmp_path, monkeypatch):
     """Only claude has `--session-id`; codex keeps its resume subcommand."""
     argv = _argv({**BASE_JOB, "cli": "codex", "session_id": SESSION,
-                  "new_session": True})
+                  "new_session": True}, tmp_path, monkeypatch)
     assert "--session-id" not in argv
     assert "resume" in argv
