@@ -175,6 +175,12 @@ def build_routes(config: dict | None = None) -> FastAPI:
             "model": body.get("model"),
             "prompt": body.get("prompt", ""),
             "session_id": body.get("session_id"),
+            # Whether that id names a conversation that does not exist yet, so
+            # the CLI is told to CREATE it (`--session-id`) instead of
+            # `--resume`, which on an unknown id returns an empty reply and
+            # still exits 0. Only agents-platform can know this — it owns the
+            # Run history the answer comes from.
+            "new_session": bool(body.get("new_session")),
             # Only used by the RUNNER_WARM_CONTAINER=1 opt-in path (see
             # warm_pool.py) — a warm container's stable name is keyed on
             # BOTH agent_id and session_id, mirroring agents-platform's own

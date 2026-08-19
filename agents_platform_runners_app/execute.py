@@ -704,8 +704,16 @@ def _build_container_kwargs(job: dict) -> tuple[str, list[str], dict, str | None
     # (codex) — same convention as agents-platform's docker_agent.py. Only
     # emitted when the caller actually has a prior session_id for this
     # bot/chat; a first turn has none and starts a fresh conversation.
+    #
+    # `new_session` means the caller minted the id and the conversation does
+    # not exist yet, so it has to be CREATED under that id. `--resume` on an
+    # id claude has never seen does not raise — it returns an empty reply, and
+    # the run is recorded as a success with zero tokens. The warm path below
+    # already made this distinction (`_warm_minted_session`); the cold path
+    # did not, which is the whole difference (2026-08-19).
     if session_id and cli == "claude":
-        argv.extend(["--resume", session_id])
+        argv.extend(["--session-id" if job.get("new_session") else "--resume",
+                     session_id])
     elif session_id and cli == "codex":
         argv.extend(["resume", session_id])
 
