@@ -2,7 +2,7 @@
   "manifest_version": 1,
   "id": "agents-platform-runners",
   "name": "Agents Platform Runners",
-  "version": "0.71.0",
+  "version": "0.72.0",
   "description": "Depends on the code-agent-clis app (claude/codex/copilot/cursor-agent already installed at /usr/local/bin, single source of truth) so this workspace's agent-CLI runners are what agents-platform_multitenant's agent sessions use, and contributes the ported \"aw-agents\" MCP (agent_mcp.py) so agents-platform is controllable as MCP tools from this workspace.",
   "tier": "inprocess",
   "requires_ui_refresh": false,
@@ -239,13 +239,13 @@
         "type": "boolean",
         "default": false,
         "title": "Kanban Ready sweep",
-        "description": "Poll the Notion Kanban board every kanban_sweep_interval_s and dispatch every card sitting in Ready — the trigger that replaces the monolith's POST /api/notion/webhook, so a card moved to Ready produces a run in THIS agents-platform rather than the legacy one. OFF by default on purpose: the monolith's webhook is still registered and live, and this flag is the entire cut-over (tick it) and the entire rollback (untick it), with no deploy on either side. Running both at once is safe by design — each side leases the card by writing a unique token into AgentRunId and reading it straight back (kanban_dispatch.claim_card), so exactly one can win, and a failed read makes both stand down and leave the card in Ready for the next tick. Takes effect on the next tick — no app restart needed either way."
+        "description": "Poll the Notion Kanban board every kanban_sweep_interval_s and dispatch every card sitting in Ready \u2014 the trigger that replaces the monolith's POST /api/notion/webhook, so a card moved to Ready produces a run in THIS agents-platform rather than the legacy one. OFF by default on purpose: the monolith's webhook is still registered and live, and this flag is the entire cut-over (tick it) and the entire rollback (untick it), with no deploy on either side. Running both at once is safe by design \u2014 each side leases the card by writing a unique token into AgentRunId and reading it straight back (kanban_dispatch.claim_card), so exactly one can win, and a failed read makes both stand down and leave the card in Ready for the next tick. Takes effect on the next tick \u2014 no app restart needed either way."
       },
       "kanban_sweep_interval_s": {
         "type": "number",
         "default": 60,
         "title": "Kanban sweep interval (s)",
-        "description": "Seconds between Ready-card sweeps. Latency is 0 to this, averaging half. 60s is the default because the webhook it replaces was measured at ~50s on a real card and its own code cites up to ~3min worst case — so 60s is at worst a wash. Lower costs Notion API calls against a ~3 req/s pace; 30s is safe if latency starts to matter."
+        "description": "Seconds between Ready-card sweeps. Latency is 0 to this, averaging half. 60s is the default because the webhook it replaces was measured at ~50s on a real card and its own code cites up to ~3min worst case \u2014 so 60s is at worst a wash. Lower costs Notion API calls against a ~3 req/s pace; 30s is safe if latency starts to matter."
       },
       "public": {
         "type": "boolean",
