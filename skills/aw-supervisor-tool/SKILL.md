@@ -75,7 +75,7 @@ infinite loop. Two invariants prevent it, both enforced in
 
 ## Implementation (agents-platform's own backend, not this workspace's)
 
-This mechanism lives inside the `agents-platform_multitenant` service
+This mechanism lives inside the `agents-platform-multitenant` service
 itself — reachable from here through the gateway's
 `aw__agents_platform_runners__*` tool namespace, not something this workspace's own code implements. Useful
 if you're debugging or extending the mechanism, not for using it day to day:

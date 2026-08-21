@@ -17,7 +17,7 @@ What this gives the model:
     ``output.limit_reached`` set.
 
 ``$AGENTS_BASE`` (default ``http://127.0.0.1:8765``) points at a separately
-managed agents-platform_multitenant instance — this client never spawns or
+managed agents-platform-multitenant instance — this client never spawns or
 owns that process.
 """
 from __future__ import annotations
@@ -91,7 +91,7 @@ def _board_client() -> "kanban_dispatch.BoardClient":
         _BOARD = kanban_dispatch.BoardClient()
     return _BOARD
 
-# agents-platform_multitenant's require_identity() rejects every request
+# agents-platform-multitenant's require_identity() rejects every request
 # without an aw-backend-issued identity JWT (401 unauthorized) — this token
 # is that credential, provided via config (AGENTS_PLATFORM_TOKEN) so every
 # httpx.AsyncClient below authenticates the same way a logged-in browser
@@ -185,7 +185,7 @@ def _running() -> bool:
 
 
 def _ensure_running() -> bool:
-    """agents-platform_multitenant is a separately managed service (BASE) —
+    """agents-platform-multitenant is a separately managed service (BASE) —
     this app is a thin MCP client for it, not its process owner, so unlike
     the original agents-platform mcp_server.py this never self-spawns a
     backend. Just a best-effort reachability check the caller can log."""

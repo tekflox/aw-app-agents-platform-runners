@@ -3,7 +3,7 @@
   "id": "agents-platform-runners",
   "name": "Agents Platform Runners",
   "version": "0.72.0",
-  "description": "Depends on the code-agent-clis app (claude/codex/copilot/cursor-agent already installed at /usr/local/bin, single source of truth) so this workspace's agent-CLI runners are what agents-platform_multitenant's agent sessions use, and contributes the ported \"aw-agents\" MCP (agent_mcp.py) so agents-platform is controllable as MCP tools from this workspace.",
+  "description": "Depends on the code-agent-clis app (claude/codex/copilot/cursor-agent already installed at /usr/local/bin, single source of truth) so this workspace's agent-CLI runners are what agents-platform-multitenant's agent sessions use, and contributes the ported \"aw-agents\" MCP (agent_mcp.py) so agents-platform is controllable as MCP tools from this workspace.",
   "tier": "inprocess",
   "requires_ui_refresh": false,
   "category": "Runnables",
@@ -214,26 +214,26 @@
       "agents_platform_base": {
         "type": "string",
         "default": "http://172.18.0.1:10014",
-        "description": "Base URL of the agents-platform_multitenant instance this app's MCP tools control. 172.18.0.1 is the agentic-workspace_default bridge gateway (== the real host) \u2014 the only address reachable from aw-app-mcp-gateway's nested podman namespace; override if your workspace's network subnet differs."
+        "description": "Base URL of the agents-platform-multitenant instance this app's MCP tools control. 172.18.0.1 is the agentic-workspace_default bridge gateway (== the real host) \u2014 the only address reachable from aw-app-mcp-gateway's nested podman namespace; override if your workspace's network subnet differs."
       },
       "agents_platform_token": {
         "type": "string",
         "x-secret": true,
-        "description": "aw-backend identity JWT sent as Authorization: Bearer on every call to agents_platform_base \u2014 required, agents-platform_multitenant's require_identity() rejects unauthenticated requests with 401. Mint one inside the aw-backend container: python -c \"from src.api.identity_auth import create_identity_jwt; print(create_identity_jwt(<user_id>, [{'workspace': 'aw', 'role': 'owner'}], expiry_seconds=<seconds>))\""
+        "description": "aw-backend identity JWT sent as Authorization: Bearer on every call to agents_platform_base \u2014 required, agents-platform-multitenant's require_identity() rejects unauthenticated requests with 401. Mint one inside the aw-backend container: python -c \"from src.api.identity_auth import create_identity_jwt; print(create_identity_jwt(<user_id>, [{'workspace': 'aw', 'role': 'owner'}], expiry_seconds=<seconds>))\""
       },
       "execute_secret": {
         "type": "string",
         "x-secret": true,
-        "description": "Shared secret RunnerLLM (agents-platform_multitenant) must present as the X-Runner-Secret header on every POST /execute call. This app is registered PUBLIC in aw-backend's AppInstall registry (bypasses the tunnel edge's aw_id_jwt+membership check), so this secret \u2014 combined with aw-workspace's own per-app IdentityGuard, which still requires a validly-signed identity JWT \u2014 is the real access control for /execute. Generate with e.g. `python3 -c \"import secrets; print(secrets.token_urlsafe(32))\"` and configure the SAME value on agents-platform_multitenant's Runner row / RunnerLLM env."
+        "description": "Shared secret RunnerLLM (agents-platform-multitenant) must present as the X-Runner-Secret header on every POST /execute call. This app is registered PUBLIC in aw-backend's AppInstall registry (bypasses the tunnel edge's aw_id_jwt+membership check), so this secret \u2014 combined with aw-workspace's own per-app IdentityGuard, which still requires a validly-signed identity JWT \u2014 is the real access control for /execute. Generate with e.g. `python3 -c \"import secrets; print(secrets.token_urlsafe(32))\"` and configure the SAME value on agents-platform-multitenant's Runner row / RunnerLLM env."
       },
       "own_base_url": {
         "type": "string",
-        "description": "Override for this app's own reachable base URL, sent to agents-platform_multitenant on POST /register as the Runner row's base_url. Defaults to https://agents-platform-runners.app.<workspace>.workspace.aw.tekflox.com (the per-app subdomain shape, bare host/path \u2014 verified-reachable via the same public BYOD tunnel edge) \u2014 only override if this workspace's public domain differs."
+        "description": "Override for this app's own reachable base URL, sent to agents-platform-multitenant on POST /register as the Runner row's base_url. Defaults to https://agents-platform-runners.app.<workspace>.workspace.aw.tekflox.com (the per-app subdomain shape, bare host/path \u2014 verified-reachable via the same public BYOD tunnel edge) \u2014 only override if this workspace's public domain differs."
       },
       "shared_redis_url": {
         "type": "string",
         "x-secret": true,
-        "description": "OPTIONAL since 0.26.0 \u2014 leave blank and it is derived automatically. Full redis:// URL (with password + db index) of the SAME shared Redis instance agents-platform_multitenant uses for its Redis-Stream run-event transport (its AP_REDIS_URL). /execute publishes each spawned CLI agent's stdout lines to run:{run_id}:events on this Redis so RunnerLLM can attach and replay exactly like a local docker-CLI run. Verified 2026-08-02: reachable from this workspace via the docker bridge gateway IP, e.g. redis://:<password>@172.18.0.1:6379/1 \u2014 aw-sandbox's own DNS name does NOT resolve from inside this workspace's nested podman netns, only the numeric gateway IP does. When blank, agents_platform_runners_app/shared_redis.py falls back to AW_SHARED_REDIS_URL, then to redis://<this container's default-route gateway>:6379/1 (db 1 = the db agents-platform_multitenant attaches its consumer groups on; override with AW_SHARED_REDIS_DB). Set this only when the shared Redis is NOT on the bridge gateway or needs a password \u2014 a freshly created workspace must not require pasting it by hand."
+        "description": "OPTIONAL since 0.26.0 \u2014 leave blank and it is derived automatically. Full redis:// URL (with password + db index) of the SAME shared Redis instance agents-platform-multitenant uses for its Redis-Stream run-event transport (its AP_REDIS_URL). /execute publishes each spawned CLI agent's stdout lines to run:{run_id}:events on this Redis so RunnerLLM can attach and replay exactly like a local docker-CLI run. Verified 2026-08-02: reachable from this workspace via the docker bridge gateway IP, e.g. redis://:<password>@172.18.0.1:6379/1 \u2014 aw-sandbox's own DNS name does NOT resolve from inside this workspace's nested podman netns, only the numeric gateway IP does. When blank, agents_platform_runners_app/shared_redis.py falls back to AW_SHARED_REDIS_URL, then to redis://<this container's default-route gateway>:6379/1 (db 1 = the db agents-platform-multitenant attaches its consumer groups on; override with AW_SHARED_REDIS_DB). Set this only when the shared Redis is NOT on the bridge gateway or needs a password \u2014 a freshly created workspace must not require pasting it by hand."
       },
       "kanban_sweep_enabled": {
         "type": "boolean",
@@ -251,7 +251,7 @@
         "type": "boolean",
         "default": true,
         "title": "Public",
-        "description": "Expose this app through the workspace's public tunnel routing layer (aw-backend's own AppInstall.config.public flag, same mechanism mcp-gateway's own \"Public\" setting uses) \u2014 required for POST /execute to be reachable at all: agents-platform_multitenant's RunnerLLM calls this app's own_base_url over the public BYOD tunnel edge, which 401s any non-public app before the request even reaches this app's own execute_secret check. Defaulting this to true (declared in schema, not just set by hand) makes it survive an uninstall+reinstall from scratch: every config save round-trips the FULL config dict through aw-backend's AppInstall.config \u2014 a field that exists only as a manually-poked cloud-side value (not part of any app's own persisted config) gets silently dropped on the very next save. Found live 2026-08-11/12: exactly that happened after an uninstall+reinstall, and /execute kept 401ing at the tunnel edge even after the app's own execute_secret was correctly restored."
+        "description": "Expose this app through the workspace's public tunnel routing layer (aw-backend's own AppInstall.config.public flag, same mechanism mcp-gateway's own \"Public\" setting uses) \u2014 required for POST /execute to be reachable at all: agents-platform-multitenant's RunnerLLM calls this app's own_base_url over the public BYOD tunnel edge, which 401s any non-public app before the request even reaches this app's own execute_secret check. Defaulting this to true (declared in schema, not just set by hand) makes it survive an uninstall+reinstall from scratch: every config save round-trips the FULL config dict through aw-backend's AppInstall.config \u2014 a field that exists only as a manually-poked cloud-side value (not part of any app's own persisted config) gets silently dropped on the very next save. Found live 2026-08-11/12: exactly that happened after an uninstall+reinstall, and /execute kept 401ing at the tunnel edge even after the app's own execute_secret was correctly restored."
       },
       "warm_container": {
         "type": "boolean",

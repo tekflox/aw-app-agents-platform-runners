@@ -70,7 +70,7 @@ def test_append_system_prompt_forwarded_in_warm_mode(tmp_path, monkeypatch):
 
 
 def test_secure_mode_style_job_gets_no_bypass_flag_and_keeps_bash_disallowed(tmp_path, monkeypatch):
-    # Mirrors what agents-platform_multitenant's make_llm() sends for
+    # Mirrors what agents-platform-multitenant's make_llm() sends for
     # security_mode="secure": dangerous_skip_permissions=False + "Bash"
     # appended to disallowed_tools.
     argv = _warm_argv({

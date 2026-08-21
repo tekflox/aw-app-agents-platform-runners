@@ -69,7 +69,7 @@ def build_routes(config: dict | None = None) -> FastAPI:
     @app.post("/register")
     async def register() -> dict:
         """Register this workspace's local CLI runners with
-        agents-platform_multitenant (POST /api/runners/register), so the
+        agents-platform-multitenant (POST /api/runners/register), so the
         platform's Runners registry reflects what's actually installed here.
         Upsert is server-side (workspace, cli) — safe to click repeatedly,
         never creates duplicates."""
@@ -84,7 +84,7 @@ def build_routes(config: dict | None = None) -> FastAPI:
         # This app's OWN reachable base URL (the "Runner" execute endpoint) —
         # the public BYOD tunnel edge (see execute.py's module docstring for
         # why this is the only proven-reachable path from
-        # agents-platform_multitenant, a sibling docker container that
+        # agents-platform-multitenant, a sibling docker container that
         # cannot reach this workspace's nested-podman container directly).
         # Uses the per-app subdomain shape (bare host, no /api/apps/<slug>
         # prefix — RunnerLLM appends /execute itself) rather than the

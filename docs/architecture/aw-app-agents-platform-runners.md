@@ -12,7 +12,7 @@ checksum: sha256:7c5a406ef1eda400101301a29262c5888959864a30b5878debf7552b8d82f88
 - **technologies**: python
 - **health** (derived): planned
 
-Depends on the code-agent-clis app (claude/codex/copilot/cursor-agent already installed at /usr/local/bin, single source of truth) so this workspace's agent-CLI runners are what agents-platform_multitenant's agent sessions use, and contributes the ported "aw-agents" MCP (agent_mcp.py) so agents-platform is controllable as MCP tools from this workspace.
+Depends on the code-agent-clis app (claude/codex/copilot/cursor-agent already installed at /usr/local/bin, single source of truth) so this workspace's agent-CLI runners are what agents-platform-multitenant's agent sessions use, and contributes the ported "aw-agents" MCP (agent_mcp.py) so agents-platform is controllable as MCP tools from this workspace.
 
 ## Connections
 - `http` → **aw-workspace** — routes mounted at /api/apps/agents-platform-runners

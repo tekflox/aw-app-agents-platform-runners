@@ -6,7 +6,7 @@ freshly created aw-workspace therefore had a Runner that looked installed and
 healthy but answered every ``POST /execute`` with ``500 shared_redis_url is
 not configured on this app's Settings`` until a human went and pasted the URL
 in — a manual step that survived neither a redeploy nor the creation of
-another workspace. Same class of gap as agents-platform_multitenant carrying a
+another workspace. Same class of gap as agents-platform-multitenant carrying a
 stale ``AP_REDIS_URL`` in a hand-maintained ``.env``.
 
 The address is discoverable, so discover it — but by PROBING, not by guessing
@@ -18,7 +18,7 @@ route. Deriving the address from ``/proc/net/route`` alone would therefore
 have produced a confidently wrong URL. Compose DNS names (``aw-sandbox``,
 ``aw-redis``) are not candidates at all: they do not resolve from inside this
 workspace's nested podman netns, which is the very thing that broke
-agents-platform_multitenant's own spawned containers.
+agents-platform-multitenant's own spawned containers.
 
 Resolution order (first hit wins):
 
@@ -30,7 +30,7 @@ Resolution order (first hit wins):
 3. The first candidate host that actually accepts a TCP connection on
    ``AW_SHARED_REDIS_PORT`` (default 6379). Result is cached process-wide.
 
-The db index defaults to 1 because that is the db agents-platform_multitenant
+The db index defaults to 1 because that is the db agents-platform-multitenant
 attaches its ``run:{run_id}:events`` consumer groups on; publishing to any
 other db means RunnerLLM waits forever on a stream nobody writes. Override
 with ``AW_SHARED_REDIS_DB`` if that deployment moves.

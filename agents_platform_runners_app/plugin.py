@@ -10,7 +10,7 @@ This app installs no CLI of its own — its two jobs are:
    config save (contributes.mcp.reload_on_save — same pattern
    aw-app-mcp-tools already uses). agent_mcp.py reads its target platform
    URL from $AGENTS_BASE; this app points that at agents_platform_base
-   (config, default the agents-platform_multitenant instance) via mcp.json's
+   (config, default the agents-platform-multitenant instance) via mcp.json's
    own env block, so no code in mcp_server.py needed changing.
 2. Register a tiny /status route (routes.py) that checks whether
    claude/codex/copilot/cursor-agent actually resolve on PATH and reports
@@ -18,7 +18,7 @@ This app installs no CLI of its own — its two jobs are:
    (aw-app.json dependencies.apps, required) actually did its job. This
    app never installs those CLIs itself; depending on code-agent-clis is
    the reused path (Frederico decision 2026-08-01) instead of duplicating
-   install logic in a second place (e.g. agents-platform_multitenant's own
+   install logic in a second place (e.g. agents-platform-multitenant's own
    agent-images Dockerfiles, which were deliberately left untouched).
 """
 
@@ -55,8 +55,8 @@ RECONCILE_INTERVAL_S = 360.0
 # and usually better, for none of the public-endpoint surface a webhook needs.
 KANBAN_SWEEP_INTERVAL_S = 60.0
 
-# agents-platform_multitenant now runs as its own docker-compose stack
-# (repos/agents-platform_multitenant/docker-compose.yml), attached to the
+# agents-platform-multitenant now runs as its own docker-compose stack
+# (repos/agents-platform-multitenant/docker-compose.yml), attached to the
 # `agentic-workspace_default` bridge network and publishing :10014 on the
 # real host — decoupled from ./aw (2026-08-02). This app's MCP server runs
 # inside aw-app-mcp-gateway, itself nested one level deeper (podman inside
@@ -104,7 +104,7 @@ def build_mcp_servers(config: dict) -> dict:
             "type": "stdio",
             "command": "python3",
             "args": ["-m", "agents_platform_runners_app.mcp_server"],
-            # agents-platform_multitenant's require_identity() rejects every
+            # agents-platform-multitenant's require_identity() rejects every
             # request without an aw-backend identity JWT (401) — this is
             # that credential (mcp_server.py sends it as Authorization:
             # Bearer on every call). Mint one with aw-backend's

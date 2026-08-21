@@ -4,7 +4,7 @@ connector can actually resolve.
 Why this exists (2026-08-12)
 ----------------------------
 An agent writes ``[[ATTACH: /opt/aw-workspace/.tmp/chart.png]]`` and the
-attachment silently never arrives. agents-platform_multitenant's
+attachment silently never arrives. agents-platform-multitenant's
 ``api/telegram.py::_deliver_reply`` does::
 
     if not os.path.exists(path):

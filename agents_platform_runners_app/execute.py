@@ -1,23 +1,23 @@
 """``POST /execute`` — spawn an agent CLI container INSIDE this workspace's
 own container engine (podman, via ``AW_CONTAINER_SOCKET``) and stream its
-output back to the caller (agents-platform_multitenant's ``RunnerLLM``) over
-the SAME Redis Stream mechanism agents-platform_multitenant already uses for
+output back to the caller (agents-platform-multitenant's ``RunnerLLM``) over
+the SAME Redis Stream mechanism agents-platform-multitenant already uses for
 its own local docker-CLI runs (``backend/app/core/redis_streams.py`` there —
 key scheme ``run:{run_id}:events``, XADD field ``line``/``done``).
 
-Why this exists (2026-08-02 architecture change): agents-platform_multitenant
+Why this exists (2026-08-02 architecture change): agents-platform-multitenant
 used to spawn every CLI-agent container as a SIBLING on its OWN host's Docker
 daemon (``core/tools/docker_agent.py``), which meant every run mounted the
 LEGACY monolith's ``/opt/agentic-workspace`` regardless of which workspace the
 run's agent config belonged to. A "Runner" is this app: the execution service
 that runs INSIDE a workspace (here, ``aw-workspace``) and mounts THAT
-workspace's own paths. agents-platform_multitenant's ``RunnerLLM`` calls
+workspace's own paths. agents-platform-multitenant's ``RunnerLLM`` calls
 ``POST {base_url}/execute`` instead of touching docker.sock itself.
 
 Design decisions, verified live (not assumed) on 2026-08-02:
 
 * **Reachability**: this app's routes are NOT reachable from
-  agents-platform_multitenant on the plain docker bridge network — the
+  agents-platform-multitenant on the plain docker bridge network — the
   workspace is a nested podman container inside ``aw-remote-host`` and only
   binds ``127.0.0.1:9030`` in ITS OWN netns. The only proven path is the
   public BYOD tunnel edge: ``https://api.<slug>.workspace.<domain>/api/apps/
@@ -40,7 +40,7 @@ Design decisions, verified live (not assumed) on 2026-08-02:
      secret configured on this app's Settings — neither alone is enough.
 * **Streaming**: Redis Stream reuse, NOT a new protocol. Verified live:
   this workspace's own container CAN reach the exact same shared Redis
-  instance agents-platform_multitenant uses for ``AP_REDIS_URL``
+  instance agents-platform-multitenant uses for ``AP_REDIS_URL``
   (``redis://<pw>@aw-sandbox:6379/1`` from the sandbox's own network — reached
   here via the docker bridge gateway IP ``172.18.0.1:6379``, since
   ``aw-sandbox`` the DNS name doesn't resolve from inside the nested podman
@@ -436,7 +436,7 @@ def _build_container_kwargs(job: dict) -> tuple[str, list[str], dict, str | None
     isolated_host_dir.mkdir(parents=True, exist_ok=True)
     isolated_container_path = f"/home/ubuntu/{isolated_rel}"
 
-    # MCP config: agents-platform_multitenant's executor.py resolves the
+    # MCP config: agents-platform-multitenant's executor.py resolves the
     # agent's configured MCP servers (incl. gateway-token injection and the
     # X-Aw-Caller-Run-Id header) and ships the FINAL dict over the wire as
     # job["mcp_servers"] — this app has no filesystem access to that host's
@@ -1341,7 +1341,7 @@ def _run_job_blocking(job: dict, redis_url: str) -> None:
     # `container.logs(stream=True)` yields raw byte chunks exactly as
     # delivered by the daemon's log API — these do NOT align with the
     # underlying process's newline-terminated lines (unlike the OLD local
-    # path's `asyncio.StreamReader.readline()` in agents-platform_multitenant's
+    # path's `asyncio.StreamReader.readline()` in agents-platform-multitenant's
     # cli.py, which buffers until a full line is available). A single
     # `claude --output-format stream-json` JSON line (e.g. a big tool_result)
     # can arrive split across two or more chunks. Publishing each raw chunk

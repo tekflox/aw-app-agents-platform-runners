@@ -1,7 +1,7 @@
 """Attachments across the runner/connector host boundary — both directions.
 
 The agent CLI runs in a nested podman container on aw-remote-host; the
-Telegram connector in agents-platform_multitenant runs under docker on the
+Telegram connector in agents-platform-multitenant runs under docker on the
 outer bare-metal host. Neither can open a path the other produced.
 
 * **Outbound** — an agent writes ``[[ATTACH: /opt/aw-workspace/.tmp/x.png]]``
