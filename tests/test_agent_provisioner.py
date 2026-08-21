@@ -3,10 +3,13 @@
 Exercises the whole seed against a stubbed agents-platform — no network, no
 running instance. What matters and is asserted here:
 
-* the five kinds are created in dependency order (an Agent's model/config/
-  group slugs must already exist; an AgentFlow's graph names agents),
+* the six kinds are created in dependency order (an Agent's model/config/
+  group slugs must already exist; an AgentFlow's graph names agents;
+  ``targets`` has no dependents and goes first),
 * an existing slug is never POSTed and never updated,
-* a 409 is already-there, not a failure,
+* a 409 is already-there, not a failure — UNLESS the kind has a soft-delete
+  restore route (only ``targets`` today), in which case a 409 on a
+  soft-deleted slug gets restored instead of silently staying invisible,
 * an unreachable platform degrades to logs instead of raising into the app
   activation path that calls this.
 """
@@ -41,26 +44,55 @@ SPEC = {
 
 
 class FakePlatform:
-    """Minimal stand-in for agents-platform's four create endpoints."""
+    """Minimal stand-in for agents-platform's create endpoints.
 
-    def __init__(self, existing=None, post_status=200, list_status=200):
+    ``deleted`` maps a list path (e.g. ``/api/targets``) to the slugs that
+    are soft-deleted there, so ``GET <list path>/<slug>`` (the single-object
+    lookup ``_restore_if_soft_deleted`` uses to tell "exists" apart from
+    "exists but tombstoned") can answer with a ``deleted_at``. A path with
+    more than one extra segment is always this single-object shape — none of
+    the real list endpoints nest, so the split length is an unambiguous
+    signal and every existing list-GET test keeps behaving exactly as before.
+    """
+
+    def __init__(self, existing=None, post_status=200, list_status=200,
+                deleted=None, get_status=200, restore_status=200):
         self.existing = {p: list(v) for p, v in (existing or {}).items()}
+        self.deleted = {p: set(v) for p, v in (deleted or {}).items()}
         self.post_status = post_status
         self.list_status = list_status
+        self.get_status = get_status
+        self.restore_status = restore_status
         self.posts: list[tuple[str, dict]] = []
+        self.restores: list[str] = []
 
     def handler(self, request: httpx.Request) -> httpx.Response:
         path = request.url.path
         if request.method == "GET":
+            if len(path.split("/")) > 3:
+                return self._single_object(path)
             if self.list_status != 200:
                 return httpx.Response(self.list_status, text="nope")
             rows = [{"slug": s} for s in self.existing.get(path, [])]
             return httpx.Response(200, json=rows)
+        if path.endswith("/restore"):
+            self.restores.append(path)
+            return httpx.Response(self.restore_status, json={"restored": True})
         body = json.loads(request.content)
         self.posts.append((path, body))
         if self.post_status != 200:
             return httpx.Response(self.post_status, text="boom")
         return httpx.Response(200, json=body)
+
+    def _single_object(self, path: str) -> httpx.Response:
+        if self.get_status != 200:
+            return httpx.Response(self.get_status, text="nope")
+        list_path, _, slug = path.rpartition("/")
+        is_deleted = slug in self.deleted.get(list_path, set())
+        return httpx.Response(200, json={
+            "slug": slug,
+            "deleted_at": "2026-01-01T00:00:00Z" if is_deleted else None,
+        })
 
     def transport(self):
         return httpx.MockTransport(self.handler)
@@ -239,3 +271,90 @@ def test_a_failed_refresh_never_raises():
                 return httpx.Response(500, text="boom")
             return FakePlatform.handler(self, request)
     _seed_with_gateway(Failing(existing={"/api/agent-configs": ["rev-cfg"]}))
+
+
+# --- targets --------------------------------------------------------------
+#
+# A Target is a delivery umbrella runs point at, not something an Agent or
+# AgentFlow references by slug — so unlike the other four kinds it has no
+# ordering constraint, and it is the one kind wired to the soft-delete
+# restore path (see the module docstring's ENDPOINTS/RESTORE_ENDPOINTS).
+
+TARGET_SPEC = {"targets": [{"slug": "system-investigations",
+                           "name": "System Investigations",
+                           "description": "Ongoing system audits"}]}
+
+
+def test_a_target_is_created():
+    platform = FakePlatform()
+    assert _seed(platform, TARGET_SPEC) == {"targets": 1}
+    assert platform.posts == [("/api/targets", {
+        "slug": "system-investigations", "name": "System Investigations",
+        "description": "Ongoing system audits"})]
+
+
+def test_targets_are_seeded_before_every_other_kind():
+    platform = FakePlatform()
+    _seed(platform, {**TARGET_SPEC, **SPEC})
+    assert [path for path, _ in platform.posts][0] == "/api/targets"
+
+
+def test_unknown_fields_are_dropped_from_a_target_payload():
+    # agents-platform's TargetIn has no room for a manifest-only key —
+    # forwarding one verbatim would 422 the whole create.
+    platform = FakePlatform()
+    _seed(platform, {"targets": [{"slug": "t", "name": "T",
+                                  "some_future_manifest_key": "x"}]})
+    _, body = platform.posts[0]
+    assert "some_future_manifest_key" not in body
+    assert body == {"slug": "t", "name": "T"}
+
+
+def test_a_target_that_already_exists_and_is_not_deleted_is_left_alone():
+    platform = FakePlatform(existing={"/api/targets": ["system-investigations"]})
+    assert _seed(platform, TARGET_SPEC) == {}
+    assert platform.posts == []
+    assert platform.restores == []
+
+
+def test_a_soft_deleted_target_is_restored_on_reseed():
+    # The trap this exists to close: the slug is absent from the LIST (soft-
+    # deleted rows are excluded there), so the pre-check says "create it",
+    # and the platform's own create route 409s on the tombstoned slug. The
+    # generic "409 == already there" rule would stop right there and the
+    # Target would stay invisible forever — this is the kind that doesn't.
+    platform = FakePlatform(post_status=409,
+                            deleted={"/api/targets": {"system-investigations"}})
+    assert _seed(platform, TARGET_SPEC) == {}
+    assert platform.restores == ["/api/targets/system-investigations/restore"]
+
+
+def test_a_409_target_that_is_not_actually_deleted_is_left_alone():
+    # Someone else created the same slug between our GET and our POST — the
+    # ordinary 409 race every kind can hit. No restore call belongs here.
+    platform = FakePlatform(post_status=409)
+    assert _seed(platform, TARGET_SPEC) == {}
+    assert platform.restores == []
+
+
+def test_a_failed_restore_is_logged_but_never_raises():
+    platform = FakePlatform(post_status=409, restore_status=500,
+                            deleted={"/api/targets": {"system-investigations"}})
+    assert _seed(platform, TARGET_SPEC) == {}
+    assert platform.restores == ["/api/targets/system-investigations/restore"]
+
+
+def test_an_unreadable_soft_delete_check_is_logged_but_never_raises():
+    platform = FakePlatform(post_status=409, get_status=500,
+                            deleted={"/api/targets": {"system-investigations"}})
+    assert _seed(platform, TARGET_SPEC) == {}
+    assert platform.restores == []
+
+
+def test_other_kinds_never_attempt_a_restore_on_409():
+    # RESTORE_ENDPOINTS is deliberately narrow — only targets have no
+    # user-tuned content, so a 409 on an agent/group/etc. must stay the
+    # ordinary "already there" no-op with no restore call at all.
+    platform = FakePlatform(post_status=409)
+    assert _seed(platform, SPEC) == {}
+    assert platform.restores == []

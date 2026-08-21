@@ -6,6 +6,7 @@ URL and the identity token — so it implements the provider method and turns
 one app's declaration into REST calls against
 agents-platform-multitenant::
 
+    POST /api/targets         -> Target
     POST /api/models          -> Model
     POST /api/agent-configs   -> AgentConfig
     POST /api/agent-groups    -> AgentGroup
@@ -35,6 +36,26 @@ rationale in aw-workspace's ``src/apps/agents.py``: an agent's system prompt
 is exactly the field a user spends weeks tuning, and an app re-asserting its
 own copy on every boot would erase that with no trace.
 
+Soft-deleted rows do not stay 409-and-forgotten forever
+---------------------------------------------------------
+
+A slug already "existing" per the platform is not always the happy case:
+agents-platform's deletes are soft by default (``deleted_at``), a soft-
+deleted row is excluded from the LIST this provider pre-checks against, and
+its own create route still 409s on the tombstoned slug — so the generic
+"409 means someone beat us to it, leave it alone" rule would make a
+soft-deleted, app-seeded object invisible forever, with nothing anywhere
+saying why (this is exactly what happened to ``agent_flows`` in production;
+see the ``soft-delete-permanently-blocks-app-seeding`` lesson). ``targets``
+is the first kind that gets a real answer instead of that trap:
+``RESTORE_ENDPOINTS`` names a kind's restore route, and a 409 on a kind
+listed there is followed up with a GET (``include_deleted=true``) to tell
+"exists" apart from "exists but soft-deleted", restoring only the latter.
+A Target carries no field a user tunes the way they tune a system prompt —
+restoring it changes nothing but ``deleted_at`` — so auto-restoring the app's
+own seeded infrastructure loses no one's edits. Deleting one for good still
+works exactly as before: ``?hard=true``, which this provider never calls.
+
 A failure here is logged and skipped, never raised — aw-workspace calls this
 inside app activation, and an app whose features work but whose seeded agent
 didn't land beats an app that refuses to install.
@@ -57,6 +78,11 @@ DEFAULT_TIMEOUT = 20.0
 #: unknown field with a 422, so forwarding the manifest verbatim would turn
 #: every future manifest-only key into a hard seeding failure.
 ENDPOINTS: dict[str, tuple[str, frozenset[str]]] = {
+    "targets": ("/api/targets", frozenset({
+        "slug", "name", "description", "source_kind", "source_ref",
+        "plan_canvas_id", "report_canvas_id", "budget_tokens", "budget_usd",
+        "enforce_budget", "tags", "notes", "pr_urls", "created_by",
+    })),
     "models": ("/api/models", frozenset({
         "slug", "provider", "model_id", "display_name", "params", "enabled",
     })),
@@ -82,14 +108,26 @@ ENDPOINTS: dict[str, tuple[str, frozenset[str]]] = {
 }
 
 #: Creation order — an Agent references the other three by slug, and an
-#: AgentFlow's graph references agents by slug, so it goes last.
-ORDER = ("models", "agent_configs", "groups", "agents", "agent_flows")
+#: AgentFlow's graph references agents by slug, so it goes last. ``targets``
+#: goes first: nothing references a Target by slug and a Target references
+#: nothing, so it has no ordering constraint — first is as defensible a slot
+#: as any, and keeps this tuple's shape matching aw-workspace's ``KINDS``.
+ORDER = ("targets", "models", "agent_configs", "groups", "agents", "agent_flows")
 
 #: ``display_name`` is required by the platform's ModelIn but is pure
 #: presentation; defaulting it from the slug spares every manifest a field
 #: that carries no decision.
 DEFAULTS: dict[str, dict[str, str]] = {
     "models": {"display_name": "slug"},
+}
+
+#: kind -> restore endpoint template, for kinds whose soft-delete would
+#: otherwise 409-block a reseed forever (see the module docstring's
+#: "Soft-deleted rows do not stay 409-and-forgotten forever" section).
+#: Only ``targets`` has a restore route today; every other kind still uses
+#: the plain "409 == already there" rule below.
+RESTORE_ENDPOINTS: dict[str, str] = {
+    "targets": "/api/targets/{slug}/restore",
 }
 
 
@@ -159,9 +197,12 @@ class AgentProvisioner:
                 log.warning("failed to create %s %r from %s: %s", kind, slug, app_id, exc)
                 continue
             if resp.status_code == 409:
-                # Created between our GET and this POST, or by another
-                # workspace against the same tenant. Same outcome we wanted.
-                log.debug("%s %r already existed (409), leaving it alone", kind, slug)
+                if kind in RESTORE_ENDPOINTS:
+                    self._restore_if_soft_deleted(client, app_id, kind, path, slug)
+                else:
+                    # Created between our GET and this POST, or by another
+                    # workspace against the same tenant. Same outcome we wanted.
+                    log.debug("%s %r already existed (409), leaving it alone", kind, slug)
                 continue
             if resp.status_code >= 400:
                 log.warning("failed to create %s %r from %s: HTTP %s %s",
@@ -170,6 +211,42 @@ class AgentProvisioner:
             count += 1
             log.info("seeded %s %r from %s", kind, slug, app_id)
         return count
+
+    def _restore_if_soft_deleted(self, client: httpx.Client, app_id: str, kind: str,
+                                 path: str, slug: str) -> None:
+        """A 409 on create means "exists" — but the platform's delete is soft
+        by default, so it can also mean "exists, tombstoned, and about to
+        stay invisible forever" (see the module docstring). Tell the two
+        apart with a GET before deciding this is a quiet no-op.
+
+        Only entries whose kind carries no user-tuned content reach here
+        (``RESTORE_ENDPOINTS`` is deliberately narrow) — restoring changes
+        nothing but ``deleted_at``, so there is nothing of a user's to lose.
+        A restore failure is logged at warning, not debug: unlike the normal
+        409 case this one means the seed did NOT converge on the intended
+        state, and that is worth someone noticing.
+        """
+        try:
+            resp = client.get(f"{path}/{slug}", params={"include_deleted": "true"})
+            resp.raise_for_status()
+            row = resp.json()
+        except (httpx.HTTPError, ValueError) as exc:
+            log.warning("could not check %s %r for soft-delete from %s: %s — "
+                        "leaving it alone", kind, slug, app_id, exc)
+            return
+        if not row.get("deleted_at"):
+            log.debug("%s %r already exists, leaving it alone", kind, slug)
+            return
+        restore_path = RESTORE_ENDPOINTS[kind].format(slug=slug)
+        try:
+            resp = client.post(restore_path)
+            resp.raise_for_status()
+        except httpx.HTTPError as exc:
+            log.warning("%s %r is soft-deleted and could not be restored from %s: "
+                        "%s — it will stay invisible until restored by hand or "
+                        "hard-deleted and reseeded", kind, slug, app_id, exc)
+            return
+        log.info("%s %r was soft-deleted — restored on reseed from %s", kind, slug, app_id)
 
     def _refresh_credentials(self, client: httpx.Client, app_id: str, kind: str,
                              path: str, slug: str, entry: dict[str, Any]) -> None:
