@@ -131,6 +131,56 @@ prompt. Works with or without a Kanban card — **if there is one**, also call
 `move_kanban_task(status="need_human", comment=...)` yourself; `ask_human`
 doesn't touch Kanban.
 
+## When the terminal action itself FAILS to execute
+
+A tool call that errors or times out is **not** the same as work that
+failed, and the two must not land in the same place. `mark_flow_done(
+outcome="failed")` says *the task did not work out*. A `mark_flow_done`
+that raises a connection error says *I could not record what already
+happened* — the verdict you reached is still valid, it just has not been
+written down.
+
+**Do not touch the card's status to report a failed terminal action.** In
+particular do not call `set_blocker` or `move_kanban_task(status=
+"need_human")` for it. Doing so overwrites a healthy delivery with a status
+that reads as "this needs a human decision", and the next person to see the
+board has no way to tell that the review actually passed. Any verdict you
+already recorded — `set_qa_status`, a comment, a property — stands; leave it
+alone.
+
+**Do this instead:**
+
+1. **Retry once.** These failures are usually a gateway upstream that
+   dropped and is re-checked every 60s (`aw-workspace-cli doctor` names it:
+   "an upstream the gateway failed to connect to serves zero tools until a
+   reload"). A second attempt often just works.
+2. **If it still fails, end your turn** and say so in your final output, in
+   plain words: which tool, what error, and what the outcome would have
+   been. Name the run id.
+
+Ending without a terminal action is already handled, and handled better
+than anything you can improvise: the runtime **reprompts you once**, which
+is a free second attempt after the upstream has had time to recover, and if
+that also produces nothing it escalates — setting `flow_needs_human` on
+every run in the flow (the yellow border on the Flow chip) and pinging
+sysadmins on Telegram with your run id and the reason. See
+`_maybe_reprompt_or_escalate` / `_escalate_need_human` in
+`core/executor.py`.
+
+So the honest failure path costs one reprompt and produces an alert that
+carries the run id. Reaching for `set_blocker` instead produces a card that
+lies about a delivery, and no alert at all.
+
+**Live example (2026-08-21).** A QA agent finished a review, called
+`set_qa_status` successfully — the `aw-kanban` upstream was fine throughout
+— and then hit connection errors on `mark_flow_done` twice and a timeout on
+`return_to_caller_agent`, both on the `agents-platform-runners` upstream.
+Following its own "don't hunt for workarounds, flag it" rule, it called
+`set_blocker`. That moved a card whose delivery had just passed review to
+**Need Human**, and a human had to read the whole run to discover nothing
+was wrong. The agent obeyed its contract exactly; the contract was missing
+this section.
+
 ## What this is NOT
 
 Not LangChain/LangGraph (no engine drives execution for you — you decide

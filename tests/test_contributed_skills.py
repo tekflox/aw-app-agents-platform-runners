@@ -86,3 +86,43 @@ def test_no_skill_points_at_a_tool_namespace_that_does_not_exist(declared):
         text = (APP_DIR / rel).read_text()
         for marker in stale:
             assert marker not in text, f"{slug} still references {marker!r}"
+
+
+def test_the_flow_contract_separates_a_failed_task_from_a_failed_tool_call(declared):
+    """The distinction a live incident cost a card to learn (2026-08-21).
+
+    A QA agent finished its review, called set_qa_status successfully, then
+    hit connection errors on mark_flow_done and a timeout on
+    return_to_caller_agent — both on one flaky gateway upstream. Following
+    its "don't hunt for workarounds, flag it" rule it called set_blocker,
+    which moved a card that had just PASSED review to Need Human. The agent
+    obeyed its contract; the contract had nothing to say about a terminal
+    action that fails to execute, as opposed to work that fails.
+
+    The runtime already handles a turn that ends without a terminal action —
+    it reprompts once (a free retry after the upstream recovers) and then
+    escalates with flow_needs_human plus a sysadmin ping carrying the run
+    id. That path is strictly better than any card-status improvisation, so
+    the contract has to point at it by name.
+    """
+    text = (APP_DIR / declared["aw-agents-flow"]).read_text()
+    assert "When the terminal action itself FAILS to execute" in text
+    # Naming the runtime functions is what makes the claim checkable by
+    # whoever doubts it, instead of another rule to take on faith.
+    assert "_escalate_need_human" in text
+    assert "reprompt" in text.lower()
+    # The prohibition has to be explicit about BOTH ways an agent can reach
+    # for the card — set_blocker is the one that fired, move_kanban_task is
+    # the obvious next improvisation.
+    assert "set_blocker" in text and "need_human" in text
+
+
+def test_the_qa_contract_scopes_set_blocker_to_the_review(declared):
+    """aw-agent-qa's "call set_blocker immediately if you're stuck" is the
+    rule that got misapplied — correctly read, wrongly scoped. It has to say
+    that "stuck" means the review is stuck, not that a tool call after the
+    verdict failed.
+    """
+    text = (APP_DIR / declared["aw-agent-qa"]).read_text()
+    assert "not your own bookkeeping" in text.lower()
+    assert "mark_flow_done" in text

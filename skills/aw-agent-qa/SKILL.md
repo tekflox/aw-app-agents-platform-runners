@@ -160,6 +160,19 @@ Explain what you tried and what's needed to unblock. This surfaces the
 problem right away instead of leaving the run to silently time out or
 hallucinate a question with nowhere to send it.
 
+**"Stuck" means the review is stuck — not your own bookkeeping.** Once you
+have reached a verdict and called `set_qa_status`, the review is over.
+If a tool call *after* that point fails — `mark_flow_done` erroring,
+`return_to_caller_agent` timing out — do **not** call `set_blocker` for it.
+That would move a card whose delivery just passed to Need Human, and
+whoever reads the board next has no way to tell the review was fine.
+
+Retry once, then end your turn saying which tool failed and what the
+outcome would have been. The runtime reprompts you and escalates on its
+own, with the run id attached — see the "When the terminal action itself
+FAILS to execute" section of `aw-agents-flow`. This exact confusion cost a
+real card on 2026-08-21.
+
 ## Where you sit in the Software Engineering flow (if this platform has Agents Flow enabled)
 
 If this instance uses the `software-engineering` Agents Flow, you're the
