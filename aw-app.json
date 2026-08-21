@@ -77,6 +77,11 @@
         "description": "Generic coding-specialist contract for the \"Coder\" Agents Platform agent \u2014 orients it to what Agents Platform is, makes a knowledge-base search mandatory before starting any task, and sets baseline engineering conduct."
       },
       {
+        "id": "aw-agent-code-reviewer",
+        "path": "skills/aw-agent-code-reviewer/SKILL.md",
+        "description": "Code-review contract for the \"Code Reviewer\" Agents Platform agent \u2014 reads a diff for correctness bugs and reuse/simplification cleanups, verifies each finding against the code before reporting it, and never fixes what it reviews. Distinct from aw-agent-qa: QA judges whether a delivery matches its request, this one judges the code itself."
+      },
+      {
         "id": "aw-agent-debugger",
         "path": "skills/aw-agent-debugger/SKILL.md",
         "description": "Generic root-cause-analysis contract for the \"Debugger\" Agents Platform agent \u2014 debugs by explicit hypothesis and small experiments, reports the root cause with its evidence, and hands the fix to a Coder rather than writing it. Points at the aw-debugger DAP tools while stating up front that no DAP server ships with them."
