@@ -1696,81 +1696,20 @@ async def _call_tool(name: str, arguments: dict[str, Any] | None) -> list[TextCo
                              json={"summary": args.get("summary") or ""})
             return _err(r.status_code, r.text) if r.status_code != 200 else _ok(r.json())
         if name == "run_ready_cards":
-            board = _board_client()
-            dry_run = bool(args.get("dry_run"))
+            # One implementation, two triggers: this manual catch-all and the
+            # in-process watchdog (plugin.py) both run kanban_dispatch's
+            # sweep_ready. Keeping a second copy of the loop here is exactly how
+            # the double-fire the claim prevents would come back — the tool
+            # would be the one path without a claim.
             try:
-                cards = await asyncio.to_thread(
-                    board.ready_cards, args.get("status") or "ready",
-                    int(args.get("limit") or 50))
+                result = await kanban_dispatch.sweep_ready(
+                    _board_client(), kanban_dispatch.PlatformClient(c, BASE),
+                    status=args.get("status") or "ready",
+                    limit=int(args.get("limit") or 50),
+                    dry_run=bool(args.get("dry_run")))
             except kanban_dispatch.BoardUnavailable as exc:
                 return _err(503, f"could not read the Kanban board — {exc}")
-
-            results: list[dict] = []
-            for summary in cards:
-                page_id = summary.get("page_id") or ""
-                row: dict[str, Any] = {"page_id": page_id, "title": summary.get("title")}
-
-                # Skip before doing anything else: this tool is a manual
-                # catch-all, so it gets called on boards the webhook already
-                # dispatched from. Double-firing a card is the failure mode.
-                existing = await c.get(f"{BASE}/api/runs",
-                                       params={"notion_task_id": page_id, "limit": 1})
-                latest = (existing.json() or [None])[0] if existing.status_code == 200 else None
-                if latest and latest.get("status") in ("pending", "running"):
-                    results.append({**row, "skipped": "run-already-in-flight",
-                                    "run_id": latest.get("id")})
-                    continue
-
-                try:
-                    card = await asyncio.to_thread(board.card, page_id)
-                except kanban_dispatch.BoardUnavailable as exc:
-                    results.append({**row, "error": f"could not read the card — {exc}"})
-                    continue
-
-                # list_cards' summary lacks body/comments; card() has them but
-                # is one page's worth. Merge so the prompt sees everything.
-                card = {**summary, **card}
-                planned = kanban_dispatch.dispatch_payload(
-                    card, kanban_dispatch.build_run_input(card))
-                if planned is None:
-                    results.append({**row, "skipped": "card names no agent_slug or workflow_slug"})
-                    continue
-                path, payload = planned
-                if dry_run:
-                    results.append({**row, "would_dispatch": path,
-                                    "target_slug": payload["target_slug"]})
-                    continue
-
-                # Move first, dispatch second — the monolith's order. A card
-                # left in Ready after a successful dispatch gets swept again by
-                # the next call; one moved to running after a failed dispatch
-                # just sits there, which is the quieter of the two wrongs.
-                try:
-                    await asyncio.to_thread(board.move, page_id, "running")
-                except kanban_dispatch.BoardUnavailable as exc:
-                    results.append({**row, "error": f"could not move the card — {exc}"})
-                    continue
-
-                r = await c.post(f"{BASE}{path}", json=payload)
-                if r.status_code != 200:
-                    results.append({**row, "error": f"dispatch failed: {r.status_code} {r.text[:200]}"})
-                    continue
-                run = r.json()
-                run_id = run.get("run_id") or run.get("id") or ""
-                if run_id:
-                    try:
-                        await asyncio.to_thread(board.set_property, page_id,
-                                                kanban_dispatch.RUN_ID_PROPERTY, run_id)
-                    except kanban_dispatch.BoardUnavailable as exc:
-                        # The run is already flying; a missing back-reference is
-                        # a navigation annoyance, not a reason to report failure.
-                        row["run_id_stamp_failed"] = str(exc)
-                results.append({**row, "run_id": run_id,
-                                "target_slug": payload["target_slug"]})
-
-            dispatched = sum(1 for r in results if r.get("run_id") and not r.get("skipped"))
-            return _ok({"considered": len(results), "dispatched": dispatched,
-                        "dry_run": dry_run, "results": results})
+            return _ok(result)
 
         if name == "invoke_kanban_agent":
             message = (args.get("message") or "").strip()

@@ -10,6 +10,7 @@ Run: python -m pytest tests/test_kanban_dispatch.py
 """
 from __future__ import annotations
 
+import asyncio
 import sys
 from pathlib import Path
 
@@ -232,3 +233,224 @@ def test_card_asks_for_the_body_and_comments(monkeypatch):
     kd.BoardClient().card("p1")
     assert "include_body=true" in seen["url"]
     assert "include_comments=true" in seen["url"]
+
+
+def test_the_watchdog_addresses_the_board_over_loopback(monkeypatch):
+    """The in-process watchdog runs INSIDE the workspace server, so the
+    published URL sends its traffic out to the tunnel edge and back — and that
+    edge cuts at ~30s, under this module's own 60s card-read timeout. A slow
+    card read there dies at the edge, not at the timeout sized for it."""
+    monkeypatch.delenv("AW_LOCAL_API_URL", raising=False)
+    monkeypatch.setenv("AW_WORKSPACE_API_URL", "https://aw.example")
+    monkeypatch.setenv("AW_PORT", "9030")
+    assert kd.board_base_url(prefer_loopback=True) == "http://127.0.0.1:9030"
+    assert kd.board_base_url() == "https://aw.example", "the MCP path is unchanged"
+
+
+# ── the claim ───────────────────────────────────────────────────────────
+#
+# The guard the whole cut-over rests on. Two dispatchers read two different run
+# databases, so "is a run already in flight?" is blind across the fence — the
+# card is the only shared signal, and a write-then-read-back on it is the only
+# way to make exactly one side win.
+
+class FakeBoard:
+    """A board where AgentRunId is a single last-write-wins cell, which is what
+    Notion's page patch actually is."""
+
+    def __init__(self, *, steal_with: str | None = None, cards=(), card=None):
+        self.props: dict[str, str] = {}
+        self.steal_with = steal_with
+        self.moves: list[tuple[str, str]] = []
+        self.writes: list[tuple[str, str]] = []
+        self._cards = list(cards)
+        self._card = card or {}
+
+    def ready_cards(self, status="ready", limit=50):
+        return self._cards
+
+    def card(self, page_id, *, with_content=True):
+        return dict(self._card)
+
+    def move(self, page_id, status):
+        self.moves.append((page_id, status))
+        return {"ok": True}
+
+    def set_property(self, page_id, name, value):
+        self.writes.append((name, value))
+        self.props[name] = value
+        return {"ok": True}
+
+    def properties(self, page_id, names=None):
+        if self.steal_with is not None:
+            # The other side patched in between our write and our read-back.
+            self.props[kd.RUN_ID_PROPERTY] = self.steal_with
+            self.steal_with = None
+        return dict(self.props)
+
+
+def test_claim_won_returns_its_own_token():
+    board = FakeBoard()
+    token = kd.claim_card(board, "p1")
+    assert token and token.startswith("mt:")
+    assert board.props[kd.RUN_ID_PROPERTY] == token
+
+
+def test_claim_lost_when_the_other_side_wrote_last():
+    """Both sides patch, both read back, and the read returns ONE value — so
+    the side that doesn't see its own token stands down. This is the case that
+    a status check alone cannot catch: both GETs landed before either PATCH."""
+    board = FakeBoard(steal_with="mono:someone-else")
+    assert kd.claim_card(board, "p1") is None
+
+
+def test_a_stale_read_fails_closed_rather_than_double_firing():
+    """A read that returns something unrelated (empty, an old run id, a human's
+    hand edit) makes us stand down. Both sides doing that leaves the card in
+    Ready — visible on the board and reclaimed by the next tick — instead of
+    two runs on one card."""
+    assert kd.claim_card(FakeBoard(steal_with=""), "p1") is None
+    assert kd.claim_card(FakeBoard(steal_with="run-from-yesterday"), "p1") is None
+
+
+def test_the_claim_token_names_the_side_that_holds_it():
+    """So a human looking at a card stuck mid-claim can tell who was holding
+    the lease when it stopped."""
+    assert kd.claim_card(FakeBoard(), "p1", side="mono").startswith("mono:")
+
+
+# ── the sweep ───────────────────────────────────────────────────────────
+
+class FakePlatform:
+    def __init__(self, *, latest=None, run_id="run-1", error=""):
+        self._latest = latest
+        self._run_id = run_id
+        self._error = error
+        self.dispatched: list[tuple[str, dict]] = []
+
+    async def latest_run(self, page_id):
+        return self._latest
+
+    async def dispatch(self, path, payload):
+        self.dispatched.append((path, payload))
+        return ("", self._error) if self._error else (self._run_id, "")
+
+
+def _sweep(board, platform, **kw):
+    return asyncio.run(kd.sweep_ready(board, platform, **kw))
+
+
+def _ready_summary(**over):
+    base = {"page_id": "p1", "title": "Fix the thing", "status": "Ready",
+            "agent_slug": "coder-sonnet", "target_slug": "some-target"}
+    base.update(over)
+    return base
+
+
+def test_sweep_claims_moves_dispatches_and_stamps_in_that_order():
+    """Move BEFORE dispatch is the monolith's order and it is deliberate: a
+    card left in Ready after a good dispatch gets swept again and looks like a
+    duplicate; one moved after a failed dispatch just sits there silently."""
+    board = FakeBoard(cards=[_ready_summary()],
+                      card={"page_id": "p1", "status": "Ready", "body_md": "do it"})
+    platform = FakePlatform()
+    out = _sweep(board, platform)
+
+    assert out["dispatched"] == 1
+    assert board.moves == [("p1", "running")]
+    assert platform.dispatched[0][0] == "/api/agents/coder-sonnet/run"
+    # First write is the claim token, last is the real run id.
+    assert board.writes[0][1].startswith("mt:")
+    assert board.writes[-1] == (kd.RUN_ID_PROPERTY, "run-1")
+
+
+def test_sweep_stands_down_when_the_claim_is_lost():
+    """Nothing is moved and nothing is dispatched — the other side won it."""
+    board = FakeBoard(steal_with="mono:x", cards=[_ready_summary()],
+                      card={"page_id": "p1", "status": "Ready"})
+    platform = FakePlatform()
+    out = _sweep(board, platform)
+
+    assert out["dispatched"] == 0
+    assert out["results"][0]["skipped"] == "claim-lost"
+    assert board.moves == []
+    assert platform.dispatched == []
+
+
+def test_sweep_skips_a_card_with_an_in_flight_run_before_writing_anything():
+    board = FakeBoard(cards=[_ready_summary()], card={"page_id": "p1", "status": "Ready"})
+    out = _sweep(board, FakePlatform(latest={"id": "r-9", "status": "running"}))
+
+    assert out["results"][0]["skipped"] == "run-already-in-flight"
+    assert board.writes == []
+
+
+def test_sweep_skips_a_card_the_other_side_already_moved():
+    """The re-read is what catches the monolith winning the race between our
+    list and our claim: the card is no longer Ready, so it isn't ours."""
+    board = FakeBoard(cards=[_ready_summary()],
+                      card={"page_id": "p1", "status": "In Progress"})
+    out = _sweep(board, FakePlatform())
+
+    assert out["results"][0]["skipped"] == "no-longer-ready"
+    assert board.writes == []
+
+
+def test_sweep_skips_a_card_with_no_slug_without_claiming_it():
+    """A card nobody finished filling in is `skipped`, not an error — and it
+    must not burn a claim, or the monolith reads our token on a card we were
+    never going to dispatch."""
+    board = FakeBoard(cards=[_ready_summary(agent_slug=None)],
+                      card={"page_id": "p1", "status": "Ready", "agent_slug": None})
+    out = _sweep(board, FakePlatform())
+
+    assert "no agent_slug" in out["results"][0]["skipped"]
+    assert board.writes == [] and board.moves == []
+
+
+def test_dry_run_writes_nothing_at_all():
+    board = FakeBoard(cards=[_ready_summary()],
+                      card={"page_id": "p1", "status": "Ready"})
+    out = _sweep(board, FakePlatform(), dry_run=True)
+
+    assert out["results"][0]["would_dispatch"] == "/api/agents/coder-sonnet/run"
+    assert board.writes == [] and board.moves == []
+
+
+def test_one_bad_card_does_not_end_the_pass():
+    """try/except per card. A board where one page 404s still dispatches the
+    rest — the sweep is the only trigger once the webhook is off."""
+    class Flaky(FakeBoard):
+        def card(self, page_id, *, with_content=True):
+            if page_id == "bad":
+                raise kd.BoardUnavailable("aw-app-notion returned 404")
+            return {"page_id": page_id, "status": "Ready"}
+
+    board = Flaky(cards=[_ready_summary(page_id="bad"), _ready_summary(page_id="good")])
+    out = _sweep(board, FakePlatform())
+
+    assert "404" in out["results"][0]["error"]
+    assert out["results"][1]["run_id"] == "run-1"
+    assert out["dispatched"] == 1
+
+
+def test_a_failed_dispatch_is_reported_not_swallowed():
+    board = FakeBoard(cards=[_ready_summary()], card={"page_id": "p1", "status": "Ready"})
+    out = _sweep(board, FakePlatform(error="dispatch failed: 500 boom"))
+
+    assert out["dispatched"] == 0
+    assert "500" in out["results"][0]["error"]
+
+
+def test_the_prompt_still_gets_the_body_the_summary_lacks():
+    """`list_cards` returns no body/comments; `card()` does. The merge is why
+    the dispatched agent sees the task instead of just its title."""
+    board = FakeBoard(cards=[_ready_summary()],
+                      card={"page_id": "p1", "status": "Ready",
+                            "body_md": "The button does nothing on mobile.",
+                            "comments_md": "- tried a CSS fix"})
+    platform = FakePlatform()
+    _sweep(board, platform)
+
+    sent = platform.dispatched[0][1]["input"]["input"]
+    assert "does nothing on mobile" in sent and "tried a CSS fix" in sent

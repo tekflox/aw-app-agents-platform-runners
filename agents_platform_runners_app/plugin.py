@@ -33,6 +33,7 @@ from pathlib import Path
 
 from . import agent_provisioner as agent_provisioner_mod
 from . import execute as execute_mod
+from . import kanban_dispatch as kanban_dispatch_mod
 from . import routes as routes_mod
 from . import shared_redis as shared_redis_mod
 from . import skills_sync as skills_sync_mod
@@ -47,6 +48,12 @@ log = logging.getLogger("aw_apps.agents_platform_runners")
 # silently drift.
 DELTA_INTERVAL_S = 180.0
 RECONCILE_INTERVAL_S = 360.0
+
+# Kanban Ready-card sweep (2026-08-21). 60s is not a compromise: the Notion
+# webhook this replaces was measured at ~50s end to end on a real card, and its
+# own code cites up to ~3min worst case — so a 0-60s sweep is at worst the same
+# and usually better, for none of the public-endpoint surface a webhook needs.
+KANBAN_SWEEP_INTERVAL_S = 60.0
 
 # agents-platform_multitenant now runs as its own docker-compose stack
 # (repos/agents-platform_multitenant/docker-compose.yml), attached to the
@@ -161,6 +168,7 @@ class AgentsPlatformRunnersAppPlugin:
         ctx.routes.register(routes_mod.build_routes(self._live_config))
 
         self._register_skills_watchdog(ctx, self._live_config)
+        self._register_kanban_sweep_watchdog(ctx, self._live_config)
 
         # Resolve warm mode from persisted config BEFORE anything asks
         # warm_pool.enabled() — config is the source of truth since 0.32.0
@@ -223,6 +231,76 @@ class AgentsPlatformRunnersAppPlugin:
         ctx.watchdog.register("skills-sync-reconcile", _reconcile, RECONCILE_INTERVAL_S,
                               run_immediately=False)
         log.info("skills_sync: watchdog registered (workspace=%s base=%s)", workspace, base)
+
+    def _register_kanban_sweep_watchdog(self, ctx, config: dict) -> None:
+        """Register the Kanban Ready-card sweep — the trigger that replaces the
+        monolith's Notion webhook.
+
+        **Off by default** (``kanban_sweep_enabled``, default false). The
+        monolith's webhook is still live while this ships, and two dispatchers
+        on one board is precisely the state the claim in
+        ``kanban_dispatch.claim_card`` exists to survive — but shipping the code
+        dark first means the flag flip is the whole cut-over, and the whole
+        rollback, with no deploy either way.
+
+        Three things here differ from the skills watchdog above, all deliberate:
+
+        * the task is registered whatever the flag says, and the flag is read
+          **inside** each tick off ``self._live_config`` — the dict
+          ``on_config_saved`` mutates in place. Gating the *registration*
+          instead would make the rollback an app restart; the whole point of
+          this flag is that turning it off takes effect on the next tick. The
+          interval is a callable for the same reason.
+        * the board is addressed over **loopback**, not the published URL. This
+          runs inside the workspace server, so the published URL would route out
+          to the tunnel edge — which cuts at ~30s, under this module's own
+          60s card-read timeout.
+        * ``BoardUnavailable`` is caught and logged here rather than left to
+          propagate. An auth or reachability failure in a watchdog is otherwise
+          a stack trace every 60s that nobody reads and no board ever shows.
+        """
+        if not ctx.has("watchdog:tasks"):
+            log.warning("kanban sweep: 'watchdog:tasks' capability not granted — "
+                        "Ready-card watchdog not started")
+            return
+        base = config.get("agents_platform_base") or DEFAULT_AGENTS_PLATFORM_BASE
+        token = config.get("agents_platform_token")
+        if not token:
+            log.warning("kanban sweep: agents_platform_token not configured — "
+                        "Ready-card watchdog not started (every dispatch would 401)")
+            return
+        def _interval() -> float:
+            try:
+                return float(self._live_config.get("kanban_sweep_interval_s")
+                             or KANBAN_SWEEP_INTERVAL_S)
+            except (TypeError, ValueError):
+                return KANBAN_SWEEP_INTERVAL_S
+
+        board_url = kanban_dispatch_mod.board_base_url(prefer_loopback=True)
+
+        async def _sweep() -> None:
+            if not self._live_config.get("kanban_sweep_enabled"):
+                return
+
+            import httpx
+
+            board = kanban_dispatch_mod.BoardClient(base_url=board_url)
+            platform_headers = {"Authorization": f"Bearer {token}"}
+            try:
+                async with httpx.AsyncClient(timeout=30, headers=platform_headers) as c:
+                    result = await kanban_dispatch_mod.sweep_ready(
+                        board, kanban_dispatch_mod.PlatformClient(c, base))
+            except kanban_dispatch_mod.BoardUnavailable as exc:
+                log.warning("kanban sweep: board unreachable at %s — %s", board_url, exc)
+                return
+            if result["considered"]:
+                log.info("kanban sweep: %s", result)
+
+        ctx.watchdog.register("kanban-ready-sweep", _sweep, _interval,
+                              run_immediately=False)
+        log.info("kanban sweep: watchdog registered (enabled=%s, every %.0fs, "
+                 "board=%s, platform=%s)",
+                 bool(config.get("kanban_sweep_enabled")), _interval(), board_url, base)
 
     def register_contributed_agents(self, app_id: str, spec: dict) -> dict:
         """Seed one ``contributes.agents`` declaration into Agents Platform.
