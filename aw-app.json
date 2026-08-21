@@ -77,6 +77,11 @@
         "description": "Generic coding-specialist contract for the \"Coder\" Agents Platform agent \u2014 orients it to what Agents Platform is, makes a knowledge-base search mandatory before starting any task, and sets baseline engineering conduct."
       },
       {
+        "id": "aw-agent-debugger",
+        "path": "skills/aw-agent-debugger/SKILL.md",
+        "description": "Generic root-cause-analysis contract for the \"Debugger\" Agents Platform agent \u2014 debugs by explicit hypothesis and small experiments, reports the root cause with its evidence, and hands the fix to a Coder rather than writing it. Points at the aw-debugger DAP tools while stating up front that no DAP server ships with them."
+      },
+      {
         "id": "aw-agent-doc-writer",
         "path": "skills/aw-agent-doc-writer/SKILL.md",
         "description": "Generic documentation-writer contract for the \"Doc Writer\" Agents Platform agent \u2014 writes README/ADR/module/API docs grounded in the actual code."
