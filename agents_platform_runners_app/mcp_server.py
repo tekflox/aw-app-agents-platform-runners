@@ -817,6 +817,17 @@ async def _list_tools() -> list[Tool]:
                           "Use this instead of N separate `run_agent_async` calls when "
                           "you want shared lineage + cost rollup. Max 20 children per "
                           "dispatch.\n\n"
+                          "**Call-me-back (default ON):** when ALL children finish, YOUR "
+                          "session is automatically re-invoked once with a summary of the "
+                          "parent's rolled-up result, and that reply is delivered down "
+                          "whatever channel started your own conversation (Telegram, Watch, "
+                          "etc.) — no polling needed. This is a SINGLE wakeup on the parent "
+                          "(all-done), never one per child. Pass `call_me_back:false` to opt "
+                          "out and get pure fire-and-forget (the old behavior) instead.\n\n"
+                          "**Redirect the callback (`call_me_back_on`):** by default the "
+                          "callback wakes YOUR OWN session. Pass `call_me_back_on:<session_id>` "
+                          "to wake a DIFFERENT session instead once every child finishes. "
+                          "Ignored if `call_me_back:false` is also set.\n\n"
                           "Example:\n"
                           "```json\n"
                           "{\"name\":\"run_agents_parallel\",\"arguments\":{\n"
@@ -841,6 +852,10 @@ async def _list_tools() -> list[Tool]:
                                               "description": "Slug of the Target this fan-out is delivering against. REQUIRED."},
                               "max_hops": {"type": ["integer", "null"]},
                               "max_tokens": {"type": ["integer", "null"]},
+                              "call_me_back": {"type": "boolean", "default": True,
+                                               "description": "Default true: when every child finishes, your own session gets woken up ONCE with the parent's rolled-up result and replies down your own channel automatically. Set false for pure fire-and-forget."},
+                              "call_me_back_on": {"type": ["string", "null"],
+                                                  "description": "Optional session_id to redirect the callback to instead of your own session. That session's agent gets woken with the parent's result instead of you."},
                           },
                           "required": ["agents", "target_slug"]}),
         Tool(name="run_tree",
