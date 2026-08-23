@@ -14,6 +14,14 @@ directly connected to you in the flow diagram — a starting point, not a
 restriction (see below), and (2) whether someone's waiting for your result
 (this run was dispatched with `call_me_back=true`), and if so, who.
 
+## Run-ID precondition
+
+Only use the terminal actions in this skill when the current dispatch
+provides an explicit Agents Platform run ID. If no run ID is available,
+treat the session as an ordinary continuing conversation: do not call a
+terminal-action tool, and do not search for, infer, or fabricate a run ID
+just to call one. No terminal action is required in that case.
+
 ## Loose by design
 
 **No enforcement on WHO you call** — any agent on the platform, not just

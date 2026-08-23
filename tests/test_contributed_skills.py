@@ -62,6 +62,20 @@ def test_the_agents_flow_skill_still_teaches_the_three_terminal_actions(declared
         assert action in text, f"aw-agents-flow no longer mentions {action}"
 
 
+def test_the_flow_contract_requires_an_explicit_run_id(declared):
+    """A continuing chat may receive the skill text without a platform run.
+
+    Calling a terminal action there can only fail with "Could not identify
+    this run" and leaks internal bookkeeping into the user's conversation.
+    The contract must make absence of an explicit run ID a stop condition,
+    not an invitation to guess or hunt for one.
+    """
+    text = (APP_DIR / declared["aw-agents-flow"]).read_text()
+    assert "explicit Agents Platform run ID" in text
+    assert "do not search for, infer, or fabricate a run ID" in text
+    assert "No terminal action is required in that case" in text
+
+
 def test_skills_carry_a_frontmatter_name_matching_their_slug(declared):
     # The slug agents-platform loads by is the directory name; a mismatched
     # frontmatter name makes the skill un-findable by search_skills.
