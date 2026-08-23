@@ -731,19 +731,19 @@ def _build_container_kwargs(job: dict) -> tuple[str, list[str], dict, str | None
         argv.append(prompt)
 
     model = job.get("model")
-    # A codex CLI logged in with a ChatGPT account (auth_mode "chatgpt")
-    # accepts ONLY that account's default model. Any -c model= override is
-    # rejected by the API and the whole turn fails:
+    # Older model overrides are rejected when codex is logged in with a
+    # ChatGPT account and the whole turn fails:
     #   400 invalid_request_error: The 'gpt-5' model is not supported when
     #   using Codex with a ChatGPT account.
     # Verified 2026-08-13 for both "gpt-5-codex" (what the codex-runner-gpt-5
     # model row asks for) and "gpt-5"; the identical run with no override
-    # answers normally. Drop the override rather than fail every run — the
-    # model row is a platform-wide default that no agent author can see is
-    # incompatible with how this workspace's codex happens to be logged in.
-    if model and cli == "codex" and _codex_auth_mode(_real_home) == "chatgpt":
+    # answers normally. GPT-5.6 Sol is explicitly available to Codex with the
+    # current ChatGPT account, so preserve that override while retaining the
+    # compatibility fallback for the known-unsupported legacy names.
+    if (model and cli == "codex" and model != "gpt-5.6-sol"
+            and _codex_auth_mode(_real_home) == "chatgpt"):
         log.info("execute: codex is logged in with a ChatGPT account — ignoring "
-                 "model override %r (only the account default is supported)", model)
+                 "unsupported legacy model override %r", model)
         model = None
     if model and spec.get("model_flag"):
         if spec["model_flag"] == "-c":

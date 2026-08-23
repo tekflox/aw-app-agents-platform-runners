@@ -51,6 +51,19 @@ def test_ships_the_telegram_family(spec):
                      "telegram-haiku", "telegram-fable"}
 
 
+def test_declares_gpt_5_6_sol_for_the_codex_runner(spec):
+    models = {model["slug"]: model for model in spec["models"]}
+    model = models["codex-runner-gpt-5-6-sol"]
+    assert model["provider"] == "runner"
+    assert model["params"] == {
+        "runner": "aw-codex",
+        "cli": "codex",
+        "model": "gpt-5.6-sol",
+        "dangerous_skip_permissions": True,
+        "timeout_s": 900,
+    }
+
+
 def test_every_agent_uses_the_shared_contract_and_prompt(spec):
     """One prompt file for all four. The live rows were byte-identical across
     the family before this app adopted them, and the contract that actually

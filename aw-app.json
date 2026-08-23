@@ -114,6 +114,21 @@
       }
     ],
     "agents": {
+      "models": [
+        {
+          "slug": "codex-runner-gpt-5-6-sol",
+          "provider": "runner",
+          "model_id": "codex-runner-gpt-5-6-sol",
+          "display_name": "Codex (aw Runner, GPT-5.6 Sol)",
+          "params": {
+            "runner": "aw-codex",
+            "cli": "codex",
+            "model": "gpt-5.6-sol",
+            "dangerous_skip_permissions": true,
+            "timeout_s": 900
+          }
+        }
+      ],
       "agent_configs": [
         {
           "slug": "agent-config-aw-full",

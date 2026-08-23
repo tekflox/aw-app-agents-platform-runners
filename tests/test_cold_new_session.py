@@ -64,3 +64,17 @@ def test_codex_ignores_the_flag(tmp_path, monkeypatch):
                   "new_session": True}, tmp_path, monkeypatch)
     assert "--session-id" not in argv
     assert "resume" in argv
+
+
+def test_chatgpt_codex_keeps_the_supported_gpt_5_6_sol_override(tmp_path, monkeypatch):
+    monkeypatch.setattr(execute_mod, "_codex_auth_mode", lambda _home: "chatgpt")
+    argv = _argv({**BASE_JOB, "cli": "codex", "model": "gpt-5.6-sol"},
+                 tmp_path, monkeypatch)
+    assert argv[argv.index("-c") + 1] == 'model="gpt-5.6-sol"'
+
+
+def test_chatgpt_codex_still_drops_known_legacy_overrides(tmp_path, monkeypatch):
+    monkeypatch.setattr(execute_mod, "_codex_auth_mode", lambda _home: "chatgpt")
+    argv = _argv({**BASE_JOB, "cli": "codex", "model": "gpt-5-codex"},
+                 tmp_path, monkeypatch)
+    assert "-c" not in argv
