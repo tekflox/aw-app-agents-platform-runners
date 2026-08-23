@@ -219,6 +219,26 @@
           "hidden_from_flow": false,
           "icon": "bot",
           "color": "#f6ad55"
+        },
+        {
+          "slug": "telegram-gpt-5-6-sol",
+          "name": "Telegram - GPT-5.6 Sol",
+          "description": "The Codex-backed Telegram variant, for coding and other agentic work that benefits from GPT-5.6 Sol while staying reachable from the phone.",
+          "system_prompt_file": "prompts/telegram.md",
+          "model_slug": "codex-runner-gpt-5-6-sol",
+          "agent_config_slug": "agent-config-aw-full",
+          "skill_slugs": [
+            "aw-agent-telegram"
+          ],
+          "capabilities": "Answers a human on their phone through a Telegram bot — voice or text, in their language — with this workspace's full tool surface behind it.",
+          "use_cases": [
+            "reply to a Telegram message with GPT-5.6 Sol",
+            "run a coding task from the phone",
+            "use Codex through a Telegram conversation"
+          ],
+          "hidden_from_flow": false,
+          "icon": "bot",
+          "color": "#ffa657"
         }
       ]
     }

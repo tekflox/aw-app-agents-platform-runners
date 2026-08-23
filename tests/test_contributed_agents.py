@@ -39,7 +39,7 @@ def test_declares_the_capability_the_contribution_needs(manifest):
 
 
 def test_ships_the_telegram_family(spec):
-    """Four model variants of one role, same contract, chosen by what the
+    """Five model variants of one role, same contract, chosen by what the
     conversation is worth — the same shape as the Coder and QA families.
 
     They were platform-seeded rows until now: a workspace that installed no
@@ -48,7 +48,8 @@ def test_ships_the_telegram_family(spec):
     """
     slugs = {a["slug"] for a in spec["agents"]}
     assert slugs == {"telegram-sonnet", "telegram-opus",
-                     "telegram-haiku", "telegram-fable"}
+                     "telegram-haiku", "telegram-fable",
+                     "telegram-gpt-5-6-sol"}
 
 
 def test_declares_gpt_5_6_sol_for_the_codex_runner(spec):
@@ -65,7 +66,7 @@ def test_declares_gpt_5_6_sol_for_the_codex_runner(spec):
 
 
 def test_every_agent_uses_the_shared_contract_and_prompt(spec):
-    """One prompt file for all four. The live rows were byte-identical across
+    """One prompt file for all five. The live rows were byte-identical across
     the family before this app adopted them, and the contract that actually
     matters is the aw-agent-telegram skill — the prompt is a pointer to it.
     """
