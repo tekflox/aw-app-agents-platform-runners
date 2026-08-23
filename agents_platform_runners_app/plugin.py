@@ -354,6 +354,36 @@ class AgentsPlatformRunnersAppPlugin:
             log.info("seeded agents platform objects from %s: %s", app_id, created)
         return created
 
+    def _reconcile_provisioner(self):
+        """Same construction as the seed path, for the two reconcile hooks.
+
+        Built per call off ``self._live_config`` rather than cached, for the
+        reason the seed path documents: a token pasted into settings has to
+        take effect without a restart.
+        """
+        config = self._live_config or {}
+        return agent_provisioner_mod.AgentProvisioner(
+            base=config.get("agents_platform_base") or DEFAULT_AGENTS_PLATFORM_BASE,
+            token=config.get("agents_platform_token") or "",
+            mcp_url_overrides=(
+                {"aw-gateway": config["gateway_mcp_url"]}
+                if config.get("gateway_mcp_url") else None
+            ),
+        )
+
+    def read_contributed_agent(self, kind: str, slug: str) -> dict | None:
+        """One live object, so the workspace can tell seeded from hand-edited.
+
+        Half of the pair that lets an app correct a prompt it shipped wrong.
+        The workspace owns the decision of *what* may change; this only
+        reports what is live. See aw-workspace ``src/apps/seeded_state.py``.
+        """
+        return self._reconcile_provisioner().read(kind, slug)
+
+    def update_contributed_agent(self, kind: str, slug: str, changes: dict) -> bool:
+        """Apply the workspace's vetted field changes to one seeded object."""
+        return self._reconcile_provisioner().update(kind, slug, changes)
+
     async def on_config_saved(self, ctx) -> None:
         """Regenerate mcp.json from the newly-saved config (agents_platform_base) —
         aw-workspace's save_app_config calls this BEFORE telling the MCP

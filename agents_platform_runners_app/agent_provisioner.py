@@ -173,6 +173,57 @@ class AgentProvisioner:
                 created[kind] = self._seed_kind(client, app_id, kind, entries)
         return {k: v for k, v in created.items() if v}
 
+    def read(self, kind: str, slug: str) -> dict[str, Any] | None:
+        """One live object, so the workspace can tell seeded from hand-edited.
+
+        Returns ``None`` — never ``{}`` — when the object is absent or the
+        platform is unreachable. The workspace treats a falsy answer as "skip
+        this one", so an outage degrades to the old create-if-absent
+        behaviour instead of a reconcile computed against nothing.
+        """
+        if kind not in ENDPOINTS or not self.base or not self.token:
+            return None
+        path, _ = ENDPOINTS[kind]
+        headers = {"Authorization": f"Bearer {self.token}"}
+        try:
+            with httpx.Client(base_url=self.base, headers=headers,
+                              timeout=self.timeout, transport=self.transport) as client:
+                resp = client.get(f"{path}/{slug}")
+                if resp.status_code == 404:
+                    return None
+                resp.raise_for_status()
+                body = resp.json()
+                return body if isinstance(body, dict) else None
+        except (httpx.HTTPError, ValueError) as exc:
+            log.warning("could not read %s %r for reconcile (%s)", kind, slug, exc)
+            return None
+
+    def update(self, kind: str, slug: str, changes: dict[str, Any]) -> bool:
+        """PATCH the workspace's vetted field changes onto one object.
+
+        Ownership and merge decisions already happened on the workspace side
+        (``src/apps/seeded_state.py``); this only enforces the platform's own
+        schema, reusing the same ``allowed`` set the create path filters
+        against so a reconcile can never push a field a POST could not.
+        """
+        if kind not in ENDPOINTS or not changes or not self.base or not self.token:
+            return False
+        path, allowed = ENDPOINTS[kind]
+        body = {k: v for k, v in changes.items() if k in allowed}
+        if not body:
+            return False
+        headers = {"Authorization": f"Bearer {self.token}"}
+        try:
+            with httpx.Client(base_url=self.base, headers=headers,
+                              timeout=self.timeout, transport=self.transport) as client:
+                resp = client.patch(f"{path}/{slug}", json=body)
+                resp.raise_for_status()
+        except httpx.HTTPError as exc:
+            log.warning("could not reconcile %s %r (%s)", kind, slug, exc)
+            return False
+        log.info("reconciled %s %r (%s)", kind, slug, ", ".join(sorted(body)))
+        return True
+
     # ---- internals ---------------------------------------------------------
 
     def _seed_kind(self, client: httpx.Client, app_id: str, kind: str,
