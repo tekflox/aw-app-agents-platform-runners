@@ -2,7 +2,7 @@
   "manifest_version": 1,
   "id": "agents-platform-runners",
   "name": "Agents Platform Runners",
-  "version": "0.77.0",
+  "version": "0.78.0",
   "description": "Depends on the code-agent-clis app (claude/codex/copilot/cursor-agent already installed at /usr/local/bin, single source of truth) so this workspace's agent-CLI runners are what agents-platform-multitenant's agent sessions use, and contributes the ported \"aw-agents\" MCP (agent_mcp.py) so agents-platform is controllable as MCP tools from this workspace.",
   "tier": "inprocess",
   "requires_ui_refresh": false,
@@ -230,7 +230,7 @@
           "skill_slugs": [
             "aw-agent-telegram"
           ],
-          "capabilities": "Answers a human on their phone through a Telegram bot — voice or text, in their language — with this workspace's full tool surface behind it.",
+          "capabilities": "Answers a human on their phone through a Telegram bot \u2014 voice or text, in their language \u2014 with this workspace's full tool surface behind it.",
           "use_cases": [
             "reply to a Telegram message with GPT-5.6 Sol",
             "run a coding task from the phone",
