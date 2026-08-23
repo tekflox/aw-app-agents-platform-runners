@@ -32,9 +32,15 @@ def _runner_status(name: str) -> dict:
     path = shutil.which(name)
     if not path:
         return {"installed": False, "path": None, "version": None}
+    # cursor-agent writes a fresh debug-session log under
+    # /tmp/cursor-agent-logs-<uid> on every invocation, even a bare
+    # --version — this route can be polled repeatedly, so suppress it via
+    # the CLI's own documented env var rather than accumulating logs.
+    env = {**os.environ, "CURSOR_AGENT_DISABLE_DEBUG_LOG": "1"} if name == "cursor-agent" else None
     try:
         out = subprocess.run(
             [path, "--version"], capture_output=True, text=True, timeout=10, check=False,
+            env=env,
         )
         version = (out.stdout or out.stderr).strip().splitlines()[0] if (out.stdout or out.stderr) else None
     except Exception as exc:  # noqa: BLE001 — surfaced as-is, not a route failure
