@@ -208,7 +208,12 @@ def build_routes(config: dict | None = None) -> FastAPI:
             # simply keep getting URL-only prompts.
             "attachments": body.get("attachments"),
         }
-        execute_mod.start_job(job, redis_url)
-        return {"run_id": run_id, "status": "started"}
+        # "duplicate" = this run_id was already dispatched by this process, so
+        # nothing new was spawned. A retried handshake (RunnerLLM._dispatch
+        # retries when the POST fails) must be a no-op, not a second agent on
+        # the same run — see start_job's _STARTED_RUN_IDS. Either way the
+        # caller's next step is identical: attach to run:{run_id}:events.
+        started = execute_mod.start_job(job, redis_url)
+        return {"run_id": run_id, "status": "started" if started else "duplicate"}
 
     return app

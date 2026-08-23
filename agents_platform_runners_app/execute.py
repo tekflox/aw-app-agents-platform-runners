@@ -69,6 +69,7 @@ import shutil
 import threading
 import time
 import uuid
+from collections import OrderedDict
 from pathlib import Path
 from typing import Any
 
@@ -1377,9 +1378,36 @@ def _run_job_blocking(job: dict, redis_url: str) -> None:
             pass
 
 
-def start_job(job: dict, redis_url: str) -> None:
-    """Fire-and-forget: launch `_run_job_blocking` in a background thread."""
+# run_ids already dispatched by this process, so a retried POST for the same
+# run cannot spawn a second container (2026-08-23). RunnerLLM._dispatch retries
+# a failed handshake, and a lost RESPONSE is indistinguishable there from a lost
+# REQUEST — without this guard that retry would start a second agent publishing
+# into the SAME `run:{run_id}:events` stream: interleaved output, double cost,
+# and two replies to one message. Bounded so a long-lived process can't grow it
+# without limit; the window only has to outlive the caller's retry budget
+# (seconds), not the run.
+_STARTED_RUN_IDS: "OrderedDict[str, None]" = OrderedDict()
+_STARTED_RUN_IDS_LOCK = threading.Lock()
+_STARTED_RUN_IDS_MAX = 2048
+
+
+def start_job(job: dict, redis_url: str) -> bool:
+    """Fire-and-forget: launch `_run_job_blocking` in a background thread.
+
+    Returns True when this call started the job, False when ``run_id`` was
+    already dispatched by this process (a retried handshake) and nothing new
+    was spawned."""
+    run_id = job.get("run_id") or ""
+    if run_id:
+        with _STARTED_RUN_IDS_LOCK:
+            if run_id in _STARTED_RUN_IDS:
+                log.info("execute: run=%s already dispatched — ignoring duplicate", run_id)
+                return False
+            _STARTED_RUN_IDS[run_id] = None
+            while len(_STARTED_RUN_IDS) > _STARTED_RUN_IDS_MAX:
+                _STARTED_RUN_IDS.popitem(last=False)
     t = threading.Thread(target=_run_job_blocking, args=(job, redis_url),
-                         name=f"runner-exec-{job.get('run_id', uuid.uuid4().hex[:8])}",
+                         name=f"runner-exec-{run_id or uuid.uuid4().hex[:8]}",
                          daemon=True)
     t.start()
+    return True
