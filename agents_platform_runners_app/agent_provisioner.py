@@ -101,18 +101,29 @@ ENDPOINTS: dict[str, tuple[str, frozenset[str]]] = {
         "tool_specs", "skill_slugs", "params", "mcp_config", "extra_volumes",
         "permissions", "icon", "color",
     })),
+    "workflows": ("/api/workflows", frozenset({
+        "slug", "name", "description", "use_cases", "kind", "graph",
+    })),
+    "evals": ("/api/evals", frozenset({
+        "slug", "name", "description", "target_kind", "target_slug",
+        "dataset", "metric", "metric_args",
+    })),
     "agent_flows": ("/api/agent-flows", frozenset({
         "slug", "name", "description", "enabled", "graph", "max_hops",
         "budget_tokens", "budget_usd",
     })),
 }
 
-#: Creation order — an Agent references the other three by slug, and an
-#: AgentFlow's graph references agents by slug, so it goes last. ``targets``
-#: goes first: nothing references a Target by slug and a Target references
-#: nothing, so it has no ordering constraint — first is as defensible a slot
-#: as any, and keeps this tuple's shape matching aw-workspace's ``KINDS``.
-ORDER = ("targets", "models", "agent_configs", "groups", "agents", "agent_flows")
+#: Creation order — an Agent references the other three by slug; a Workflow's
+#: graph references agents by slug, so it comes after them; an Eval's
+#: target_slug can point at either an agent or a workflow, so it comes after
+#: both; an AgentFlow's graph references agents by slug too, so it goes
+#: last. ``targets`` goes first: nothing references a Target by slug and a
+#: Target references nothing, so it has no ordering constraint — first is as
+#: defensible a slot as any, and keeps this tuple's shape matching
+#: aw-workspace's ``KINDS``.
+ORDER = ("targets", "models", "agent_configs", "groups", "agents",
+         "workflows", "evals", "agent_flows")
 
 #: ``display_name`` is required by the platform's ModelIn but is pure
 #: presentation; defaulting it from the slug spares every manifest a field
@@ -124,10 +135,14 @@ DEFAULTS: dict[str, dict[str, str]] = {
 #: kind -> restore endpoint template, for kinds whose soft-delete would
 #: otherwise 409-block a reseed forever (see the module docstring's
 #: "Soft-deleted rows do not stay 409-and-forgotten forever" section).
-#: Only ``targets`` has a restore route today; every other kind still uses
-#: the plain "409 == already there" rule below.
+#: ``targets`` and ``workflows`` have a restore route; every other kind
+#: still uses the plain "409 == already there" rule below. ``agents`` is
+#: conspicuously absent despite also soft-deleting — see the
+#: soft-delete-permanently-blocks-app-seeding lesson this docstring already
+#: cites; it hasn't been fixed there yet, this just doesn't make it worse.
 RESTORE_ENDPOINTS: dict[str, str] = {
     "targets": "/api/targets/{slug}/restore",
+    "workflows": "/api/workflows/{slug}/restore",
 }
 
 
@@ -223,6 +238,84 @@ class AgentProvisioner:
             return False
         log.info("reconciled %s %r (%s)", kind, slug, ", ".join(sorted(body)))
         return True
+
+    # ---- tenant-scoped seeded-state baseline --------------------------------
+    #
+    # Counterpart to ``read``/``update`` above: those move a WORKSPACE's
+    # vetted field changes onto a live platform object; these move the
+    # baseline aw-workspace's own ``src/apps/seeded_state.py`` compares
+    # against onto the PLATFORM's ``seeded_objects`` table, so that baseline
+    # is shared by every workspace of a tenant instead of trapped in one
+    # workspace's local file. See ``ap-mt:seeded-state-tenant-scoped``.
+
+    def read_state(self, kind: str, slug: str) -> dict[str, Any] | None:
+        """The tenant-shared seeded-state baseline for one object.
+
+        Returns ``None`` both when the row doesn't exist yet AND when the
+        platform is unreachable — ``seeded_state.updatable_fields`` treats a
+        falsy answer as "nothing safe to change" either way, same as
+        ``read`` above. Logged at WARNING, not DEBUG: unlike the reconcile
+        content path, this table has no per-workspace file to fall back to
+        once a workspace has migrated onto it — an outage here means every
+        contributed agent's reconcile silently does nothing, every boot,
+        until the platform is back. A quiet DEBUG line would make that
+        exactly the kind of silent degradation this workspace tries hard to
+        avoid.
+        """
+        if not self.base or not self.token:
+            return None
+        headers = {"Authorization": f"Bearer {self.token}"}
+        try:
+            with httpx.Client(base_url=self.base, headers=headers,
+                              timeout=self.timeout, transport=self.transport) as client:
+                resp = client.get(f"/api/seeded-state/{kind}/{slug}")
+                if resp.status_code == 404:
+                    return None
+                resp.raise_for_status()
+                body = resp.json()
+                return body if isinstance(body, dict) else None
+        except (httpx.HTTPError, ValueError) as exc:
+            log.warning("could not read seeded state for %s %r (%s)", kind, slug, exc)
+            return None
+
+    def write_state(self, app_id: str, kind: str, slug: str, app_version: str,
+                    fingerprints: dict[str, str]) -> dict[str, Any] | None:
+        """PUT this workspace's baseline for one seeded object onto the
+        tenant-shared table. ``workspace_ref`` is resolved here from
+        ``AW_WORKSPACE`` — the same env var ``routes.py``'s runner
+        registration already uses to name this workspace to the platform.
+
+        The platform arbitrates by ``app_version``: a caller running an
+        OLDER app version than what's already recorded loses, and the
+        response says so (``written: false``) plus names the winner, so the
+        loser can log a WARNING naming the other workspace and both
+        versions instead of silently believing its own write took.
+        """
+        if not self.base or not self.token:
+            return None
+        workspace_ref = os.environ.get("AW_WORKSPACE", "aw")
+        headers = {"Authorization": f"Bearer {self.token}"}
+        body = {"app_id": app_id, "workspace_ref": workspace_ref,
+                "app_version": app_version, "fingerprints": fingerprints}
+        try:
+            with httpx.Client(base_url=self.base, headers=headers,
+                              timeout=self.timeout, transport=self.transport) as client:
+                resp = client.put(f"/api/seeded-state/{kind}/{slug}", json=body)
+                resp.raise_for_status()
+                result = resp.json()
+        except (httpx.HTTPError, ValueError) as exc:
+            log.warning("could not write seeded state for %s %r (%s)", kind, slug, exc)
+            return None
+        if not result.get("written"):
+            current = result.get("current") or {}
+            log.warning(
+                "seeded state for %s %r NOT written — this workspace (%r, "
+                "app_version %s) lost the race to workspace %r (app_version "
+                "%s); leaving the newer baseline in place",
+                kind, slug, workspace_ref, app_version,
+                current.get("workspace_ref"), current.get("app_version"),
+            )
+        return result
 
     # ---- internals ---------------------------------------------------------
 

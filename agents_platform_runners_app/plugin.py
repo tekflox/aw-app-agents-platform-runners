@@ -312,10 +312,15 @@ class AgentsPlatformRunnersAppPlugin:
         one call, so this side owns the creation ORDER an Agent's slug
         references depend on.
 
-        **Create-if-absent, matched by slug, never updated**, exactly like
-        the tasks surface: an existing object is left as it is, prompt and
-        model and all. See ``agent_provisioner.py`` for why a 409 counts as
-        already-there rather than an error.
+        **Create-if-absent, matched by slug.** An existing object's CONTENT
+        is reconciled, not left forever as it was: aw-workspace's own
+        ``read_contributed_agent``/``update_contributed_agent`` calls below
+        push a corrected field back onto it, but only when that field still
+        holds the value the app itself seeded (see aw-workspace's
+        ``src/apps/seeded_state.py`` for the hash-based hand-edit check that
+        decides this) — a field the user tuned in the UI is never touched.
+        See ``agent_provisioner.py`` for why a 409 on the initial create
+        counts as already-there rather than an error.
 
         Reads ``self._live_config``, not a snapshot, so a token pasted into
         the settings panel after this app came up is used by the next
@@ -383,6 +388,20 @@ class AgentsPlatformRunnersAppPlugin:
     def update_contributed_agent(self, kind: str, slug: str, changes: dict) -> bool:
         """Apply the workspace's vetted field changes to one seeded object."""
         return self._reconcile_provisioner().update(kind, slug, changes)
+
+    def read_state(self, kind: str, slug: str) -> dict | None:
+        """The tenant-shared seeded-state baseline for one object. See
+        aw-workspace's ``src/apps/seeded_state.py`` — this is the provider
+        half of the namespace it now delegates to the platform instead of a
+        per-workspace file for ``"agents"``."""
+        return self._reconcile_provisioner().read_state(kind, slug)
+
+    def write_state(self, app_id: str, kind: str, slug: str, app_version: str,
+                    fingerprints: dict) -> dict | None:
+        """Record this workspace's seeded-state baseline for one object onto
+        the platform's tenant-shared table."""
+        return self._reconcile_provisioner().write_state(
+            app_id, kind, slug, app_version, fingerprints)
 
     async def on_config_saved(self, ctx) -> None:
         """Regenerate mcp.json from the newly-saved config (agents_platform_base) —
