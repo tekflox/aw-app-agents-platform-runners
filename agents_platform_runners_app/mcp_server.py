@@ -946,6 +946,66 @@ async def _list_tools() -> list[Tool]:
                           "properties": {"session_id": {"type": "string",
                               "description": "This session's claude CLI session_id (from $AW_SESSION_ID)."}},
                           "required": ["session_id"]}),
+        Tool(name="recycle_session",
+             description=("Recover a session whose MCP client is DEAD while everything "
+                          "around it is healthy — you can see zero (or obviously too few) "
+                          "mcp__ tools, but the gateway itself is fine. Measured live "
+                          "2026-08-25: a session sat at zero tools for hours while "
+                          "`aw-workspace-cli doctor` reported the gateway serving 686 "
+                          "tools across 33 upstreams, and raw JSON-RPC from the same "
+                          "container returned the full list. An MCP client is built once, "
+                          "when the CLI process starts, and nothing ever re-initialises "
+                          "it — so a client that failed at startup stays dead for that "
+                          "container's entire 6h life. Only a new CLI process fixes it.\n\n"
+                          "This does NOT act mid-turn. It is applied right before your "
+                          "NEXT turn in this session, exactly like clear_session/"
+                          "compact_session — so this turn's reply is delivered first, and "
+                          "you always get to tell the user what you did. Nothing is "
+                          "signalled or killed while a turn is in flight (in particular "
+                          "the warm relay, which is what puts your messages in front of "
+                          "the user, is never touched).\n\n"
+                          "Three levels, weakest first — try in this order:\n"
+                          "  • reconnect_mcp (default, SAFE) — next turn gets a brand-new "
+                          "CLI process with fresh MCP clients, resuming this same "
+                          "conversation. Nothing is lost. Try this first.\n"
+                          "  • recycle_container (SAFE) — same, but the current container "
+                          "is removed immediately instead of being left to finish on its "
+                          "own. For a process too wedged to notice a drain. Conversation "
+                          "still preserved. NOTE: this was done by hand on 2026-08-25 and "
+                          "did NOT fix that outage on its own — do not assume it will.\n"
+                          "  • fresh_session (DESTRUCTIVE) — starts a new session id with "
+                          "no --resume. THE CONVERSATION IS LOST. Never pick this "
+                          "silently; say so first, or use it only when the two safe "
+                          "levels have already been tried and are recorded as having "
+                          "failed.\n\n"
+                          "The response includes `preflight` (what your session's MCP "
+                          "surface actually looks like from the platform's side) and "
+                          "`history` (previous recycle attempts on this session, "
+                          "including ones made before a fresh_session replaced it). READ "
+                          "THE HISTORY: it is there so you escalate instead of re-running "
+                          "a level that already failed — an agent that recycles itself "
+                          "cannot report its own result, so this record is the only way "
+                          "the outcome is ever known.\n\n"
+                          "Get your session_id with `echo $AW_SESSION_ID` (Bash tool)."),
+             inputSchema={"type": "object",
+                          "properties": {
+                              "session_id": {"type": "string",
+                                  "description": "This session's claude CLI session_id (from $AW_SESSION_ID)."},
+                              "level": {"type": "string",
+                                  "enum": ["reconnect_mcp", "recycle_container", "fresh_session"],
+                                  "description": "Recovery strength. Default reconnect_mcp. "
+                                                 "fresh_session LOSES the conversation."},
+                              "reason": {"type": "string",
+                                  "description": "What you observed that made you call this "
+                                                 "(e.g. 'zero mcp__ tools, doctor reports gateway "
+                                                 "healthy'). Stored on the durable record — the "
+                                                 "next session reads it."},
+                              "mcp_tools_seen": {"type": "integer",
+                                  "description": "How many mcp__ tools YOU can currently see. 0 is "
+                                                 "the signal this tool exists for. Recorded as "
+                                                 "evidence so 'did it work' is answerable later."},
+                          },
+                          "required": ["session_id"]}),
         Tool(name="rename_session",
              description=("Rename the CURRENT conversation's CLI session — same effect as "
                           "Telegram's `/rename`, just callable as a tool (e.g. from the "
@@ -1562,6 +1622,65 @@ def _err(status: int, text: str) -> list[TextContent]:
                         text=json.dumps({"error": True, "status": status, "message": text}, indent=2))]
 
 
+async def _mcp_preflight(run_id: str | None) -> dict:
+    """Probe the MCP config THIS run was actually handed, and report what it
+    answers — never the token itself.
+
+    This is what makes the level choice informed rather than a guess. A
+    recycle only ever fixes a client that died against a config that works;
+    a config carrying, say, a rotated gateway token reproduces every single
+    symptom of the 2026-08-25 outage (doctor healthy, raw JSON-RPC with the
+    workspace's own .mcp.json token returns 200, the session's client shows
+    `failed` with zero tools) and survives all three levels, because the bad
+    value is re-injected on every fresh spawn. Verified by reproduction:
+    good URL + stale token -> status "failed", 0 tools. Without this probe
+    the two are indistinguishable from inside a toolless session, which is
+    exactly how that outage lasted hours.
+    """
+    if not run_id:
+        return {"checked": False, "why": "no caller run id available"}
+    rel = f".claude/isolated/{run_id}/mcp.json"
+    for base in (os.environ.get("HOME") or "/home/ubuntu",
+                 os.environ.get("AW_WORKSPACE_CONTAINER_DIR", "/opt/aw-workspace")):
+        path = os.path.join(base, rel)
+        if os.path.isfile(path):
+            break
+    else:
+        return {"checked": False, "why": f"no per-run mcp config found at */{rel}"}
+    try:
+        servers = (json.load(open(path)) or {}).get("mcpServers") or {}
+    except Exception as exc:  # unreadable/corrupt config is itself the finding
+        return {"checked": False, "why": f"{path}: {exc}"}
+
+    out = []
+    async with httpx.AsyncClient(timeout=15) as probe:
+        for sname, cfg in servers.items():
+            url = cfg.get("url")
+            row: dict[str, Any] = {"server": sname, "url": url}
+            if not url:
+                row["error"] = "no url in config"
+                out.append(row)
+                continue
+            try:
+                pr = await probe.post(
+                    url, headers={**(cfg.get("headers") or {}),
+                                  "Content-Type": "application/json",
+                                  "Accept": "application/json, text/event-stream"},
+                    json={"jsonrpc": "2.0", "id": 1, "method": "tools/list"})
+                row["http_status"] = pr.status_code
+                row["tools"] = pr.text.count('"name"') if pr.status_code == 200 else 0
+                row["verdict"] = ("config works — a dead client here is what recycle_session fixes"
+                                  if pr.status_code == 200 else
+                                  "config does NOT work from the platform side — no recycle level "
+                                  "will fix this; the config itself (token/url) is wrong")
+            except Exception as exc:
+                row["error"] = f"{type(exc).__name__}: {exc}"
+                row["verdict"] = ("unreachable from the platform side — a recycle will not help "
+                                  "until this is reachable")
+            out.append(row)
+    return {"checked": True, "config": path, "servers": out}
+
+
 def _caller_run_id(args: dict) -> str | None:
     """Which run is calling us. Prefers the gateway-injected
     ``_gateway_caller_run_id`` (set from the per-run X-Aw-Caller-Run-Id
@@ -1963,6 +2082,33 @@ async def _call_tool(name: str, arguments: dict[str, Any] | None) -> list[TextCo
             r = await c.post(f"{BASE}/api/sessions/{sid}/pending-command",
                              json={"command": command})
             return _err(r.status_code, r.text) if r.status_code != 200 else _ok(r.json())
+        if name == "recycle_session":
+            sid = (args.get("session_id") or "").strip()
+            if not sid:
+                return _err(400, "session_id is required — get it with `echo $AW_SESSION_ID`.")
+            level = (args.get("level") or "reconnect_mcp").strip().lower()
+            own_run_id = _caller_run_id(args)
+            body = {"level": level,
+                    "reason": args.get("reason") or "",
+                    "requested_by_run_id": own_run_id}
+            if args.get("mcp_tools_seen") is not None:
+                body["mcp_tools_seen"] = args["mcp_tools_seen"]
+            r = await c.post(f"{BASE}/api/sessions/{sid}/recycle", json=body)
+            if r.status_code != 200:
+                return _err(r.status_code, r.text)
+            out = r.json()
+            # History first: it is the only durable answer to "did the last
+            # attempt work", and the caller needs it BEFORE it decides
+            # whether the level it just picked was already tried and failed.
+            h = await c.get(f"{BASE}/api/sessions/{sid}/recycle", params={"limit": "10"})
+            out["history"] = h.json() if h.status_code == 200 else []
+            out["preflight"] = await _mcp_preflight(own_run_id)
+            out["applies"] = ("right before this session's NEXT turn — this turn's reply "
+                              "is delivered first, nothing is killed mid-turn")
+            if level == "fresh_session":
+                out["warning"] = ("DESTRUCTIVE: the next turn starts a new session with no "
+                                  "--resume. This conversation's history will be gone.")
+            return _ok(out)
         if name == "rename_session":
             sid = (args.get("session_id") or "").strip()
             if not sid:

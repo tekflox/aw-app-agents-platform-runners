@@ -207,6 +207,12 @@ def build_routes(config: dict | None = None) -> FastAPI:
             # aw_attach.materialise_inbound. Absent from older callers, which
             # simply keep getting URL-only prompts.
             "attachments": body.get("attachments"),
+            # recycle_session, already resolved by agents-platform from this
+            # session's queued level into "drain"/"force" (see that repo's
+            # executor.py). Only the warm path can honour it — the container
+            # it recycles exists solely on this side. Absent on every
+            # ordinary turn, which is what keeps the warm pool warm.
+            "warm_recycle": body.get("warm_recycle"),
         }
         # "duplicate" = this run_id was already dispatched by this process, so
         # nothing new was spawned. A retried handshake (RunnerLLM._dispatch

@@ -70,6 +70,7 @@ import threading
 import time
 import uuid
 from collections import OrderedDict
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -1140,6 +1141,39 @@ def _build_warm_kwargs_codex(job: dict, epoch_hash: str, redis_url: str) -> tupl
     return image, kwargs
 
 
+#: Durable, host-visible record of every recycle this runner actually
+#: performed. agents-platform keeps the authoritative row
+#: (session_recycle_attempts), but that is on the other side of an HTTP hop
+#: and of whatever was broken enough to need a recycle in the first place —
+#: and the agent that asked for it is gone by the time it happens, so it
+#: cannot report anything itself. On 2026-08-25 a hand-written log at
+#: .tmp/self-kill/attempt.log was the ONLY reason the outcome of the manual
+#: escalation was knowable at all. This is that file, owned by the tool.
+RECYCLE_LOG_DIR = Path(WORKSPACE_CONTAINER_DIR) / ".tmp" / "recycle-session"
+
+
+def _log_recycle(job: dict, *, container: str) -> None:
+    """Append one applied-recycle record to the workspace tree. Best-effort:
+    a recycle that happened but could not be written down is still better
+    than one that didn't happen."""
+    try:
+        RECYCLE_LOG_DIR.mkdir(parents=True, exist_ok=True)
+        rec = {
+            "at": datetime.now(timezone.utc).isoformat(),
+            "session_id": job.get("session_id"),
+            "run_id": job.get("run_id"),
+            "agent_id": job.get("agent_id"),
+            "level": job.get("warm_recycle"),
+            "container": container,
+            "mcp_servers": sorted((job.get("mcp_servers") or {}).keys()),
+        }
+        with (RECYCLE_LOG_DIR / f"{job.get('session_id') or 'unknown'}.jsonl").open("a") as fh:
+            fh.write(json.dumps(rec) + "\n")
+    except Exception:
+        log.warning("execute: could not write recycle record for run=%s",
+                    job.get("run_id"), exc_info=True)
+
+
 def _dispatch_warm_turn(client, job: dict, redis_url: str) -> None:
     """RUNNER_WARM_CONTAINER=1 path: get-or-create this session's persistent
     container (spawning + pulling only on a cold/stale session) and feed the
@@ -1166,10 +1200,19 @@ def _dispatch_warm_turn(client, job: dict, redis_url: str) -> None:
                    image, run_id, exc_info=True)
         client.images.get(image)
 
+    # recycle_session: agents-platform resolved this session's queued recycle
+    # level into "drain"/"force" and forwarded it here, because the warm
+    # container lives on THIS host and it has no reach into it. Applied
+    # before the turn goes in, never during one — see get_or_create's own
+    # note on why that is what protects aw-warm-relay.py.
+    recycle = job.get("warm_recycle") or None
     name = warm_pool.get_or_create(
         client=client, agent_id=agent_id, session_id=session_id, epoch_hash=epoch,
         build_kwargs=lambda _name, _epoch: _build_warm_kwargs(job, _epoch, redis_url),
+        recycle=recycle,
     )
+    if recycle:
+        _log_recycle(job, container=name)
     prompt = job.get("prompt") or ""
     # codex has no --append-system-prompt equivalent — same reason the cold
     # path prepends it into the prompt text (_build_container_kwargs's own

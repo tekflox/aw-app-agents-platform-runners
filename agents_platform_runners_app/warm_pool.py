@@ -345,7 +345,7 @@ BuildKwargs = Callable[[str, str], tuple[str, dict[str, Any]]]
 
 
 def get_or_create(*, client, agent_id: str, session_id: str, epoch_hash: str,
-                   build_kwargs: BuildKwargs) -> str:
+                   build_kwargs: BuildKwargs, recycle: str | None = None) -> str:
     """Return the name of a running warm container whose epoch label matches
     epoch_hash — reusing it if so, otherwise draining any stale one
     (mismatched epoch, or present-but-dead) and spawning a fresh one under
@@ -354,14 +354,36 @@ def get_or_create(*, client, agent_id: str, session_id: str, epoch_hash: str,
     Serialized per (agent_id, session_id) so two concurrent dispatches to
     the same session never race each other on the same rename/run — but two
     DIFFERENT sessions (even of the same agent) proceed fully in parallel.
+
+    ``recycle`` ("drain" | "force", from recycle_session — see execute.py's
+    _dispatch_warm_turn) refuses to reuse an otherwise-perfectly-matching
+    container, so the next turn gets a brand-new CLI process. That is the
+    only lever there is over a dead MCP client: the clients are built once,
+    when the CLI starts, and nothing re-initialises them for the container's
+    whole 6h life. "drain" leaves the old container to finish on its own;
+    "force" removes it now, for a process too wedged to notice a drain flag.
+    Neither is reachable while a turn is in flight — this runs BEFORE the
+    turn is fed in — which is what keeps aw-warm-relay.py, and therefore the
+    user's chat, out of the blast radius.
     """
     lock = _session_lock(agent_id, session_id)
     with lock:
         name = warm_container_name(agent_id, session_id)
         labels = _labels(client, name)
         if labels is not None:
-            if labels.get(EPOCH_LABEL) == epoch_hash and _is_running(client, name):
+            if recycle:
+                log.info("warm_pool: recycle=%s requested for %s — not reusing it", recycle, name)
+                if recycle == "force":
+                    try:
+                        client.containers.get(name).remove(force=True)
+                    except Exception:
+                        log.warning("warm_pool: force-remove of %s failed — falling through "
+                                    "to the drain path", name, exc_info=True)
+                    else:
+                        labels = None
+            elif labels.get(EPOCH_LABEL) == epoch_hash and _is_running(client, name):
                 return name
+        if labels is not None:
             # Stale — free the stable name immediately so the fresh spawn
             # below can take it, then drain the old one in the background.
             # Draining is uncapped by design and must never block this call.
