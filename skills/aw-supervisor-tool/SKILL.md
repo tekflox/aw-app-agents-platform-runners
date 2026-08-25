@@ -1,6 +1,6 @@
 ---
 name: aw-supervisor-tool
-description: The Supervisor tool — 3 MCP tools (supervise/stop_supervisor/supervisor_status) any Agents Platform agent can call to watch another session's whole run chain and get woken up exactly once when it goes idle. Mechanism, not a persona — use when an agent needs to watch a delegated task without polling, or when debugging/extending core/supervisor.py in repos/agents-platform/backend.
+description: The Supervisor tool — 4 MCP tools (supervise/stop_supervisor/supervisor_status/list_supervisors) any Agents Platform agent can call to watch another session's whole run chain and get woken up exactly once when it goes idle, plus list and turn off supervisions armed by ANY session. Mechanism, not a persona — use when an agent needs to watch a delegated task without polling, when asked what is supervising what or to stop a supervisor, or when debugging/extending core/supervisor.py in repos/agents-platform/backend.
 ---
 
 # aw-supervisor-tool — watch a session, get woken when it stops
@@ -9,15 +9,52 @@ A profile-agnostic mechanism, not a "Manager" persona: any agent can
 supervise any other session. It reports STATE only (who ran, how long, why
 it stopped) — deciding whether that's good or bad is on the calling agent.
 
-## The 3 tools
+## The 4 tools
 
 ```
 supervise(session_id, forever=false) → {supervision_id, existing: bool}
-stop_supervisor(supervision_id) → {ok}
+stop_supervisor(supervision_id | target_session_id | caller_session_id) → {ok, stopped:[ids], count}
 supervisor_status(supervision_id?)
   → without arg: your own supervisions [{supervision_id, target_session_id, status, forever, wakeup_count}]
   → with arg: full detail {status, edge_state, discovered, last_activity_at, idle_since, stop_reason, wakeups}
+list_supervisors(status="armed", target_session_id?, caller_session_id?, limit=100)
+  → EVERY supervision on the deployment, whoever armed it
 ```
+
+### Scope: `supervisor_status` is yours, `list_supervisors` is everyone's
+
+`supervisor_status` resolves your own session from `caller_run_id` and only
+ever shows what YOU armed. That's the right default for an agent managing
+its own delegations — and it's also why a stray `forever` supervision was
+historically invisible: nobody could see it but its own caller, who by
+definition wasn't asking. Enumerating meant sweeping `/api/runs` and
+re-querying `/api/supervisions?caller_run_id=…` once per distinct session
+(545 of them, to surface 4 live watchers, 2026-08-25).
+
+`list_supervisors` is that sweep as one call. Default `status="armed"`
+(active + waiting_retrigger — the ones that can still fire); pass
+`status=null` for the full history including `done`/`stopped`. Each row
+carries both sides resolved to an agent slug (`caller_agent_slug` /
+`target_agent_slug`), so you can read "watch-sonnet is watching
+telegram-opus" without a second lookup.
+
+### Turning one off when you don't own it
+
+`stop_supervisor` takes exactly one of three selectors:
+
+| Selector | Stops |
+|---|---|
+| `supervision_id` | that one supervision (the original form) |
+| `target_session_id` | every armed supervision WATCHING that session |
+| `caller_session_id` | every armed supervision that session ARMED |
+
+The session forms exist because the id is precisely what a third party
+never had. "Turn off whatever is supervising session X" is
+`target_session_id`; "stop this agent from watching anything" is
+`caller_session_id`. Neither is restricted to your own session, and both
+skip already-terminal rows rather than rewriting them. Run
+`list_supervisors` first — the stop is not reversible, a stopped
+supervision has to be re-armed with `supervise`.
 
 `session_id`/`supervision_id` are the only params you pass — `caller_run_id`
 (and from it, your own session_id) comes free via the MCP layer's
@@ -104,10 +141,16 @@ if you're debugging or extending the mechanism, not for using it day to day:
   - `_deliver_wakeup` — reuses `wakeups._rerun_and_deliver`/
     `_resolve_channel` verbatim. Do not invent a second delivery path.
 - `app/api/supervisions.py` — thin REST layer the MCP tools call
-  (`POST /api/supervisions`, `POST /{id}/stop`, `GET /api/supervisions`,
-  `GET /{id}`).
-- `mcp_server/agent_mcp.py` — the 3 `Tool()` definitions + dispatch, same
-  shape as `register_callback`.
+  (`POST /api/supervisions`, `POST /{id}/stop`, `POST /stop` (by session),
+  `GET /api/supervisions`, `GET /all`, `GET /{id}`). The two fixed paths
+  (`/stop`, `/all`) MUST stay declared before their `/{supervision_id}`
+  siblings or FastAPI matches the literal as an id.
+- `mcp_server/agent_mcp.py` — the 4 `Tool()` definitions + dispatch, same
+  shape as `register_callback`. **This file is not what runs**: the gateway
+  spawns a vendored copy at
+  `repos/aw-app-agents-platform-runners/agents_platform_runners_app/mcp_server.py`.
+  Edit both, byte-identical, or the schema you ship is not the schema
+  agents see.
 - `backend/tests/test_supervisor.py` — activity/reason rules, cycle
   discovery, atomic claim under a race, one-shot give-up/retrigger,
   forever re-arm, and a schema-pin test for the 3 tools (imports

@@ -738,19 +738,63 @@ async def _list_tools() -> list[Tool]:
                                                       "description": "Override the default 90s wakeup-dedup window for this supervision."}},
                           "required": ["session_id"]}),
         Tool(name="stop_supervisor",
-             description="Cancel an active supervision armed via `supervise` — no more wakeups from it.",
+             description=("Cancel a supervision armed via `supervise` — no more wakeups from it.\n\n"
+                          "Pass EXACTLY ONE of:\n"
+                          "- `supervision_id` — that one supervision.\n"
+                          "- `target_session_id` — every armed supervision WATCHING that "
+                          "  session ('turn off whatever is supervising session X'). This is "
+                          "  the one to use when you don't own the supervision and therefore "
+                          "  never saw its id.\n"
+                          "- `caller_session_id` — every armed supervision that session ARMED "
+                          "  ('stop this agent from watching anything').\n\n"
+                          "The session forms are not restricted to your own session, and stop "
+                          "no-op on already-terminal (done/stopped) rows. Returns "
+                          "{ok, stopped:[ids], count}. Use `list_supervisors` first to see "
+                          "what you are about to turn off."),
              inputSchema={"type": "object",
-                          "properties": {"supervision_id": {"type": "string",
-                                                            "description": "The supervision_id returned by `supervise`. REQUIRED."}},
-                          "required": ["supervision_id"]}),
+                          "properties": {"supervision_id": {"type": ["string", "null"],
+                                                            "description": "The supervision_id returned by `supervise`."},
+                                         "target_session_id": {"type": ["string", "null"],
+                                                               "description": "Stop every armed supervision WATCHING this session. Need not be your own."},
+                                         "caller_session_id": {"type": ["string", "null"],
+                                                               "description": "Stop every armed supervision ARMED BY this session. Need not be your own."}},
+                          "required": []}),
         Tool(name="supervisor_status",
              description=("Inspect your active supervisions. Without `supervision_id`: lists "
                           "every supervision YOU armed (id, target, status, forever, "
                           "wakeup_count). With `supervision_id`: full detail — discovered "
-                          "sessions/runs, edge_state, idle_since, stop_reason, wakeup history."),
+                          "sessions/runs, edge_state, idle_since, stop_reason, wakeup history.\n\n"
+                          "Scoped to YOUR OWN session — for everything armed on this "
+                          "deployment regardless of who armed it, use `list_supervisors`."),
              inputSchema={"type": "object",
                           "properties": {"supervision_id": {"type": ["string", "null"],
                                                             "description": "Optional — omit to list all of your own supervisions instead."}},
+                          "required": []}),
+        Tool(name="list_supervisors",
+             description=("List supervisions across the WHOLE deployment — every watcher, no "
+                          "matter which session armed it. `supervisor_status` only ever shows "
+                          "your own, so a stray `forever` supervision armed by another agent "
+                          "is otherwise invisible to everyone, including whoever it keeps "
+                          "waking up.\n\n"
+                          "Each row: supervision_id, status, forever, edge_state, "
+                          "caller_session_id/caller_agent_slug (who armed it), "
+                          "target_session_id/target_agent_slug (what it watches), "
+                          "wakeup_count, suppressed_count, last_activity_at, idle_since, "
+                          "stop_reason, created_at.\n\n"
+                          "Default `status='armed'` = active + waiting_retrigger, i.e. the ones "
+                          "that can still fire. Pass status=null explicitly for the full "
+                          "history including done/stopped, or an exact status string.\n\n"
+                          "Pair with `stop_supervisor`'s target_session_id/caller_session_id to "
+                          "actually turn one off."),
+             inputSchema={"type": "object",
+                          "properties": {"status": {"type": ["string", "null"], "default": "armed",
+                                                    "description": "'armed' (default) for active+waiting_retrigger, an exact status ('active'|'waiting_retrigger'|'done'|'stopped'), or null for all."},
+                                         "target_session_id": {"type": ["string", "null"],
+                                                               "description": "Only supervisions watching this session."},
+                                         "caller_session_id": {"type": ["string", "null"],
+                                                               "description": "Only supervisions armed by this session."},
+                                         "limit": {"type": "integer", "default": 100,
+                                                   "description": "Max rows (1-1000). Default 100."}},
                           "required": []}),
         Tool(name="run_status",
              description=("Return the current Run row: status, output, error, tokens, "
@@ -1784,9 +1828,29 @@ async def _call_tool(name: str, arguments: dict[str, Any] | None) -> list[TextCo
             return _err(r.status_code, r.text) if r.status_code != 200 else _ok(r.json())
         if name == "stop_supervisor":
             supervision_id = args.get("supervision_id")
-            if not supervision_id:
-                return _err(400, "supervision_id is required")
-            r = await c.post(f"{BASE}/api/supervisions/{supervision_id}/stop")
+            target_session_id = args.get("target_session_id")
+            caller_session_id = args.get("caller_session_id")
+            given = [x for x in (supervision_id, target_session_id, caller_session_id) if x]
+            if len(given) != 1:
+                return _err(400, "pass exactly one of supervision_id, target_session_id "
+                                 "or caller_session_id")
+            if supervision_id:
+                r = await c.post(f"{BASE}/api/supervisions/{supervision_id}/stop")
+            else:
+                r = await c.post(f"{BASE}/api/supervisions/stop",
+                                 json={"target_session_id": target_session_id,
+                                       "caller_session_id": caller_session_id})
+            return _err(r.status_code, r.text) if r.status_code != 200 else _ok(r.json())
+        if name == "list_supervisors":
+            # absent -> "armed" (the useful default); explicit null -> no filter at all
+            params = {"limit": str(args.get("limit") or 100)}
+            status = args.get("status", "armed")
+            if status:
+                params["status"] = status
+            for k in ("target_session_id", "caller_session_id"):
+                if args.get(k):
+                    params[k] = args[k]
+            r = await c.get(f"{BASE}/api/supervisions/all", params=params)
             return _err(r.status_code, r.text) if r.status_code != 200 else _ok(r.json())
         if name == "supervisor_status":
             if args.get("supervision_id"):
