@@ -17,6 +17,19 @@ Use this app when an AW Workspace should be able to receive agent jobs from Agen
 
 Install the app in the workspace, open its settings, and connect it to the Agents Platform instance that should dispatch work here. Once configured, the platform can launch runs through this workspace and agents can use the contributed tools from their normal sessions.
 
+### OpenAI models
+
+The app contributes the current OpenAI catalogue as `openai-*` models, and its settings panel holds the **OpenAI API key** they run on. Saving the panel pushes that key onto Agents Platform's own `Settings.openai_api_key` row, so the models and the credential they need are configured in one place instead of two. A blank field never clears the platform's value — clearing is done in the platform UI, deliberately.
+
+These used to be four slugs hardcoded in Agents Platform's `seed.py`, which is why they were stale: a hardcoded seed can't track a catalogue that ships a new frontier model every few months, and since the seed re-runs on every boot, deleting an obsolete one only made it come back. Refreshing the list is now an app release, not a platform deploy.
+
+Two rules matter when refreshing it, because breaking either produces a model that seeds fine and then fails on its first dispatch:
+
+- **Chat-completions only.** Agents Platform's `openai` provider is LangChain `ChatOpenAI`. Every `-pro` variant and the `-codex` line are `v1/responses`-only or deprecated — listed by `/v1/models`, rejected on use.
+- **No `temperature` on reasoning models.** GPT-5.x and the o-series accept `temperature=1` and nothing else; any other value is a 400 on every call. Only the gpt-4.x family takes one.
+
+`tests/test_openai_catalog.py` enforces both.
+
 ### Kanban dispatch
 
 Two tools bridge a Notion Kanban card to a run: `run_ready_cards` fires an agent for every card in `Ready`, and `invoke_kanban_agent` sends a message into the session of the agent already working a card.

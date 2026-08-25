@@ -34,6 +34,7 @@ from pathlib import Path
 from . import agent_provisioner as agent_provisioner_mod
 from . import execute as execute_mod
 from . import kanban_dispatch as kanban_dispatch_mod
+from . import platform_settings as platform_settings_mod
 from . import routes as routes_mod
 from . import shared_redis as shared_redis_mod
 from . import skills_sync as skills_sync_mod
@@ -424,6 +425,16 @@ class AgentsPlatformRunnersAppPlugin:
         self._live_config.update(config)
         mcp_doc = write_mcp_json(ctx.package_dir, self._live_config)
         log.info("aw-app-agents-platform-runners config saved: mcp.json servers=%s", list(mcp_doc["mcpServers"]))
+
+        # Settings this panel owns but the platform stores — today the
+        # OpenAI key the contributed `openai-*` models need. See
+        # platform_settings.py for why the push lives on the save and not
+        # on activation.
+        platform_settings_mod.push_settings(
+            base=self._live_config.get("agents_platform_base") or DEFAULT_AGENTS_PLATFORM_BASE,
+            token=self._live_config.get("agents_platform_token") or "",
+            config=self._live_config,
+        )
 
         # A save is also how warm mode itself is turned on/off (the
         # warm_container field) — re-resolve before acting on it.

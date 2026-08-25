@@ -2,7 +2,7 @@
   "manifest_version": 1,
   "id": "agents-platform-runners",
   "name": "Agents Platform Runners",
-  "version": "0.81.0",
+  "version": "0.82.0",
   "description": "Depends on the code-agent-clis app (claude/codex/copilot/cursor-agent already installed at /usr/local/bin, single source of truth) so this workspace's agent-CLI runners are what agents-platform-multitenant's agent sessions use, and contributes the ported \"aw-agents\" MCP (agent_mcp.py) so agents-platform is controllable as MCP tools from this workspace.",
   "tier": "inprocess",
   "requires_ui_refresh": false,
@@ -127,6 +127,163 @@
             "dangerous_skip_permissions": true,
             "timeout_s": 900
           }
+        },
+        {
+          "slug": "openai-gpt-5-6-sol",
+          "provider": "openai",
+          "model_id": "gpt-5.6-sol",
+          "display_name": "OpenAI \u2013 GPT-5.6 Sol",
+          "params": {}
+        },
+        {
+          "slug": "openai-gpt-5-6-luna",
+          "provider": "openai",
+          "model_id": "gpt-5.6-luna",
+          "display_name": "OpenAI \u2013 GPT-5.6 Luna",
+          "params": {}
+        },
+        {
+          "slug": "openai-gpt-5-6-terra",
+          "provider": "openai",
+          "model_id": "gpt-5.6-terra",
+          "display_name": "OpenAI \u2013 GPT-5.6 Terra",
+          "params": {}
+        },
+        {
+          "slug": "openai-gpt-5-5",
+          "provider": "openai",
+          "model_id": "gpt-5.5",
+          "display_name": "OpenAI \u2013 GPT-5.5",
+          "params": {}
+        },
+        {
+          "slug": "openai-gpt-5-4",
+          "provider": "openai",
+          "model_id": "gpt-5.4",
+          "display_name": "OpenAI \u2013 GPT-5.4",
+          "params": {}
+        },
+        {
+          "slug": "openai-gpt-5-4-mini",
+          "provider": "openai",
+          "model_id": "gpt-5.4-mini",
+          "display_name": "OpenAI \u2013 GPT-5.4 mini",
+          "params": {}
+        },
+        {
+          "slug": "openai-gpt-5-4-nano",
+          "provider": "openai",
+          "model_id": "gpt-5.4-nano",
+          "display_name": "OpenAI \u2013 GPT-5.4 nano (cheapest)",
+          "params": {}
+        },
+        {
+          "slug": "openai-gpt-5-2",
+          "provider": "openai",
+          "model_id": "gpt-5.2",
+          "display_name": "OpenAI \u2013 GPT-5.2",
+          "params": {}
+        },
+        {
+          "slug": "openai-gpt-5-1",
+          "provider": "openai",
+          "model_id": "gpt-5.1",
+          "display_name": "OpenAI \u2013 GPT-5.1",
+          "params": {}
+        },
+        {
+          "slug": "openai-gpt-5",
+          "provider": "openai",
+          "model_id": "gpt-5",
+          "display_name": "OpenAI \u2013 GPT-5",
+          "params": {}
+        },
+        {
+          "slug": "openai-gpt-5-mini",
+          "provider": "openai",
+          "model_id": "gpt-5-mini",
+          "display_name": "OpenAI \u2013 GPT-5 mini",
+          "params": {}
+        },
+        {
+          "slug": "openai-gpt-5-nano",
+          "provider": "openai",
+          "model_id": "gpt-5-nano",
+          "display_name": "OpenAI \u2013 GPT-5 nano",
+          "params": {}
+        },
+        {
+          "slug": "openai-gpt-4-1",
+          "provider": "openai",
+          "model_id": "gpt-4.1",
+          "display_name": "OpenAI \u2013 GPT-4.1",
+          "params": {
+            "temperature": 0.2
+          }
+        },
+        {
+          "slug": "openai-gpt-4-1-mini",
+          "provider": "openai",
+          "model_id": "gpt-4.1-mini",
+          "display_name": "OpenAI \u2013 GPT-4.1 mini",
+          "params": {
+            "temperature": 0.2
+          }
+        },
+        {
+          "slug": "openai-gpt-4-1-nano",
+          "provider": "openai",
+          "model_id": "gpt-4.1-nano",
+          "display_name": "OpenAI \u2013 GPT-4.1 nano",
+          "params": {
+            "temperature": 0.2
+          }
+        },
+        {
+          "slug": "openai-gpt-4o",
+          "provider": "openai",
+          "model_id": "gpt-4o",
+          "display_name": "OpenAI \u2013 GPT-4o",
+          "params": {
+            "temperature": 0.2
+          }
+        },
+        {
+          "slug": "openai-gpt-4o-mini",
+          "provider": "openai",
+          "model_id": "gpt-4o-mini",
+          "display_name": "OpenAI \u2013 GPT-4o mini",
+          "params": {
+            "temperature": 0.2
+          }
+        },
+        {
+          "slug": "openai-o3",
+          "provider": "openai",
+          "model_id": "o3",
+          "display_name": "OpenAI \u2013 o3 (reasoning)",
+          "params": {}
+        },
+        {
+          "slug": "openai-o3-mini",
+          "provider": "openai",
+          "model_id": "o3-mini",
+          "display_name": "OpenAI \u2013 o3-mini (reasoning, cheap)",
+          "params": {}
+        },
+        {
+          "slug": "openai-o4-mini",
+          "provider": "openai",
+          "model_id": "o4-mini",
+          "display_name": "OpenAI \u2013 o4-mini (reasoning)",
+          "params": {}
+        },
+        {
+          "slug": "openai-o1",
+          "provider": "openai",
+          "model_id": "o1",
+          "display_name": "OpenAI \u2013 o1 (reasoning)",
+          "params": {}
         }
       ],
       "agent_configs": [
@@ -299,6 +456,12 @@
         "default": "http://172.18.0.1:9200/mcp",
         "title": "Gateway MCP URL (for seeded agents)",
         "description": "Address a SPAWNED AGENT CONTAINER uses to reach this workspace's MCP gateway. Written into the mcp_config of any AgentConfig an app contributes with `mcp_servers: [\"aw-gateway\"]`; the bearer token for it is read from the workspace's own .mcp.json and never travels in a manifest. Deliberately NOT the URL .mcp.json carries (http://aw-app-mcp-gateway:9200/mcp) \u2014 that name resolves inside the workspace container, where the gateway is a compose peer, but an agent container is a sibling in the nested podman namespace and only the bridge gateway IP resolves there. Override only if this workspace's bridge subnet differs."
+      },
+      "openai_api_key": {
+        "type": "string",
+        "x-secret": true,
+        "title": "OpenAI API key",
+        "description": "OpenAI API key the contributed `openai-*` models below run on. Saving this panel PUTs it onto agents-platform-multitenant's own Settings.openai_api_key row (see platform_settings.py) \u2014 the platform stores it, this is just where you type it, so the models this app seeds and the key they need are configured in one place. Leave blank to leave the platform's current value alone: a blank field means \"not set here\", never \"clear it\", so saving an unrelated field on this panel cannot wipe a key entered in the platform UI. The same key also drives the platform's OpenAI TTS/STT, which read the identical setting."
       }
     },
     "required": []
