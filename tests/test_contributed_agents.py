@@ -20,6 +20,13 @@ import pytest
 
 APP_DIR = Path(__file__).resolve().parents[1]
 
+#: This file only pins the Telegram family's own shape. The manifest has
+#: since grown other agent families (see test_seed_migration.py) that don't
+#: share this family's MCP-gateway contract — skill_slugs/agent_config_slug
+#: are how the Telegram agents reach tools, not a rule every agent follows.
+TELEGRAM_AGENT_SLUGS = {"telegram-sonnet", "telegram-opus", "telegram-haiku",
+                        "telegram-fable", "telegram-gpt-5-6-sol"}
+
 
 @pytest.fixture(scope="module")
 def manifest() -> dict:
@@ -47,9 +54,7 @@ def test_ships_the_telegram_family(spec):
     have lost its entire Telegram channel with nothing to say why.
     """
     slugs = {a["slug"] for a in spec["agents"]}
-    assert slugs == {"telegram-sonnet", "telegram-opus",
-                     "telegram-haiku", "telegram-fable",
-                     "telegram-gpt-5-6-sol"}
+    assert TELEGRAM_AGENT_SLUGS <= slugs
 
 
 def test_declares_gpt_5_6_sol_for_the_codex_runner(spec):
@@ -71,6 +76,8 @@ def test_every_agent_uses_the_shared_contract_and_prompt(spec):
     matters is the aw-agent-telegram skill — the prompt is a pointer to it.
     """
     for agent in spec["agents"]:
+        if agent["slug"] not in TELEGRAM_AGENT_SLUGS:
+            continue
         assert agent["skill_slugs"] == ["aw-agent-telegram"], agent["slug"]
         assert agent["system_prompt_file"] == "prompts/telegram.md", agent["slug"]
 
@@ -81,13 +88,15 @@ def test_the_skill_every_declared_agent_names_is_shipped_by_this_app(manifest, s
     """
     shipped = {s["id"] for s in manifest["contributes"]["skills"]}
     for agent in spec["agents"]:
-        for slug in agent["skill_slugs"]:
+        for slug in agent.get("skill_slugs") or []:
             assert slug in shipped, f"{agent['slug']} names {slug!r}, unshipped"
 
 
 def test_referenced_files_exist(spec):
     for agent in spec["agents"]:
-        assert (APP_DIR / agent["system_prompt_file"]).is_file()
+        ref = agent.get("system_prompt_file")
+        if ref is not None:
+            assert (APP_DIR / ref).is_file(), agent["slug"]
 
 
 def test_every_agent_names_a_config_this_app_declares(spec):
@@ -108,6 +117,8 @@ def test_every_agent_names_a_config_this_app_declares(spec):
     configs = {c["slug"] for c in spec["agent_configs"]}
     assert configs == {"agent-config-aw-full"}
     for agent in spec["agents"]:
+        if agent["slug"] not in TELEGRAM_AGENT_SLUGS:
+            continue
         assert agent["agent_config_slug"] in configs, agent["slug"]
 
 

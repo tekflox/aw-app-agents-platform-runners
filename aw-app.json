@@ -284,6 +284,240 @@
           "model_id": "o1",
           "display_name": "OpenAI \u2013 o1 (reasoning)",
           "params": {}
+        },
+        {
+          "slug": "claude-cli-sonnet",
+          "provider": "cli",
+          "model_id": "claude-cli-sonnet",
+          "display_name": "Claude CLI \u2013 Sonnet 4 (default, full perms)",
+          "params": {
+            "cli": "claude",
+            "model": "sonnet",
+            "add_dirs": [
+              "/tmp"
+            ],
+            "dangerous_skip_permissions": true,
+            "stream_json": true,
+            "timeout_s": 900
+          }
+        },
+        {
+          "slug": "claude-cli-opus",
+          "provider": "cli",
+          "model_id": "claude-cli-opus",
+          "display_name": "Claude CLI \u2013 Opus (premium, full perms)",
+          "params": {
+            "cli": "claude",
+            "model": "opus",
+            "add_dirs": [
+              "/tmp"
+            ],
+            "dangerous_skip_permissions": true,
+            "stream_json": true,
+            "timeout_s": 1800
+          }
+        },
+        {
+          "slug": "claude-cli-haiku",
+          "provider": "cli",
+          "model_id": "claude-cli-haiku",
+          "display_name": "Claude CLI \u2013 Haiku (cheap & fast)",
+          "params": {
+            "cli": "claude",
+            "model": "haiku",
+            "add_dirs": [
+              "/tmp"
+            ],
+            "dangerous_skip_permissions": true,
+            "stream_json": true,
+            "timeout_s": 600
+          }
+        },
+        {
+          "slug": "claude-cli-fable",
+          "provider": "cli",
+          "model_id": "claude-cli-fable",
+          "display_name": "Claude CLI \u2013 Fable 5 (latest, full perms)",
+          "params": {
+            "cli": "claude",
+            "model": "fable",
+            "add_dirs": [
+              "/tmp"
+            ],
+            "dangerous_skip_permissions": true,
+            "stream_json": true,
+            "timeout_s": 900
+          }
+        },
+        {
+          "slug": "claude-cli-readonly",
+          "provider": "cli",
+          "model_id": "claude-cli-readonly",
+          "display_name": "Claude CLI \u2013 Sonnet (read-only: Read/Grep/Glob/Web)",
+          "params": {
+            "cli": "claude",
+            "model": "sonnet",
+            "dangerous_skip_permissions": false,
+            "allowed_tools": [
+              "Read",
+              "Grep",
+              "Glob",
+              "WebFetch",
+              "WebSearch"
+            ],
+            "stream_json": true,
+            "timeout_s": 600
+          }
+        },
+        {
+          "slug": "codex-cli-gpt-5",
+          "provider": "cli",
+          "model_id": "codex-cli-gpt-5",
+          "display_name": "Codex CLI \u2013 GPT-5 Codex (requires `codex` on PATH)",
+          "params": {
+            "cli": "codex",
+            "add_dirs": [
+              "/tmp"
+            ],
+            "stream_json": false,
+            "dangerous_skip_permissions": false,
+            "timeout_s": 900,
+            "model": "gpt-5-codex"
+          }
+        },
+        {
+          "slug": "cursor-agent",
+          "provider": "cli",
+          "model_id": "cursor-agent",
+          "display_name": "Cursor Agent CLI (requires `cursor-agent` on PATH)",
+          "params": {
+            "cli": "cursor-agent",
+            "extra_args": [
+              "--print"
+            ],
+            "timeout_s": 900,
+            "stream_json": false,
+            "dangerous_skip_permissions": false
+          }
+        },
+        {
+          "slug": "gemini-cli",
+          "provider": "cli",
+          "model_id": "gemini-cli",
+          "display_name": "Gemini CLI \u2013 `gemini` (requires Google CLI on PATH)",
+          "params": {
+            "cli": "gemini",
+            "add_dirs": [
+              "/tmp"
+            ],
+            "stream_json": false,
+            "dangerous_skip_permissions": false,
+            "timeout_s": 900
+          }
+        },
+        {
+          "slug": "github-copilot-cli",
+          "provider": "cli",
+          "model_id": "github-copilot-cli",
+          "display_name": "GitHub Copilot CLI \u2013 `gh copilot suggest` (requires gh + ext)",
+          "params": {
+            "cli": "gh",
+            "extra_args": [
+              "copilot",
+              "suggest"
+            ],
+            "timeout_s": 120,
+            "stream_json": false,
+            "dangerous_skip_permissions": false
+          }
+        },
+        {
+          "slug": "amp-cli",
+          "provider": "cli",
+          "model_id": "amp-cli",
+          "display_name": "Sourcegraph Amp CLI \u2013 `amp` (requires Amp on PATH)",
+          "params": {
+            "cli": "amp",
+            "add_dirs": [
+              "/tmp"
+            ],
+            "stream_json": false,
+            "dangerous_skip_permissions": false,
+            "timeout_s": 900
+          }
+        },
+        {
+          "slug": "aider-cli",
+          "provider": "cli",
+          "model_id": "aider-cli",
+          "display_name": "aider CLI \u2013 `aider` (requires aider on PATH)",
+          "params": {
+            "cli": "aider",
+            "extra_args": [
+              "--no-pretty"
+            ],
+            "timeout_s": 900,
+            "stream_json": false,
+            "dangerous_skip_permissions": false
+          }
+        },
+        {
+          "slug": "anthropic-sonnet-4-5",
+          "provider": "anthropic",
+          "model_id": "claude-sonnet-4-5",
+          "display_name": "Anthropic API \u2013 Claude Sonnet 4.5",
+          "params": {
+            "temperature": 0.2,
+            "max_tokens": 4096
+          }
+        },
+        {
+          "slug": "anthropic-opus-4-1",
+          "provider": "anthropic",
+          "model_id": "claude-opus-4-1",
+          "display_name": "Anthropic API \u2013 Claude Opus 4.1",
+          "params": {
+            "temperature": 0.2,
+            "max_tokens": 4096
+          }
+        },
+        {
+          "slug": "anthropic-haiku-4-5",
+          "provider": "anthropic",
+          "model_id": "claude-haiku-4-5",
+          "display_name": "Anthropic API \u2013 Claude Haiku 4.5",
+          "params": {
+            "temperature": 0.2,
+            "max_tokens": 2048
+          }
+        },
+        {
+          "slug": "bedrock-sonnet-4-5",
+          "provider": "bedrock",
+          "model_id": "us.anthropic.claude-sonnet-4-5-20251022-v1:0",
+          "display_name": "AWS Bedrock \u2013 Claude Sonnet 4.5",
+          "params": {}
+        },
+        {
+          "slug": "bedrock-opus-4-1",
+          "provider": "bedrock",
+          "model_id": "us.anthropic.claude-opus-4-1-20250930-v1:0",
+          "display_name": "AWS Bedrock \u2013 Claude Opus 4.1",
+          "params": {}
+        },
+        {
+          "slug": "bedrock-nova-pro",
+          "provider": "bedrock",
+          "model_id": "us.amazon.nova-pro-v1:0",
+          "display_name": "AWS Bedrock \u2013 Amazon Nova Pro",
+          "params": {}
+        },
+        {
+          "slug": "bedrock-llama-3-3",
+          "provider": "bedrock",
+          "model_id": "us.meta.llama3-3-70b-instruct-v1:0",
+          "display_name": "AWS Bedrock \u2013 Llama 3.3 70B",
+          "params": {}
         }
       ],
       "agent_configs": [
@@ -396,6 +630,294 @@
           "hidden_from_flow": false,
           "icon": "bot",
           "color": "#ffa657"
+        },
+        {
+          "slug": "monitor-shell",
+          "name": "Monitor (shell)",
+          "description": "Internal agent backing the run_monitor_async MCP tool \u2014 runs a raw shell command in an isolated container with no LLM involved, then wakes the caller via the same call_me_back rails run_agent_async uses. Dispatched only via POST /api/monitor/run (core.monitor_run.dispatch_monitor_run), never through the normal agent-run path.",
+          "icon": "terminal",
+          "color": "#94a3b8"
+        },
+        {
+          "slug": "explorer",
+          "name": "Explorer",
+          "description": "Locates code by pattern or topic; returns where-is reports with file paths + line numbers.",
+          "system_prompt_file": "prompts/explorer.md",
+          "model_slug": "claude-cli-readonly",
+          "tool_specs": [
+            "code.glob",
+            "code.grep",
+            "code.read_file"
+          ],
+          "icon": "search",
+          "color": "#2dd4bf"
+        },
+        {
+          "slug": "planner",
+          "name": "Planner",
+          "description": "Designs an implementation strategy; produces a numbered plan with files, steps and trade-offs.",
+          "system_prompt_file": "prompts/planner.md",
+          "model_slug": "claude-cli-readonly",
+          "tool_specs": [
+            "code.read_file",
+            "code.glob",
+            "code.grep"
+          ],
+          "icon": "list",
+          "color": "#b794f4"
+        },
+        {
+          "slug": "reviewer",
+          "name": "Reviewer",
+          "description": "Reviews code or a diff; flags bugs, security issues, missing tests.",
+          "system_prompt_file": "prompts/reviewer.md",
+          "model_slug": "claude-cli-readonly",
+          "tool_specs": [
+            "code.read_file",
+            "code.grep",
+            "code.glob"
+          ],
+          "icon": "shield-check",
+          "color": "#f0c000"
+        },
+        {
+          "slug": "retro",
+          "name": "Retrospective Analyst",
+          "description": "Analyzes a completed Target's full run history, dispatches follow-up questions to the agents who did the work, dedupes against existing lessons + KB, then records new/updated lessons. Decision-tier (Opus).",
+          "system_prompt_file": "prompts/retro.md",
+          "model_slug": "claude-cli-opus",
+          "tool_specs": [
+            "code.read_file",
+            "code.glob",
+            "code.grep"
+          ],
+          "use_cases": [
+            "Post-delivery retrospective on any completed Target",
+            "Cross-Target pattern detection (run multiple in sequence to compare)",
+            "Continuous-improvement feedback loop \u2014 feeds Phase-1.5 of future deliveries",
+            "Identify time-wasters / dead-ends / tooling gaps / cost traps"
+          ],
+          "icon": "history",
+          "color": "#c4b5fd"
+        },
+        {
+          "slug": "researcher",
+          "name": "Researcher",
+          "description": "Researches with web search + reading; returns findings with citations.",
+          "system_prompt_file": "prompts/researcher.md",
+          "model_slug": "claude-cli-readonly",
+          "tool_specs": [],
+          "icon": "globe",
+          "color": "#a5d6ff"
+        },
+        {
+          "slug": "coder",
+          "name": "Coder",
+          "description": "Implements the user's request. Writes code, edits files, runs commands.",
+          "system_prompt_file": "prompts/coder.md",
+          "model_slug": "claude-cli-sonnet",
+          "tool_specs": [
+            "code.read_file",
+            "code.write_file",
+            "code.edit_file",
+            "code.run_command",
+            "code.glob",
+            "code.grep"
+          ],
+          "icon": "code",
+          "color": "#58a6ff"
+        }
+      ],
+      "workflows": [
+        {
+          "slug": "ask-coder",
+          "name": "Ask Coder (single agent)",
+          "kind": "sequential",
+          "description": "Send the user's request to the Coder agent. Simplest possible workflow.",
+          "graph": {
+            "nodes": [
+              {
+                "id": "go",
+                "agent": "coder",
+                "label": "Coder",
+                "input_template": "{input}"
+              }
+            ]
+          }
+        },
+        {
+          "slug": "spec-pipeline",
+          "name": "Spec \u2192 Plan \u2192 Code \u2192 Review",
+          "kind": "pipeline",
+          "description": "4-stage codegen pipeline that turns a feature request into shipped code with review.",
+          "graph": {
+            "stages": [
+              {
+                "id": "spec",
+                "agent": "planner",
+                "label": "Spec",
+                "input_template": "Write a one-page spec for the user's feature request:\n\n{input}"
+              },
+              {
+                "id": "plan",
+                "agent": "planner",
+                "label": "Plan",
+                "input_template": "Given this spec, produce a numbered implementation plan:\n\n{prev}"
+              },
+              {
+                "id": "code",
+                "agent": "coder",
+                "label": "Code",
+                "input_template": "Implement the plan below. Original request:\n{input}\n\nPlan:\n{prev}"
+              },
+              {
+                "id": "review",
+                "agent": "reviewer",
+                "label": "Review",
+                "input_template": "Review the implementation summary below for the original request: {input}\n\nFlag blocking issues only.\n\n{prev}"
+              }
+            ]
+          }
+        },
+        {
+          "slug": "orchestrator-worker",
+          "name": "Orchestrator \u2192 Workers (fan-out)",
+          "kind": "orchestrator_worker",
+          "description": "A planner decomposes the task into 3 independent sub-tasks, three coders run them in parallel, a reviewer synthesises.",
+          "graph": {
+            "orchestrator": {
+              "id": "plan",
+              "agent": "planner",
+              "label": "Planner",
+              "input_template": "Decompose the user's request into exactly 3 independent sub-tasks. Output them as 3 numbered items.\n\nUSER REQUEST: {input}"
+            },
+            "workers": [
+              {
+                "id": "w1",
+                "agent": "coder",
+                "label": "Coder #1",
+                "input_template": "Execute sub-task 1 from the plan below. Original request: {input}\n\nPLAN:\n{prev}"
+              },
+              {
+                "id": "w2",
+                "agent": "coder",
+                "label": "Coder #2",
+                "input_template": "Execute sub-task 2 from the plan below. Original request: {input}\n\nPLAN:\n{prev}"
+              },
+              {
+                "id": "w3",
+                "agent": "coder",
+                "label": "Coder #3",
+                "input_template": "Execute sub-task 3 from the plan below. Original request: {input}\n\nPLAN:\n{prev}"
+              }
+            ],
+            "synthesizer": {
+              "id": "review",
+              "agent": "reviewer",
+              "label": "Reviewer",
+              "input_template": "Synthesize the three workers' results below for the original request: {input}\n\nWORKERS:\n{prev}"
+            }
+          }
+        },
+        {
+          "slug": "parallel-explore",
+          "name": "Parallel Explore (3 explorers)",
+          "kind": "parallel",
+          "description": "Three Explorer agents run in parallel on the same request \u2014 useful for triangulating where something lives.",
+          "graph": {
+            "concurrency": "parallel",
+            "nodes": [
+              {
+                "id": "e1",
+                "agent": "explorer",
+                "label": "Explorer #1",
+                "input_template": "From the angle of code structure: {input}"
+              },
+              {
+                "id": "e2",
+                "agent": "explorer",
+                "label": "Explorer #2",
+                "input_template": "From the angle of config and dependencies: {input}"
+              },
+              {
+                "id": "e3",
+                "agent": "explorer",
+                "label": "Explorer #3",
+                "input_template": "From the angle of tests and usage examples: {input}"
+              }
+            ]
+          }
+        },
+        {
+          "slug": "sequential-review",
+          "name": "Explore \u2192 Plan \u2192 Review",
+          "kind": "sequential",
+          "description": "Triage a request: locate relevant code, plan the change, then critique the plan.",
+          "graph": {
+            "nodes": [
+              {
+                "id": "s1",
+                "agent": "explorer",
+                "label": "Explore",
+                "input_template": "{input}"
+              },
+              {
+                "id": "s2",
+                "agent": "planner",
+                "label": "Plan",
+                "input_template": "Findings:\n{prev}\n\nGiven the findings above, write an implementation plan for: {input}"
+              },
+              {
+                "id": "s3",
+                "agent": "reviewer",
+                "label": "Review",
+                "input_template": "Review this plan for: {input}\n\nFlag blocking issues only.\n\nPLAN:\n{prev}"
+              }
+            ]
+          }
+        },
+        {
+          "slug": "group-chat-debate",
+          "name": "Group Chat: Planner \u2194 Critic \u2194 Coder",
+          "kind": "group_chat",
+          "description": "Three agents debate the user's question for up to 3 turns. Useful for design choices.",
+          "graph": {
+            "participants": [
+              {
+                "id": "p1",
+                "agent": "planner",
+                "label": "Planner"
+              },
+              {
+                "id": "p2",
+                "agent": "reviewer",
+                "label": "Critic"
+              },
+              {
+                "id": "p3",
+                "agent": "coder",
+                "label": "Coder"
+              }
+            ],
+            "max_turns": 3
+          }
+        }
+      ],
+      "evals": [
+        {
+          "slug": "explorer-smoke",
+          "name": "Explorer smoke",
+          "description": "Confirms the Explorer agent returns at least one file path for a basic request.",
+          "target_kind": "agent",
+          "target_slug": "explorer",
+          "dataset": [
+            {
+              "input": "find a python file in the agents repo",
+              "expected": ".py"
+            }
+          ],
+          "metric": "assert_contains",
+          "metric_args": {}
         }
       ]
     }
