@@ -273,6 +273,18 @@ def test_a_failed_refresh_never_raises():
     _seed_with_gateway(Failing(existing={"/api/agent-configs": ["rev-cfg"]}))
 
 
+def test_reconcile_uses_the_platforms_put_update_endpoint():
+    platform = RecordingPlatform(existing={"/api/agents": ["sec-reviewer"]})
+    provisioner = AgentProvisioner(base="http://ap.test", token="tok",
+                                   transport=platform.transport())
+
+    assert provisioner.update("agents", "sec-reviewer",
+                              {"agent_config_slug": "rev-cfg"}) is True
+    assert platform.puts == [
+        ("/api/agents/sec-reviewer", {"agent_config_slug": "rev-cfg"})
+    ]
+
+
 # --- targets --------------------------------------------------------------
 #
 # A Target is a delivery umbrella runs point at, not something an Agent or

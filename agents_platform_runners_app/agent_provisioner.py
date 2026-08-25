@@ -231,7 +231,11 @@ class AgentProvisioner:
         try:
             with httpx.Client(base_url=self.base, headers=headers,
                               timeout=self.timeout, transport=self.transport) as client:
-                resp = client.patch(f"{path}/{slug}", json=body)
+                # Agents Platform update endpoints are PUT (with partial
+                # Pydantic update bodies), not PATCH.  The fake provisioner
+                # accepted any verb, so this previously poisoned the seeded
+                # baseline while every real reconcile returned 405.
+                resp = client.put(f"{path}/{slug}", json=body)
                 resp.raise_for_status()
         except httpx.HTTPError as exc:
             log.warning("could not reconcile %s %r (%s)", kind, slug, exc)
