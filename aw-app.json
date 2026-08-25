@@ -975,9 +975,9 @@
       },
       "gateway_mcp_url": {
         "type": "string",
-        "default": "http://172.18.0.1:9200/mcp",
+        "default": "",
         "title": "Gateway MCP URL (for seeded agents)",
-        "description": "Address a SPAWNED AGENT CONTAINER uses to reach this workspace's MCP gateway. Written into the mcp_config of any AgentConfig an app contributes with `mcp_servers: [\"aw-gateway\"]`; the bearer token for it is read from the workspace's own .mcp.json and never travels in a manifest. Deliberately NOT the URL .mcp.json carries (http://aw-app-mcp-gateway:9200/mcp) \u2014 that name resolves inside the workspace container, where the gateway is a compose peer, but an agent container is a sibling in the nested podman namespace and only the bridge gateway IP resolves there. Override only if this workspace's bridge subnet differs."
+        "description": "Override for the address a SPAWNED AGENT CONTAINER uses to reach this workspace's MCP gateway. Written into the mcp_config of any AgentConfig an app contributes with `mcp_servers: [\"aw-gateway\"]`; the bearer token for it is read from the workspace's own .mcp.json and never travels in a manifest. Blank by default: the URL then comes straight from this workspace's own .mcp.json (http://aw-app-mcp-gateway:9200/mcp), which a spawned agent container CAN resolve \u2014 verified from inside a live agent container on 2026-08-14. Only set this if that resolution genuinely fails for your deployment (e.g. a non-default bridge subnet); a stale/wrong value here silently 401s every MCP call an agent makes, with nothing in any log to say why."
       },
       "openai_api_key": {
         "type": "string",
