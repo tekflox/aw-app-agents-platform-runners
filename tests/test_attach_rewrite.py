@@ -356,12 +356,64 @@ class TestInboundWiring:
 
         url = "https://ap.test/api/gallery/direct/t1"
         job = {"run_id": "run-5", "prompt": f"look at {url}", "cli": "claude",
+               "permissions": {"workspace_access": True},
                "attachments": [{"placeholder": url, "name": "p.png", "mime": "image/png",
                                 "content": base64.b64encode(b"png").decode()}]}
         execute_mod._run_job_blocking(job, "redis://example.test:6379/0")
         seen["prompt"] = job["prompt"]
         assert url not in seen["prompt"]
         assert "/.tmp/agent-inbound/run-5/p.png" in seen["prompt"]
+
+    def test_prompt_keeps_its_urls_when_the_agent_has_no_workspace_mount(
+            self, tmp_path, monkeypatch):
+        """A workspace path is unreadable inside a container that was denied
+        the workspace mount — in BOTH directions.
+
+        Inbound the agent cannot open the file it was handed. Outbound it
+        quotes that same path back in [[ATTACH: ...]], and the rewrite to
+        `artefact://` runs inside that container too, so it cannot read the
+        file either and leaves the marker alone; agents-platform then drops
+        it on its own os.path.exists(). That is the aw-cris Telegram group,
+        2026-08-25: "here are your 4 images" and no images.
+
+        The URL works for these agents and always did — AP fetches it over
+        HTTP and never touches a filesystem.
+        """
+        import base64
+        import sys
+        import types
+
+        monkeypatch.setitem(sys.modules, "docker", types.ModuleType("docker"))
+        monkeypatch.setattr(execute_mod, "WORKSPACE_CONTAINER_DIR", str(tmp_path))
+        monkeypatch.setattr(execute_mod, "_redis_client", lambda url: None)
+        monkeypatch.setattr(execute_mod, "_publish_line", lambda *a, **k: None)
+        monkeypatch.setattr(execute_mod, "_publish_done", lambda *a, **k: None)
+        monkeypatch.setattr(execute_mod.warm_pool, "enabled", lambda: False)
+
+        def _boom(*a, **k):
+            raise RuntimeError("stop after the materialise decision")
+
+        monkeypatch.setattr(execute_mod, "_build_container_kwargs", _boom)
+
+        url = "https://ap.test/api/gallery/direct/t1"
+        att = {"placeholder": url, "name": "p.png", "mime": "image/png",
+               "content": base64.b64encode(b"png").decode()}
+        for perms in ({}, {"workspace_access": False}, {"github": True}):
+            job = {"run_id": "run-6", "prompt": f"look at {url}", "cli": "claude",
+                   "permissions": perms, "attachments": [att]}
+            execute_mod._run_job_blocking(job, "redis://example.test:6379/0")
+            assert job["prompt"] == f"look at {url}", perms
+            # and nothing was written to a tree the container cannot see
+            assert not (tmp_path / ".tmp" / "agent-inbound" / "run-6").exists(), perms
+
+    def test_the_mount_and_the_materialise_read_the_same_permission(self):
+        """One helper decides both, so they cannot drift apart again — the
+        drift IS the bug (mount says no, materialise said yes)."""
+        for perms in ({}, {"workspace_access": True}, {"workspace_access": False},
+                      {"workspace_access": None}, {"github": True}, None):
+            assert execute_mod.job_workspace_access({"permissions": perms}) is \
+                bool((perms or {}).get("workspace_access", False))
+        assert execute_mod.job_workspace_access({}) is False
 
 
 def _attach_mod():

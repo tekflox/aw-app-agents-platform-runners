@@ -329,6 +329,21 @@ def _attach_helper():
     return _attach_module
 
 
+def job_workspace_access(job: dict) -> bool:
+    """Whether this run's container gets the workspace tree mounted.
+
+    Module-level because two decisions hang off it and they MUST agree: the
+    mount itself (``_build_container_kwargs``) and whether inbound
+    attachments may be handed over as workspace paths
+    (``_run_job_blocking``). They disagreed until 2026-08-26 and that is
+    exactly what silently broke outbound images — see the comment at the
+    materialise call site.
+
+    Fail-CLOSED, byte-for-byte what agents-platform's executor.py does.
+    """
+    return bool((job.get("permissions") or {}).get("workspace_access", False))
+
+
 def _publish_line(r, run_id: str, line: str) -> None:
     # Cold/ephemeral path's counterpart to the rewrite aw-warm-relay.py does
     # for warm containers — an [[ATTACH]] pointing at a file only reachable on
@@ -492,7 +507,7 @@ def _build_container_kwargs(job: dict) -> tuple[str, list[str], dict, str | None
 
         A grant is now explicit or it does not exist.
         """
-        return bool(_perms.get("workspace_access", False))
+        return job_workspace_access(job)
 
     def _mount(host_rel: str, container_path: str, ro: bool = False) -> None:
         host_path = f"{WORKSPACE_HOST_DIR.rstrip('/')}/{host_rel.lstrip('/')}"
@@ -1305,14 +1320,40 @@ def _run_job_blocking(job: dict, redis_url: str) -> None:
     # the agent's disk and point the prompt at the real files BEFORE either
     # path below consumes job["prompt"] (cold bakes it into argv, warm feeds
     # it through the FIFO). See aw_attach.materialise_inbound.
-    try:
-        job["prompt"] = _attach_helper().materialise_inbound(
-            job.get("prompt") or "", job.get("attachments"), run_id,
-            workspace_dir=WORKSPACE_CONTAINER_DIR,
-        )
-    except Exception:
-        log.exception("execute: inbound attachment materialise failed run=%s "
-                      "(prompt left with its URLs)", run_id)
+    #
+    # ONLY for an agent whose container actually mounts the workspace tree.
+    # Handing a `/opt/aw-workspace/...` path to an agent that was denied that
+    # mount is worse than doing nothing, in both directions (found live
+    # 2026-08-25, the aw-cris Telegram group):
+    #
+    #   inbound  — the path resolves to nothing inside the container, so the
+    #              agent cannot open the image it was just "given";
+    #   outbound — the agent quotes that path back in [[ATTACH: ...]], and
+    #              the rewrite that would turn it into `artefact://` runs
+    #              INSIDE that same container (aw-warm-relay*.py), where the
+    #              file is equally invisible. So the marker survives as a raw
+    #              local path, reaches agents-platform, fails its
+    #              os.path.exists() and is dropped with only a log line. The
+    #              user is told four images are attached and gets none.
+    #
+    # Left alone, the prompt keeps the gallery URL it arrived with, which is
+    # what these agents handled correctly all along — AP fetches a URL over
+    # HTTP and never touches a filesystem. The rewrite cannot be moved to
+    # this side instead: for a warm container the relay publishes straight to
+    # the run's Redis stream, so this process never sees the output line.
+    if job_workspace_access(job):
+        try:
+            job["prompt"] = _attach_helper().materialise_inbound(
+                job.get("prompt") or "", job.get("attachments"), run_id,
+                workspace_dir=WORKSPACE_CONTAINER_DIR,
+            )
+        except Exception:
+            log.exception("execute: inbound attachment materialise failed run=%s "
+                          "(prompt left with its URLs)", run_id)
+    elif job.get("attachments"):
+        log.info("execute: run=%s has no workspace_access — %d inbound attachment(s) "
+                 "left as URLs (a workspace path would be unreadable in its container)",
+                 run_id, len(job.get("attachments") or []))
 
     import docker as docker_sdk
 
