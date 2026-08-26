@@ -704,6 +704,52 @@ async def _list_tools() -> list[Tool]:
                                         "session_id": {"type": ["string", "null"],
                                                        "description": "Optional session_id to wake instead of your own — same as call_me_back_on."}},
                           "required": ["run_id"]}),
+        Tool(name="schedule_wakeup",
+             description=("Wake YOUR OWN session up later — the platform re-invokes this "
+                          "conversation with `prompt` after `delay_seconds`, with your full "
+                          "context intact, and ships the reply back down whatever channel "
+                          "this session came in on.\n\n"
+                          "Use this instead of ending your turn hoping something will resume "
+                          "you: polling an external job, waiting out a deploy, checking back "
+                          "on a long-running run you dispatched with call_me_back=false.\n\n"
+                          "`delay_seconds` is clamped to 10s..24h. Only ONE wake-up can be "
+                          "armed per run — call `cancel_wakeup` first if you need to replace "
+                          "it, or arm the next one from the woken turn.\n\n"
+                          "This ERRORS rather than silently doing nothing when the wake-up "
+                          "cannot be armed. In particular, if a sysadmin has blocked wake-ups "
+                          "on this session you get back exactly: 'You are not allowed to "
+                          "Wake-up, talk to the user about it' — when you see that, say so to "
+                          "the user in THIS turn instead of ending it expecting to return.\n\n"
+                          "(The Claude Code harness's own ScheduleWakeup is still honoured for "
+                          "backwards compatibility, but it cannot report a refusal back to "
+                          "you — prefer this tool.)"),
+             inputSchema={"type": "object",
+                          "properties": {"delay_seconds": {"type": "number",
+                                                           "description": "Seconds from now to wake up. Clamped to 10..86400."},
+                                        "prompt": {"type": "string",
+                                                   "description": "What to say to yourself when you wake up. REQUIRED — this is the whole point of the wake-up."},
+                                        "reason": {"type": ["string", "null"],
+                                                   "description": "One short line on what you're waiting for. Shown to the sysadmin on every firing wake-up — be specific."}},
+                          "required": ["delay_seconds", "prompt"]}),
+        Tool(name="list_wakeups",
+             description=("Pending wake-ups armed on YOUR OWN session, plus whether a sysadmin "
+                          "has muted the notifications or blocked wake-ups entirely. Pass "
+                          "status='' to see fired/error/cancelled ones too."),
+             inputSchema={"type": "object",
+                          "properties": {"status": {"type": "string", "default": "pending",
+                                                    "description": "Filter by status (pending|firing|fired|error|cancelled). Empty string for all."},
+                                        "limit": {"type": "integer", "default": 50}},
+                          "required": []}),
+        Tool(name="cancel_wakeup",
+             description=("Cancel one pending wake-up on your own session — e.g. the thing you "
+                          "were waiting for already happened, or you want to re-arm with a "
+                          "different delay. Get the id from `list_wakeups` or from "
+                          "`schedule_wakeup`'s own return value. Only pending wake-ups can be "
+                          "cancelled, and only on your own session."),
+             inputSchema={"type": "object",
+                          "properties": {"wakeup_id": {"type": "string",
+                                                       "description": "The wakeup_id to cancel. REQUIRED."}},
+                          "required": ["wakeup_id"]}),
         Tool(name="supervise",
              description=("Watch another session's whole run chain (that session plus every "
                           "descendant session/run it spawns) and get woken up on YOUR OWN "
@@ -1933,6 +1979,41 @@ async def _call_tool(name: str, arguments: dict[str, Any] | None) -> list[TextCo
                 return _err(400, "run_id is required")
             r = await c.post(f"{BASE}/api/runs/{run_id}/register-callback",
                              json={"origin_run_id": own_run_id, "session_id": args.get("session_id")})
+            return _err(r.status_code, r.text) if r.status_code != 200 else _ok(r.json())
+        if name == "schedule_wakeup":
+            # The declared counterpart to the harness's intercepted
+            # ScheduleWakeup (see backend api/wakeups.py's module docstring for
+            # why both exist). Session comes from the caller's own run — never
+            # from an argument — so this can't arm a wake-up on someone else.
+            own_run_id = _caller_run_id(args)
+            if not own_run_id:
+                return _err(400, "Could not identify this run — this tool only works inside a docker CLI agent run.")
+            if not args.get("prompt"):
+                return _err(400, "prompt is required — it's what you'll be woken up with")
+            r = await c.post(f"{BASE}/api/wakeups",
+                             json={"caller_run_id": own_run_id,
+                                   "delay_seconds": args.get("delay_seconds"),
+                                   "prompt": args.get("prompt"),
+                                   "reason": args.get("reason")})
+            return _err(r.status_code, r.text) if r.status_code != 200 else _ok(r.json())
+        if name == "list_wakeups":
+            own_run_id = _caller_run_id(args)
+            if not own_run_id:
+                return _err(400, "Could not identify this run — this tool only works inside a docker CLI agent run.")
+            params = {"caller_run_id": own_run_id, "limit": str(args.get("limit") or 50)}
+            # absent -> "pending"; explicit "" -> every status
+            params["status"] = args.get("status", "pending") or ""
+            r = await c.get(f"{BASE}/api/wakeups", params=params)
+            return _err(r.status_code, r.text) if r.status_code != 200 else _ok(r.json())
+        if name == "cancel_wakeup":
+            own_run_id = _caller_run_id(args)
+            if not own_run_id:
+                return _err(400, "Could not identify this run — this tool only works inside a docker CLI agent run.")
+            wakeup_id = args.get("wakeup_id")
+            if not wakeup_id:
+                return _err(400, "wakeup_id is required")
+            r = await c.post(f"{BASE}/api/wakeups/{wakeup_id}/cancel",
+                             json={"caller_run_id": own_run_id})
             return _err(r.status_code, r.text) if r.status_code != 200 else _ok(r.json())
         if name == "supervise":
             own_run_id = _caller_run_id(args)
