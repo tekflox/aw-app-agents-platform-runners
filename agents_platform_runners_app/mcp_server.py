@@ -1727,13 +1727,46 @@ async def _mcp_preflight(run_id: str | None) -> dict:
     return {"checked": True, "config": path, "servers": out}
 
 
+#: Written fresh by warm_pool.dispatch_turn() at the START of every turn
+#: dispatched into a warm container (see that function's docstring) — the
+#: one thing in this process's reach that's actually per-turn, not
+#: per-container-boot.
+_WARM_CURRENT_RUN_ID_PATH = "/home/ubuntu/.aw-warm/current_run_id"
+
+
 def _caller_run_id(args: dict) -> str | None:
-    """Which run is calling us. Prefers the gateway-injected
-    ``_gateway_caller_run_id`` (set from the per-run X-Aw-Caller-Run-Id
-    header — see api/agents.py::write_run_mcp_config) since this process is a
-    single shared subprocess whose own os.environ can't carry per-call
-    identity. Falls back to AW_RUN_ID for direct/non-gateway invocations
-    (e.g. a local stdio test)."""
+    """Which run is calling us.
+
+    Three sources, in order:
+    1. The warm-container turn file, when it exists. This process (the MCP
+       server) is a single subprocess kept alive for the container's whole
+       warm lifetime (6h TTL) — its own os.environ and any header baked into
+       its mcp.json at launch are fixed at turn 1 and never refresh, but the
+       CLI process itself never restarts either, so nothing re-reads them.
+       warm_pool.dispatch_turn() writes this file fresh at the START of
+       every turn specifically so something downstream CAN learn the current
+       run without a restart — confirmed live 2026-08-29 (WS-8): AW_RUN_ID
+       stayed pinned to turn 1's run for the rest of the container's life,
+       while this file tracked every turn correctly. Without this, any
+       per-run gate (schedule_wakeup's dedup-by-origin_run_id chief among
+       them) permanently locks onto turn 1's run — once a wakeup fires once,
+       every later one is refused forever, misread as "already armed".
+    2. The gateway-injected ``_gateway_caller_run_id`` (from the per-run
+       X-Aw-Caller-Run-Id header) — same staleness problem as os.environ in
+       a warm container (the header is baked into mcp.json once too), but
+       still correct for the ephemeral (non-warm) per-run container path,
+       where this whole process — and therefore its env/headers — really is
+       fresh every time.
+    3. AW_RUN_ID, for direct/non-gateway invocations (e.g. a local stdio
+       test) where neither of the above applies.
+    """
+    try:
+        with open(_WARM_CURRENT_RUN_ID_PATH, encoding="utf-8") as f:
+            from_file = f.read().strip()
+        if from_file:
+            return from_file
+    except OSError:
+        pass  # not in a warm container, or the file isn't there yet — fall through
     return args.get("_gateway_caller_run_id") or os.environ.get("AW_RUN_ID")
 
 
