@@ -3,7 +3,7 @@ repo: architecture
 path: docs/architecture/aw-app-agents-platform-runners.md
 source: generated
 edited: false
-checksum: sha256:7c5a406ef1eda400101301a29262c5888959864a30b5878debf7552b8d82f88a
+checksum: sha256:4173bb992dd560b4915b9a3e72c8e9ab2cda9c0a3840c4c7c48d957d5b908545
 ---
 # Agents Platform Runners
 

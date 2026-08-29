@@ -23,6 +23,7 @@ import httpx
 from fastapi import FastAPI, HTTPException, Request
 
 from . import execute as execute_mod
+from . import observability_push as observability_push_mod
 from . import shared_redis
 
 RUNNERS = ["claude", "codex", "copilot", "cursor-agent"]
@@ -122,6 +123,20 @@ def build_routes(config: dict | None = None) -> FastAPI:
             return {"error": f"agents-platform responded {exc.response.status_code}: {exc.response.text[:500]}"}
         except Exception as exc:  # noqa: BLE001 — surfaced as-is to the caller
             return {"error": f"could not reach {url}: {exc}"}
+
+    @app.post("/register-observability")
+    async def register_observability() -> dict:
+        """Push this workspace's resolved Settings > Observability target to
+        agents-platform-multitenant right now. Called by aw-workspace core
+        (``src/api/observability.py``'s ``put_observability`` handler) right
+        after a mode change saves, over loopback — that's the only caller in
+        the normal case, so a save reaches AP-MT within the same request
+        cycle, no polling delay. Also usable standalone as a manual retry if
+        that push failed (e.g. AP-MT was briefly unreachable) while the save
+        itself still succeeded. See ``observability_push.push_once`` for the
+        actual two-hop logic."""
+        import asyncio
+        return await asyncio.to_thread(observability_push_mod.push_once, cfg)
 
     @app.post("/execute")
     async def execute_job(request: Request) -> dict:
