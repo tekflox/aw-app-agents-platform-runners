@@ -1090,7 +1090,9 @@ async def _list_tools() -> list[Tool]:
                           "properties": {"limit": {"type": "integer",
                                                     "description": "Max rows to return. Default 20."},
                                          "status": {"type": "string",
-                                                    "description": "Filter by status: pending|running|success|error|cancelled."}}}),
+                                                    "description": "Filter by status: pending|running|success|error|cancelled."},
+                                         "session_id": {"type": "string",
+                                                        "description": "Filter to runs resumed under this CLI session id only."}}}),
         Tool(name="get_run_detail",
              description=("FULL record for one Run: untruncated input/output, status, "
                           "timestamps, target_slug, agent/source_slug, cost, tokens, "
@@ -2127,6 +2129,8 @@ async def _call_tool(name: str, arguments: dict[str, Any] | None) -> list[TextCo
             params = {"limit": str(args.get("limit") or 20), "summary": "true"}
             if args.get("status"):
                 params["status"] = args["status"]
+            if args.get("session_id"):
+                params["session_id"] = args["session_id"]
             r = await c.get(f"{BASE}/api/runs", params=params)
             return _err(r.status_code, r.text) if r.status_code != 200 else _ok(r.json())
         if name == "get_run_detail":
