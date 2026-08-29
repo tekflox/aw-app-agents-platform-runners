@@ -1873,6 +1873,16 @@ async def _call_tool(name: str, arguments: dict[str, Any] | None) -> list[TextCo
             # for its result. Without it every child was told "no one is
             # waiting" and pointed at a return_to_caller_agent it didn't need.
             body["call_me_back"] = args.get("call_me_back") is not False
+            # Redirect target for the eventual callback (see the tool's own
+            # schema description). The backend's /run validation and
+            # core.wakeups arming both read this straight off the request —
+            # dropping it here silently downgraded every call_me_back_on
+            # request into "callback wakes MY session" (or, with no caller
+            # run identity at all, a flat 400), which is exactly backwards
+            # for a middle hop in an A->B->C chain trying to redirect C's
+            # answer straight to A.
+            if args.get("call_me_back_on"):
+                body["call_me_back_on"] = args["call_me_back_on"]
             r = await c.post(f"{BASE}/api/agents/{args['slug']}/run", json=body)
             return _err(r.status_code, r.text) if r.status_code != 200 else _ok(r.json())
         if name == "run_workflow_async":
@@ -1885,6 +1895,8 @@ async def _call_tool(name: str, arguments: dict[str, Any] | None) -> list[TextCo
                 body["target_slug"] = args["target_slug"]
             if _rid := _caller_run_id(args):
                 body["caller_run_id"] = _rid
+            if args.get("call_me_back_on"):
+                body["call_me_back_on"] = args["call_me_back_on"]
             r = await c.post(f"{BASE}/api/workflows/{args['slug']}/run", json=body)
             return _err(r.status_code, r.text) if r.status_code != 200 else _ok(r.json())
         if name == "run_monitor_async":
