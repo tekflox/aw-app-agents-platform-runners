@@ -430,7 +430,11 @@ def _build_raw_kwargs(job: dict) -> tuple[str, list[str], dict]:
         "environment": {"HOME": "/home/ubuntu", "AW_RUN_ID": run_id},
         "volumes": volumes,
         "detach": True,
-        "remove": True,
+        # NOT remove=True — the wait-then-fetch-once raw_command branch in
+        # _run_job_blocking needs the container to still exist after it
+        # exits, to read its logs without racing engine-side auto-removal.
+        # That branch removes it explicitly once it's done.
+        "remove": False,
         "privileged": False,
         "stdin_open": False,
         "tty": False,
@@ -1509,6 +1513,56 @@ def _run_job_blocking(job: dict, redis_url: str) -> None:
         kill_timer = threading.Timer(timeout_s, _kill_on_timeout)
         kill_timer.daemon = True
         kill_timer.start()
+
+    if job.get("raw_command"):
+        # Route around the streaming CLI-agent path below entirely — podman's
+        # follow-mode log API was found live (2026-08-30, Kanban ap-mt:
+        # monitor-run-dead-workspace-mount) to return EMPTY immediately when a
+        # container has produced no stdout bytes YET at attach time, instead
+        # of blocking for output that arrives later, and the container (spawned
+        # with remove=True) can already be gone by the time a subsequent
+        # `container.wait()` runs. A CLI agent always emits something almost
+        # immediately (its own stream-json init event), so the streaming path
+        # never hits this; a raw shell command routinely does not (`sleep`,
+        # `git`, anything redirected to a file) — verified by hand against this
+        # exact image/host: `bash -lc "sleep 2; exit 7"` (nothing printed for
+        # 2s) got a `logs -f` that returned instantly with zero bytes and a
+        # container already removed by the time `wait` ran, while
+        # `bash -lc "echo hi; sleep 2; echo bye"` (output present at attach
+        # time) streamed correctly start to finish on the identical host.
+        #
+        # A monitor run has no live-streaming UI to serve anyway (this
+        # module's own docstring — just an exit code and a final blob), so
+        # switching it to wait-then-fetch-once loses nothing: `_build_raw_
+        # kwargs` sets remove=False so the container survives long enough for
+        # this to reliably read it, and cleanup is explicit below instead of
+        # racing engine-side auto-removal.
+        try:
+            status = container.wait()
+            returncode = int(status.get("StatusCode", 1)) if isinstance(status, dict) else int(status)
+        except Exception:
+            log.exception("execute: wait failed for monitor run=%s", run_id)
+            returncode = 1
+        try:
+            raw = container.logs(stdout=True, stderr=True, stream=False)
+            output = raw.decode("utf-8", errors="replace") if isinstance(raw, (bytes, bytearray)) else str(raw)
+        except Exception:
+            log.warning("execute: could not fetch logs for monitor run=%s", run_id, exc_info=True)
+            output = ""
+        if output.strip():
+            _publish_line(r, run_id, output)
+        if kill_timer:
+            kill_timer.cancel()
+        _publish_done(r, run_id, returncode)
+        try:
+            container.remove(force=True)
+        except Exception:
+            pass  # already gone (e.g. killed by the timeout timer) — nothing left to clean up
+        try:
+            r.close()
+        except Exception:
+            pass
+        return
 
     returncode = 1
     # `container.logs(stream=True)` yields raw byte chunks exactly as

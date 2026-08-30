@@ -46,6 +46,14 @@ def test_build_raw_kwargs_starts_bash_under_the_identity_mapped_workspace(monkey
     assert kwargs["volumes"] == {
         "/home/aw-remote-host/aw-workspace": {"bind": "/opt/aw-workspace", "mode": "rw"}
     }
+    # NOT remove=True: the raw_command branch in _run_job_blocking waits for
+    # the container then fetches its logs in one shot, which needs the
+    # container to still exist after exit — podman's follow-mode log API was
+    # found (2026-08-30) to return empty immediately for a container with no
+    # buffered stdout yet, racing engine-side auto-removal for a fast/silent
+    # command (`sleep 2; exit 7` reproduced it live; a command with output at
+    # attach time did not). Cleanup happens explicitly instead.
+    assert kwargs["remove"] is False
 
 
 def test_build_raw_kwargs_defaults_to_the_workspace_root_with_no_cwd(monkeypatch):
