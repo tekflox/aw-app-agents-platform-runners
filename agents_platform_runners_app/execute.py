@@ -387,8 +387,70 @@ def _sync_home_creds_into_workspace(real_home: Path, spec: dict) -> None:
             log.warning("execute: creds resync %s -> %s failed", src, dst, exc_info=True)
 
 
+def _build_raw_kwargs(job: dict) -> tuple[str, list[str], dict]:
+    """(image, command_argv, docker-SDK run kwargs) for a "monitor run" job —
+    a raw ``bash -lc "<command>"`` with NO CLI agent, no credentials, no MCP
+    config, no session. The counterpart of ``_build_container_kwargs`` for
+    agents-platform-multitenant's ``core.monitor_run.py``, which used to
+    spawn this itself via ``docker run`` against ITS OWN bare-metal daemon —
+    the wrong host, since ``/opt/aw-workspace`` there is a stale stub, not
+    the live workspace tree (Kanban card
+    ``ap-mt:monitor-run-dead-workspace-mount``). Routing it through this app
+    instead means the command runs on the SAME container engine, and sees
+    the SAME workspace mount, as a real CLI-agent run — identity-mapped
+    exactly like ``_build_container_kwargs``'s own workspace mount below, so
+    a ``cwd`` means the same thing to a monitor run as to an agent run.
+
+    Uses the pre-existing ``aw-sandbox-agent-cli-shell`` image
+    (agents-platform-multitenant's ``agent-images/shell/Dockerfile`` — no CLI
+    runtime baked in, and its own docstring already anticipated being spawned
+    by "the runner" with ``--user``/``--group-add``, exactly what happens
+    here). No new image to build.
+    """
+    run_id = job["run_id"]
+    command = job["raw_command"]
+    cwd = (job.get("cwd") or "").strip().lstrip("/")
+    image = f"{REGISTRY}/{IMAGE_PREFIX}-shell:{DEFAULT_TAG}"
+    workdir = f"/opt/aw-workspace/{cwd}" if cwd else "/opt/aw-workspace"
+    argv = ["bash", "-lc", command]
+
+    volumes: dict[str, dict] = {}
+    # Same identity mount _build_container_kwargs uses for a real agent run
+    # (WORKSPACE_HOST_DIR -> "/opt/aw-workspace") — unconditional here, unlike
+    # the CLI-agent path's job_workspace_access() gate: a monitor run's
+    # entire purpose is workspace filesystem access, and it has no Agent
+    # Config to carry that permission through in the first place.
+    if WORKSPACE_HOST_DIR:
+        volumes[WORKSPACE_HOST_DIR.rstrip("/")] = {"bind": "/opt/aw-workspace", "mode": "rw"}
+
+    kwargs: dict[str, Any] = {
+        "name": f"aw-runner-monitor-{run_id[:12]}",
+        "command": argv,
+        "working_dir": workdir,
+        "environment": {"HOME": "/home/ubuntu", "AW_RUN_ID": run_id},
+        "volumes": volumes,
+        "detach": True,
+        "remove": True,
+        "privileged": False,
+        "stdin_open": False,
+        "tty": False,
+        # Same uid/gid reasoning as _build_container_kwargs's own "user"
+        # kwarg — the workspace mount's files are owned by this process's
+        # real uid, not the image's baked-in "ubuntu" (1000).
+        "user": f"{os.getuid()}:{os.getgid()}",
+        "group_add": [1000],
+    }
+    if CONTAINER_NETWORK:
+        kwargs["network"] = CONTAINER_NETWORK
+    return image, argv, kwargs
+
+
 def _build_container_kwargs(job: dict) -> tuple[str, list[str], dict, str | None]:
     """Return (image, command_argv, docker-SDK run kwargs) for this job.
+
+    A ``raw_command`` job (monitor run — see ``_build_raw_kwargs``) branches
+    off immediately: it has no CLI, no credentials, no MCP config, none of
+    what follows applies to it.
 
     Mirrors agents-platform's ``build_docker_argv`` narrowed to what a single
     stateless job needs — no warm-pool, no WS/legacy modes (this app always
@@ -412,6 +474,10 @@ def _build_container_kwargs(job: dict) -> tuple[str, list[str], dict, str | None
     ``resume <session_id>`` (codex) convention, which resolves by session ID
     globally across ``~/.claude/projects/**`` regardless of cwd.
     """
+    if job.get("raw_command"):
+        image, argv, kwargs = _build_raw_kwargs(job)
+        return image, argv, kwargs, None
+
     cli = job.get("cli") or "claude"
     if cli not in CLI_SPECS:
         cli = "claude"
@@ -1422,6 +1488,28 @@ def _run_job_blocking(job: dict, redis_url: str) -> None:
         _publish_done(r, run_id, 1)
         return
 
+    # A raw_command (monitor run) job carries its own timeout_seconds — the
+    # OLD monitor_run.py enforced this itself (asyncio.wait_for + `docker
+    # kill`) because it owned the subprocess directly; now that the container
+    # runs here instead, this app has to be the one to kill a runaway command.
+    # A CLI-agent job has no such kill switch (never did — its own timeout is
+    # enforced AP-MT-side, on the Redis Stream consumer), so this only
+    # applies to raw_command jobs.
+    kill_timer = None
+    if job.get("raw_command"):
+        timeout_s = min(max(1, int(job.get("timeout_seconds") or 3600)), 24 * 3600)
+
+        def _kill_on_timeout() -> None:
+            log.warning("execute: monitor run=%s exceeded %ds — killing container", run_id, timeout_s)
+            try:
+                container.kill()
+            except Exception:
+                pass  # already exited between the timer firing and this running
+
+        kill_timer = threading.Timer(timeout_s, _kill_on_timeout)
+        kill_timer.daemon = True
+        kill_timer.start()
+
     returncode = 1
     # `container.logs(stream=True)` yields raw byte chunks exactly as
     # delivered by the daemon's log API — these do NOT align with the
@@ -1455,6 +1543,8 @@ def _run_job_blocking(job: dict, redis_url: str) -> None:
     except Exception:
         log.exception("execute: log-stream failed run=%s", run_id)
     finally:
+        if kill_timer:
+            kill_timer.cancel()
         _publish_done(r, run_id, returncode)
         try:
             r.close()

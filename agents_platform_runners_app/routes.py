@@ -140,10 +140,17 @@ def build_routes(config: dict | None = None) -> FastAPI:
 
     @app.post("/execute")
     async def execute_job(request: Request) -> dict:
-        """Spawn an agent CLI container in THIS workspace's own container
-        engine and stream its output back over the shared Redis Stream (see
-        execute.py's module docstring for the full design + the reachability/
-        auth investigation that shaped it).
+        """Spawn a container in THIS workspace's own container engine and
+        stream its output back over the shared Redis Stream (see execute.py's
+        module docstring for the full design + the reachability/auth
+        investigation that shaped it). Two job shapes share this one route,
+        auth, and Redis-publish plumbing — the CLI-agent path (agent runs)
+        and the raw_command path (agents-platform-multitenant's monitor
+        runs, no LLM in the loop — see execute.py's ``_build_raw_kwargs``);
+        a raw_command body starts `bash -lc "<command>"` instead of a CLI,
+        which is why this is a mode flag here rather than a second endpoint —
+        it needs nothing this route, its auth, or its dispatch/dedup
+        machinery don't already do for the CLI path.
 
         Auth: this app is registered as a PUBLIC app in aw-backend's registry
         (AppInstall.config.public=true) so the tunnel edge's usual aw_id_jwt
@@ -192,6 +199,13 @@ def build_routes(config: dict | None = None) -> FastAPI:
             pass
         job = {
             "run_id": run_id,
+            # Monitor-run path (agents-platform-multitenant's monitor_run.py):
+            # a raw shell command, no CLI/session/MCP involved — everything
+            # below this stays None/default and _build_container_kwargs
+            # branches off to _build_raw_kwargs before touching any of it.
+            "raw_command": body.get("raw_command"),
+            "cwd": body.get("cwd"),
+            "timeout_seconds": body.get("timeout_seconds"),
             "cli": body.get("cli", "claude"),
             "model": body.get("model"),
             "prompt": body.get("prompt", ""),
