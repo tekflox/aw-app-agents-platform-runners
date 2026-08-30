@@ -1116,13 +1116,24 @@ async def _list_tools() -> list[Tool]:
                           "to diagnose a wedged or stale warm container without shelling "
                           "into the podman host.\n\n"
                           "Per container: container_id, name, status, session_id, "
-                          "agent_id, cli (\"claude\"/\"codex\"), cli_source (\"label\" if "
-                          "the container was spawned with the aw.cli label, \"inferred\" "
-                          "if it predates that label and this had to guess from its "
-                          "entrypoint — treat an inferred cli as a good guess, not a "
-                          "fact), epoch, created, and draining (a container reap() is "
-                          "retiring, not one still serving turns — excluded by default, "
-                          "pass include_draining to see them anyway).\n\n"
+                          "agent_id, cli, cli_source, epoch, created, and draining (a "
+                          "container reap() is retiring, not one still serving turns — "
+                          "excluded by default, pass include_draining to see them "
+                          "anyway).\n\n"
+                          "Each container also carries a `session` block translated from "
+                          "its session_id against agents-platform: agent_slug, "
+                          "model_slug, target_slug, and the last run's id/status/start.\n\n"
+                          "`cli_source` says how cli was answered, and they are not "
+                          "equally trustworthy: \"label\" (the aw.cli label the container "
+                          "was spawned with), \"session_lookup\" (the model's own cli — "
+                          "authoritative, this is what the platform dispatches from), or "
+                          "\"inferred\" (guessed from the entrypoint's wrapper path, for "
+                          "containers predating the label and unresolvable by lookup — a "
+                          "good guess, not a fact).\n\n"
+                          "Top-level `session_lookup` reports whether that translation "
+                          "ran. If ok=false the containers are still listed but have no "
+                          "`session` block — absent, not empty. Do not read a missing "
+                          "session block as \"this session has no agent\".\n\n"
                           "The top-level warm_enabled tells you whether warm mode is "
                           "even on: an empty containers list with warm_enabled=false "
                           "means warm mode is off (expected); with warm_enabled=true it "
@@ -1736,6 +1747,84 @@ def _ok(data: Any) -> list[TextContent]:
 def _err(status: int, text: str) -> list[TextContent]:
     return [TextContent(type="text",
                         text=json.dumps({"error": True, "status": status, "message": text}, indent=2))]
+
+
+async def _enrich_warm_containers(c, payload: dict) -> None:
+    """Translate each warm container's session_id into what agents-platform
+    knows about that session, in place.
+
+    A container's labels answer "which session is this", not "whose work is
+    it". The platform holds the rest — the agent, the model, and the model's
+    ``params.cli``, which is the AUTHORITATIVE answer to the question
+    ``warm_pool._infer_cli`` can only guess at from a wrapper path. A renamed
+    wrapper breaks the guess silently; the model's cli is the record the
+    platform dispatches from.
+
+    So the cli precedence is: ``aw.cli`` label (local, no network) ->
+    session lookup (authoritative, needs the platform) -> entrypoint
+    inference (last resort) -> null. ``cli_source`` always says which one
+    answered; an inference must never be presented as a label read.
+
+    BEST-EFFORT BY DESIGN. This runs at the MCP layer rather than inside the
+    /warm-containers route so the container inventory keeps no dependency on
+    a second service: an inventory that fails because the platform is
+    unreachable is useless exactly when it is most needed — diagnosing a
+    wedged runner. On failure the containers are returned unchanged and
+    ``session_lookup`` reports why, rather than the whole tool erroring or,
+    worse, quietly returning containers with no session data as if the
+    sessions had none.
+    """
+    containers = payload.get("containers") or []
+    session_ids = {ct.get("session_id") for ct in containers if ct.get("session_id")}
+    if not session_ids:
+        payload["session_lookup"] = {"ok": True, "resolved": 0,
+                                     "note": "no container carried a session_id"}
+        return
+
+    by_session: dict[str, dict] = {}
+    cli_by_model: dict[str, str] = {}
+    try:
+        for sid in sorted(session_ids):
+            r = await c.get(f"{BASE}/api/runs", params={"session_id": sid, "limit": "1"})
+            r.raise_for_status()
+            rows = r.json() or []
+            if rows:
+                by_session[sid] = rows[0]
+        rm = await c.get(f"{BASE}/api/models")
+        rm.raise_for_status()
+        for m in rm.json() or []:
+            cli = (m.get("params") or {}).get("cli")
+            if cli:
+                cli_by_model[m.get("slug")] = cli
+    except Exception as exc:  # noqa: BLE001 — degraded, never fatal
+        payload["session_lookup"] = {
+            "ok": False,
+            "reason": f"could not reach agents-platform at {BASE}: {exc}",
+            "note": "containers below are unenriched — session fields are absent, "
+                    "not empty",
+        }
+        return
+
+    for ct in containers:
+        run = by_session.get(ct.get("session_id") or "")
+        if not run:
+            continue
+        model_slug = run.get("model_slug")
+        ct["session"] = {
+            "agent_slug": run.get("source_slug"),
+            "model_slug": model_slug,
+            "target_slug": run.get("target_slug"),
+            "last_run_id": run.get("id"),
+            "last_run_status": run.get("status"),
+            "last_run_started_at": run.get("started_at"),
+        }
+        resolved = cli_by_model.get(model_slug or "")
+        if resolved and ct.get("cli_source") != "label":
+            ct["cli"] = resolved
+            ct["cli_source"] = "session_lookup"
+
+    payload["session_lookup"] = {"ok": True, "resolved": len(by_session),
+                                 "of": len(session_ids)}
 
 
 async def _mcp_preflight(run_id: str | None) -> dict:
@@ -2354,7 +2443,14 @@ async def _call_tool(name: str, arguments: dict[str, Any] | None) -> list[TextCo
                                 params=params, headers={"X-Api-Key": key})
             except httpx.HTTPError as exc:
                 return _err(502, f"could not reach this workspace's own API at {own_base}: {exc}")
-            return _err(r.status_code, r.text) if r.status_code != 200 else _ok(r.json())
+            if r.status_code != 200:
+                return _err(r.status_code, r.text)
+            payload = r.json()
+            # Join each container's session_id against the platform — see
+            # _enrich_warm_containers for why this lives here and not in the
+            # route, and why a failed join degrades instead of erroring.
+            await _enrich_warm_containers(c, payload)
+            return _ok(payload)
 
         # --- Targets ---
         if name == "list_callers":
