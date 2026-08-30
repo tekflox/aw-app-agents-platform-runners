@@ -1110,6 +1110,34 @@ async def _list_tools() -> list[Tool]:
                               "description": "New display name for the session. Empty string clears it back to unnamed."}},
                           "required": ["session_id", "name"]}),
 
+        Tool(name="list_warm_containers",
+             description=("Inventory of warm containers alive on THIS workspace's own "
+                          "container engine right now, and whose each one is. Use this "
+                          "to diagnose a wedged or stale warm container without shelling "
+                          "into the podman host.\n\n"
+                          "Per container: container_id, name, status, session_id, "
+                          "agent_id, cli (\"claude\"/\"codex\"), cli_source (\"label\" if "
+                          "the container was spawned with the aw.cli label, \"inferred\" "
+                          "if it predates that label and this had to guess from its "
+                          "entrypoint — treat an inferred cli as a good guess, not a "
+                          "fact), epoch, created, and draining (a container reap() is "
+                          "retiring, not one still serving turns — excluded by default, "
+                          "pass include_draining to see them anyway).\n\n"
+                          "The top-level warm_enabled tells you whether warm mode is "
+                          "even on: an empty containers list with warm_enabled=false "
+                          "means warm mode is off (expected); with warm_enabled=true it "
+                          "means nothing is warm right now — two different answers a "
+                          "caller cannot otherwise tell apart from an empty list. A "
+                          "listing failure comes back as an error, never as an empty "
+                          "list — do not read an error response as \"no warm "
+                          "containers\"."),
+             inputSchema={"type": "object",
+                          "properties": {
+                              "include_draining": {"type": "boolean",
+                                  "description": "Include containers currently being "
+                                                 "drained (dying, not serving). Default false."},
+                          }}),
+
         # ----- legacy alias -----
         Tool(name="get_run",
              description="Alias for run_status — fetches a Run row by id.",
@@ -2301,6 +2329,31 @@ async def _call_tool(name: str, arguments: dict[str, Any] | None) -> list[TextCo
             return _err(r.status_code, r.text) if r.status_code != 200 else _ok(r.json())
         if name == "cancel_all_runs":
             r = await c.post(f"{BASE}/api/runs/cancel_all")
+            return _err(r.status_code, r.text) if r.status_code != 200 else _ok(r.json())
+        if name == "list_warm_containers":
+            # This tool reads THIS APP's own /warm-containers route, not
+            # agents-platform-multitenant (BASE) — and this process is a
+            # stdio child of the mcp-gateway's own container (see
+            # kanban_dispatch's module docstring), so it has to reach that
+            # route the same way kanban_dispatch reaches aw-app-notion's:
+            # over the published workspace API, with the X-Api-Key baked
+            # into this upstream's env by plugin.build_mcp_servers.
+            own_base = kanban_dispatch.board_base_url()
+            key = (os.environ.get(kanban_dispatch.API_KEY_VAR)
+                   or kanban_dispatch._from_env_file(kanban_dispatch.API_KEY_VAR))
+            if not key:
+                return _err(500, f"{kanban_dispatch.API_KEY_VAR} is not set for this MCP "
+                                 "upstream. It is baked into the stdio env by the app's "
+                                 "plugin.build_mcp_servers() — an upstream missing it was "
+                                 "registered by an older version of this app, so restart "
+                                 "the workspace (which rewrites mcp.json) and then the "
+                                 "mcp-gateway.")
+            params = {"include_draining": "true"} if args.get("include_draining") else {}
+            try:
+                r = await c.get(f"{own_base}/api/apps/agents-platform-runners/warm-containers",
+                                params=params, headers={"X-Api-Key": key})
+            except httpx.HTTPError as exc:
+                return _err(502, f"could not reach this workspace's own API at {own_base}: {exc}")
             return _err(r.status_code, r.text) if r.status_code != 200 else _ok(r.json())
 
         # --- Targets ---

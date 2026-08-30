@@ -25,6 +25,7 @@ from fastapi import FastAPI, HTTPException, Request
 from . import execute as execute_mod
 from . import observability_push as observability_push_mod
 from . import shared_redis
+from . import warm_pool
 
 RUNNERS = ["claude", "codex", "copilot", "cursor-agent"]
 
@@ -72,6 +73,29 @@ def build_routes(config: dict | None = None) -> FastAPI:
             "agents_platform_base": cfg.get("agents_platform_base", "http://127.0.0.1:10014"),
             "runners": {name: _runner_status(name) for name in RUNNERS},
         }
+
+    @app.get("/warm-containers")
+    async def warm_containers(include_draining: bool = False) -> dict:
+        """Inventory of warm containers alive on THIS workspace's own
+        container engine right now, and whose each one is — see
+        warm_pool.list_containers for the label-vs-inferred cli logic.
+        `warm_enabled` is returned alongside the list because "warm mode is
+        off" and "no warm containers right now" are different answers a
+        caller cannot otherwise tell apart from an empty list. A listing
+        failure raises rather than returning an empty list, for the same
+        reason."""
+        if not execute_mod.CONTAINER_SOCKET:
+            raise HTTPException(
+                503, "AW_CONTAINER_SOCKET is not set — this workspace has no container "
+                     "engine available to spawn agent CLIs (containers:manage capability "
+                     "unmet at runtime, even though granted in aw-app.json)")
+        import docker as docker_sdk
+        try:
+            client = docker_sdk.DockerClient(base_url="unix://" + execute_mod.CONTAINER_SOCKET)
+            containers = warm_pool.list_containers(client, include_draining=include_draining)
+        except Exception as exc:  # noqa: BLE001 — surfaced as an error, never as []
+            raise HTTPException(502, f"could not list warm containers: {exc}") from exc
+        return {"warm_enabled": warm_pool.enabled(), "containers": containers}
 
     @app.post("/register")
     async def register() -> dict:

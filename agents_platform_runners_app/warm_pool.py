@@ -53,6 +53,7 @@ WARM_LABEL = "aw.warm"
 AGENT_ID_LABEL = "aw.agent_id"
 SESSION_ID_LABEL = "aw.session_id"
 EPOCH_LABEL = "aw.epoch"
+CLI_LABEL = "aw.cli"
 
 # Same 6h backstop as agents-platform's warm_pool.py — enforced INSIDE the
 # container by aw-warm-wrapper itself (its own TTL watcher subshell); this
@@ -306,6 +307,69 @@ def reap(client, *, drain_grace_s: int = DRAIN_GRACE_S) -> int:
     if removed:
         log.info("warm_pool.reap: removed %d dead warm container(s)", removed)
     return removed
+
+
+def _infer_cli(c) -> str | None:
+    """Guess which CLI a warm container runs when it predates ``CLI_LABEL``.
+
+    Every warm container alive before this label existed has no ``aw.cli`` —
+    the one thing that already discriminates claude from codex on such a
+    container is the entrypoint each spawn path bakes in: claude's
+    ``_build_warm_kwargs_claude`` sets ``aw-warm-wrapper``, codex's
+    ``_build_warm_kwargs_codex`` sets ``aw-warm-wrapper-codex`` (execute.py).
+    Requires a full inspect (``c.reload()``) — the abbreviated attrs
+    ``containers.list()`` returns have no ``Config.Entrypoint``."""
+    try:
+        c.reload()
+    except Exception:
+        return None
+    entrypoint = (c.attrs.get("Config") or {}).get("Entrypoint") or []
+    joined = " ".join(entrypoint)
+    if "aw-warm-wrapper-codex" in joined:
+        return "codex"
+    if "aw-warm-wrapper" in joined:
+        return "claude"
+    return None
+
+
+def list_containers(client, *, include_draining: bool = False) -> list[dict]:
+    """Inventory of every warm container this engine knows about — the read
+    path ``reap()``'s own listing call was never surfaced for.
+
+    Raises whatever the docker client raises on a failed list. Callers must
+    NOT swallow that into an empty result: "no warm containers" and "could
+    not check" are different answers a caller cannot tell apart from ``[]``
+    alone.
+    """
+    containers = client.containers.list(all=True, filters={"label": f"{WARM_LABEL}=1"})
+    out: list[dict] = []
+    for c in containers:
+        name = getattr(c, "name", "") or ""
+        draining = "-draining-" in name
+        if draining and not include_draining:
+            continue
+        attrs = c.attrs or {}
+        # containers.list()'s abbreviated attrs carry Labels at the top
+        # level; a full inspect (post-reload, from a prior call) nests them
+        # under Config instead — accept either shape.
+        labels = attrs.get("Labels") or (attrs.get("Config") or {}).get("Labels") or {}
+        cli = labels.get(CLI_LABEL)
+        cli_source = "label"
+        if not cli:
+            cli, cli_source = _infer_cli(c), "inferred"
+        out.append({
+            "container_id": (getattr(c, "id", "") or "")[:12],
+            "name": name,
+            "status": getattr(c, "status", None),
+            "session_id": labels.get(SESSION_ID_LABEL),
+            "agent_id": labels.get(AGENT_ID_LABEL),
+            "cli": cli,
+            "cli_source": cli_source,
+            "epoch": labels.get(EPOCH_LABEL),
+            "created": attrs.get("Created"),
+            "draining": draining,
+        })
+    return out
 
 
 def maybe_reap(client) -> None:

@@ -1176,6 +1176,7 @@ def _build_warm_kwargs_claude(job: dict, epoch_hash: str, redis_url: str) -> tup
         warm_pool.AGENT_ID_LABEL: agent_id,
         warm_pool.SESSION_ID_LABEL: session_id,
         warm_pool.EPOCH_LABEL: epoch_hash,
+        warm_pool.CLI_LABEL: "claude",
     }
     return image, kwargs
 
@@ -1222,6 +1223,7 @@ def _build_warm_kwargs_codex(job: dict, epoch_hash: str, redis_url: str) -> tupl
         warm_pool.AGENT_ID_LABEL: agent_id,
         warm_pool.SESSION_ID_LABEL: session_id,
         warm_pool.EPOCH_LABEL: epoch_hash,
+        warm_pool.CLI_LABEL: "codex",
     }
     return image, kwargs
 
