@@ -191,6 +191,38 @@ def build_routes(config: dict | None = None) -> FastAPI:
         if presented != secret:
             raise HTTPException(401, "invalid or missing X-Runner-Secret")
 
+        # Validate the job BEFORE spending a container on it. Until 2026-08-30
+        # this route accepted ANY body: `{}` passed straight through to
+        # start_job, which spawned a real claude container on an empty prompt
+        # and billed a full cold start to produce nothing. Found live while
+        # probing whether /execute was reachable at all — the probe itself
+        # started run f7122833. A caller that cannot name the work has a bug;
+        # answering 400 tells it so, where 200 taught it the opposite.
+        #
+        # The two job shapes are mutually exclusive by construction:
+        # _build_container_kwargs branches on raw_command before it reads
+        # prompt (execute.py:481), so a body carrying both is ambiguous — the
+        # prompt would be silently discarded. Reject rather than pick.
+        try:
+            body = await request.json()
+        except Exception:
+            raise HTTPException(400, "body is not valid JSON")
+        if not isinstance(body, dict):
+            raise HTTPException(400, "body must be a JSON object")
+        raw_command = body.get("raw_command")
+        prompt = body.get("prompt")
+        has_raw = isinstance(raw_command, str) and raw_command.strip() != ""
+        has_prompt = isinstance(prompt, str) and prompt.strip() != ""
+        if has_raw and has_prompt:
+            raise HTTPException(
+                400, "body carries both 'raw_command' and 'prompt' — these select "
+                     "different job shapes and only raw_command would be honoured; "
+                     "send exactly one")
+        if not has_raw and not has_prompt:
+            raise HTTPException(
+                400, "body must carry a non-empty 'prompt' (CLI-agent job) or a "
+                     "non-empty 'raw_command' (monitor run) — nothing to execute")
+
         redis_url = shared_redis.resolve(cfg)
         if not redis_url:
             raise HTTPException(
@@ -203,7 +235,6 @@ def build_routes(config: dict | None = None) -> FastAPI:
                      "engine available to spawn agent CLIs (containers:manage capability "
                      "unmet at runtime, even though granted in aw-app.json)")
 
-        body = await request.json()
         run_id = body.get("run_id") or uuid.uuid4().hex
         # TEMP DEBUG (2026-08-08, remove once confirmed): checking whether
         # agents-platform-multitenant's agent_id-in-payload change
