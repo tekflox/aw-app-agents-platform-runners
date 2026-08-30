@@ -519,7 +519,7 @@ async def _list_tools() -> list[Tool]:
                           "`create_target` if none exists."),
              inputSchema={"type": "object",
                           "properties": {"command": {"type": "string",
-                                                      "description": "Shell command to execute (runs as `bash -lc \"<command>\"` inside an isolated container with the workspace mounted at /workspace)."},
+                                                      "description": "Shell command to execute (runs as `bash -lc \"<command>\"` inside an isolated container, dispatched through the same Runner a CLI-agent run uses — the workspace is mounted at its own real path, e.g. /opt/aw-workspace, identical to what a real agent run sees)."},
                                          "target_slug": {"type": "string",
                                                          "description": "Slug of the Target this run is delivering against. REQUIRED."},
                                          "target_id": {"type": ["string", "null"]},
