@@ -783,25 +783,65 @@ async def _list_tools() -> list[Tool]:
                                         "debounce_s": {"type": ["integer", "null"],
                                                       "description": "Override the default 90s wakeup-dedup window for this supervision."}},
                           "required": ["session_id"]}),
+        Tool(name="supervise_card",
+             description=("Watch a KANBAN CARD instead of a session, and get woken up on YOUR "
+                          "OWN session when the work on that card goes idle. Same machinery as "
+                          "`supervise` (same idle threshold, same debounce, same wakeup "
+                          "payload) — only the seed differs.\n\n"
+                          "Use this when what you care about is 'this card', not 'that agent': "
+                          "you don't need to know which session will pick the card up, or "
+                          "whether it gets handed between several agents. Every run stamped "
+                          "with this notion_task_id joins the watched chain automatically, "
+                          "wherever it was dispatched from.\n\n"
+                          "The card does NOT need a run yet. A card armed while still in "
+                          "Backlog stays quiet (edge_state='waiting_first_run') until it "
+                          "actually gets its first run — an empty chain is not an idle chain, "
+                          "so you will not be woken about a card nobody has started.\n\n"
+                          "Idempotent per (your session, card): re-calling returns the SAME "
+                          "supervision_id with existing:true.\n\n"
+                          "Modes are identical to `supervise`: forever=false (default) gives "
+                          "one wakeup then a retrigger-or-give-up cycle; forever=true keeps "
+                          "delivering one wakeup per running->idle transition until "
+                          "`stop_supervisor`.\n\n"
+                          "IMPORTANT — a one-shot supervision that gives up now TELLS you so: "
+                          "you get a '[supervisor] ... foi DESARMADA' message on your session. "
+                          "Re-arming after that is your call, never automatic. If you want it "
+                          "to survive on its own, pass forever=true instead.\n\n"
+                          "Note this watches RUNS against the card, not the card's Notion "
+                          "properties — nothing in this deployment observes a column/status "
+                          "change, so 'the card moved to Done' is not an event you can wait "
+                          "for here."),
+             inputSchema={"type": "object",
+                          "properties": {"notion_task_id": {"type": "string",
+                                                            "description": "The Kanban card id (page_id) to supervise. REQUIRED."},
+                                         "forever": {"type": "boolean", "default": False,
+                                                     "description": "Keep re-arming after each wakeup instead of stopping after one retrigger-or-give-up cycle. Default false."},
+                                         "debounce_s": {"type": ["integer", "null"],
+                                                        "description": "Override the default 90s wakeup-dedup window for this supervision."}},
+                          "required": ["notion_task_id"]}),
         Tool(name="stop_supervisor",
-             description=("Cancel a supervision armed via `supervise` — no more wakeups from it.\n\n"
+             description=("Cancel a supervision armed via `supervise` or `supervise_card` — no "
+                          "more wakeups from it.\n\n"
                           "Pass EXACTLY ONE of:\n"
                           "- `supervision_id` — that one supervision.\n"
                           "- `target_session_id` — every armed supervision WATCHING that "
                           "  session ('turn off whatever is supervising session X'). This is "
                           "  the one to use when you don't own the supervision and therefore "
                           "  never saw its id.\n"
+                          "- `notion_task_id` — every armed supervision watching that CARD.\n"
                           "- `caller_session_id` — every armed supervision that session ARMED "
                           "  ('stop this agent from watching anything').\n\n"
-                          "The session forms are not restricted to your own session, and stop "
-                          "no-op on already-terminal (done/stopped) rows. Returns "
+                          "The session/card forms are not restricted to your own session, and "
+                          "stop no-op on already-terminal (done/stopped) rows. Returns "
                           "{ok, stopped:[ids], count}. Use `list_supervisors` first to see "
                           "what you are about to turn off."),
              inputSchema={"type": "object",
                           "properties": {"supervision_id": {"type": ["string", "null"],
-                                                            "description": "The supervision_id returned by `supervise`."},
+                                                            "description": "The supervision_id returned by `supervise`/`supervise_card`."},
                                          "target_session_id": {"type": ["string", "null"],
                                                                "description": "Stop every armed supervision WATCHING this session. Need not be your own."},
+                                         "notion_task_id": {"type": ["string", "null"],
+                                                            "description": "Stop every armed supervision watching this Kanban card."},
                                          "caller_session_id": {"type": ["string", "null"],
                                                                "description": "Stop every armed supervision ARMED BY this session. Need not be your own."}},
                           "required": []}),
@@ -2073,20 +2113,34 @@ async def _call_tool(name: str, arguments: dict[str, Any] | None) -> list[TextCo
                              json={"caller_run_id": own_run_id, "target_session_id": session_id,
                                    "forever": bool(args.get("forever")), "debounce_s": args.get("debounce_s")})
             return _err(r.status_code, r.text) if r.status_code != 200 else _ok(r.json())
+        if name == "supervise_card":
+            own_run_id = _caller_run_id(args)
+            if not own_run_id:
+                return _err(400, "Could not identify this run — this tool only works inside a docker CLI agent run.")
+            notion_task_id = args.get("notion_task_id")
+            if not notion_task_id:
+                return _err(400, "notion_task_id is required")
+            r = await c.post(f"{BASE}/api/supervisions/card",
+                             json={"caller_run_id": own_run_id, "notion_task_id": notion_task_id,
+                                   "forever": bool(args.get("forever")), "debounce_s": args.get("debounce_s")})
+            return _err(r.status_code, r.text) if r.status_code != 200 else _ok(r.json())
         if name == "stop_supervisor":
             supervision_id = args.get("supervision_id")
             target_session_id = args.get("target_session_id")
             caller_session_id = args.get("caller_session_id")
-            given = [x for x in (supervision_id, target_session_id, caller_session_id) if x]
+            notion_task_id = args.get("notion_task_id")
+            given = [x for x in (supervision_id, target_session_id, caller_session_id,
+                                 notion_task_id) if x]
             if len(given) != 1:
-                return _err(400, "pass exactly one of supervision_id, target_session_id "
-                                 "or caller_session_id")
+                return _err(400, "pass exactly one of supervision_id, target_session_id, "
+                                 "notion_task_id or caller_session_id")
             if supervision_id:
                 r = await c.post(f"{BASE}/api/supervisions/{supervision_id}/stop")
             else:
                 r = await c.post(f"{BASE}/api/supervisions/stop",
                                  json={"target_session_id": target_session_id,
-                                       "caller_session_id": caller_session_id})
+                                       "caller_session_id": caller_session_id,
+                                       "notion_task_id": notion_task_id})
             return _err(r.status_code, r.text) if r.status_code != 200 else _ok(r.json())
         if name == "list_supervisors":
             # absent -> "armed" (the useful default); explicit null -> no filter at all
