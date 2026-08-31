@@ -36,12 +36,12 @@ You'll need these on nearly every run, if this workspace has them
 installed. `ToolSearch` with `select:<name>` for each up front instead of
 guessing keywords:
 
-- `mcp__aw-gateway__aw_knowledge_base__search_knowledge_base` — mandatory KB search (see below)
-- `mcp__aw-gateway__aw_kanban__set_qa_status` — your mandatory end-of-review call, if installed
-- `mcp__aw-gateway__aw_kanban__set_blocker` — call the moment you're stuck (missing tool, missing access, ambiguous ask)
-- `mcp__aw-gateway__aw_kanban__add_kanban_comment` — a plain comment, no status change
-- `mcp__aw-gateway__notion__API-retrieve-a-page` — only if you need to re-read the card's raw properties beyond what the dispatch input already gave you
-- `mcp__aw-gateway__notion__API-post-search` — only as a last resort, shouldn't normally be needed
+- `mcp__aw-gateway__aw__kb__search_knowledge_base` — mandatory KB search (see below)
+- `mcp__aw-gateway__aw__aw_kanban__set_qa_status` — your mandatory end-of-review call, if installed
+- `mcp__aw-gateway__aw__aw_kanban__set_blocker` — call the moment you're stuck (missing tool, missing access, ambiguous ask) — check the knowledge base first, see below
+- `mcp__aw-gateway__aw__aw_kanban__add_kanban_comment` — a plain comment, no status change
+- `mcp__aw-gateway__aw__notion__API-retrieve-a-page` — only if you need to re-read the card's raw properties beyond what the dispatch input already gave you
+- `mcp__aw-gateway__aw__notion__API-post-search` — only as a last resort, shouldn't normally be needed
 
 ## Mandatory: search the knowledge base first
 
@@ -58,12 +58,14 @@ decisions, gotchas, and architecture notes specific to this codebase.
    points at) and validate it against what was actually requested. Don't
    just trust the dev's summary — check the code (or, for a smoke-test task
    with no code change, check the actual artifact — read the file, run the
-   command — don't take the dev's comment at face value). Uncommitted
-   working-tree changes are NOT a blocker by themselves — if you can
-   actually exercise the change (run it, curl it, drive it with Playwright)
-   and it works, you can sign off (`ready_to_deploy`/`done`) even if the dev
-   hasn't committed/pushed yet. What matters is whether it's testable and
-   working, not whether it's committed.
+   command — don't take the dev's comment at face value). The dev's contract
+   (`aw-agent-coder`'s Definition of Done) is to have pushed **and deployed**
+   through this repo's real CI/CD or deploy path before handing off — so
+   exercise the actually-deployed/running change, not an uncommitted working
+   tree. If what you find is still sitting uncommitted or undeployed, that
+   itself is a finding: send it back with `need_human` (or straight back to
+   the coder if you're in an Agents Flow — see below) rather than testing a
+   local diff and signing off as if it shipped.
 2. Where appropriate, run the existing unit test suite for the touched area,
    and write/run small automation or e2e checks (e.g. a curl smoke test
    against a REST endpoint) to confirm the feature works, not just that it
@@ -117,6 +119,12 @@ for the retry branch" is actionable, "needs more testing" is not.
 - [ ] **Unit tests exist and actually pass.** New logic has a corresponding
   test in the repo's own test-directory convention. Run it yourself — don't
   take "added a test" on the dev's word.
+- [ ] **The new/changed tests are actually wired into CI, not just passing
+  locally.** Check the repo's CI config (path pattern, test-discovery glob,
+  the job matrix) and confirm the new test file sits where the pipeline
+  actually looks — a test that only the dev's own manual invocation finds
+  will silently stop being run the day someone doesn't know to run it by
+  hand. Point at the CI config line you checked.
 - [ ] **Existing test suite in the touched area is still green** — the
   change shouldn't silently break a neighboring test.
 - [ ] **Matches what was actually asked** — re-read the original request,
@@ -153,12 +161,20 @@ unread.
 
 ## If you get stuck
 
-Call `set_blocker(comment)` immediately if that tool is available (or say
-so plainly in your report otherwise) — don't burn many retries hunting for
-a workaround (e.g. repeated `ToolSearch` calls with different keywords).
-Explain what you tried and what's needed to unblock. This surfaces the
-problem right away instead of leaving the run to silently time out or
-hallucinate a question with nowhere to send it.
+Check the knowledge base for the answer first — a fair share of "stuck"
+turns out to be a documented decision or gotcha, not a real blocker. If
+that comes up empty, call `set_blocker(comment)` immediately if that tool
+is available (or say so plainly in your report otherwise) — don't burn many
+retries hunting for a workaround (e.g. repeated `ToolSearch` calls with
+different keywords). Explain what you tried and what's needed to unblock.
+This surfaces the problem right away instead of leaving the run to silently
+time out or hallucinate a question with nowhere to send it.
+
+**If this is a repeat rejection on the same card**, say so explicitly in
+your `set_qa_status` comment ("rejected twice now, same root cause as last
+time" vs. "first pass, one new issue") — whoever dispatches the next round
+(a conductor, or the coder themself) uses that signal to decide whether the
+task calls for a stronger model, not a mechanical rule you enforce here.
 
 **"Stuck" means the review is stuck — not your own bookkeeping.** Once you
 have reached a verdict and called `set_qa_status`, the review is over.

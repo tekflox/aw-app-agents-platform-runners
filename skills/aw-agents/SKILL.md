@@ -227,9 +227,12 @@ reflect the run, and `agents_used` should list the agent slug. If any
 of those are zero, you forgot the `target_slug` and need to retro-link.
 
 At the end of the delivery (Phase 7), pass the presentation IDs back:
-`update_target(slug=..., plan_presentation_id="aw-agents-plan",
-report_presentation_id="aw-agents-report")` so the presentations live with the
-Target permanently, if presentations are in use.
+`update_target(slug=..., plan_canvas_id="aw-agents-plan",
+report_canvas_id="aw-agents-report")` so the presentations live with the
+Target permanently, if presentations are in use. (`update_target`'s actual
+fields are `plan_canvas_id`/`report_canvas_id` — "canvas" is the platform's
+internal name for what the `aw-presentation` skill calls a presentation;
+don't rename these to `*_presentation_id` when calling the tool.)
 
 ### Phase 1.4 — Lesson retrieval (MANDATORY · closes the propagation gap)
 
@@ -364,10 +367,21 @@ Once approved:
 1. If you need a new workflow, `create_workflow` (or `update_workflow`
    for tweaks). Pin models with `agent.model_slug` if the user picked
    any.
-2. Start with `run_workflow_async(slug, input)` and capture the run_id.
-3. Stream progress: poll `run_status` periodically and call
-   `run_events(run_id)` to surface key events (`node_start`,
-   `tool_call`, `error`, `done`).
+2. Start with `run_workflow_async(slug, input, target_slug=...)` and
+   capture the `run_id` (and `session_id`, from the response). Leave
+   `call_me_back` at its default (`true`) — you'll be woken automatically
+   when *this* run ends, no polling needed for the simple case.
+3. **Don't poll `run_status` in a loop.** `call_me_back` only fires when
+   the run you dispatched ends its own turn, which for a single agent/
+   workflow run is the whole thing — but if what you dispatched is itself
+   a multi-hop chain (an Agents Flow node handing off further, a group
+   node fanning out), that one wake-up can land before the chain is
+   actually done. For that case arm `supervise(session_id=...)` right after
+   dispatch — it watches the *whole* chain (every descendant run/session)
+   and wakes you once when all of it goes idle. See the `aw-supervisor-tool`
+   skill. Reserve manual `run_status`/`run_events(run_id)` polling for when
+   you're actively narrating live progress within the same turn, not as the
+   default way to notice completion.
 4. When `status` is terminal:
    - `success` → continue to Phase 5.
    - `success` + `output.limit_reached` → graceful stop. **Ask user**:
@@ -519,6 +533,8 @@ state. Anything that mutates the user's work belongs to an agent.
 | Run (block) | `agent_<slug>`, `workflow_<slug>` |
 | **Run (background) — MUST pass `target_slug`** | `run_agent_async(slug, input, target_slug=...)`, `run_workflow_async(slug, input, target_slug=...)`, `run_agents_parallel(..., target_slug=...)` |
 | **Watch a long-running shell command, no LLM in the loop** | `run_monitor_async(command, target_slug=...)` — see below, NOT the harness's own `Monitor` tool |
+| **Watch a whole dispatched chain go idle, no polling** | `supervise(session_id=...)` — see below; not the same as `call_me_back`, which only covers the one run you dispatched |
+| **Turn off / inspect a supervision** | `stop_supervisor`, `supervisor_status`, `list_supervisors` (everyone's, not just yours) — see the `aw-supervisor-tool` skill |
 | Observe | `run_status`, `run_events`, `run_tree` |
 | Stop | `cancel_run`, `cancel_all_runs` |
 | Present | `mcp__aw-gateway__aw_presentation__create_presentation`, `update_presentation`, if installed |
@@ -539,6 +555,33 @@ tail; fetch the full stdout/stderr with `get_run_artefact(run_id=<the
 monitor run's id>, name="monitor_output")`. Implementation lives inside
 agents-platform's own backend (`app/core/monitor_run.py` +
 `app/api/monitor.py`, `POST /api/monitor/run`) — not this workspace's code.
+
+## Watching a whole dispatched chain — `supervise()`
+
+`call_me_back` (default on for `run_agent_async`/`run_workflow_async`) is a
+**level-trigger on one run's own completion** — it wakes you when the run
+you dispatched ends its own turn. That's not the same as "the work is
+done" when what you dispatched hands off further on its own (an Agents Flow
+node, a group node, a conductor that itself delegates): that first run can
+finish in seconds by handing off, while the actual delivery keeps going
+several hops deeper.
+
+For that shape, arm a supervision right after dispatch:
+
+```
+run_agent_async(slug="architect", input="...", target_slug="...")
+# → {run_id, session_id, ...}
+supervise(session_id="<the session_id from above>")
+```
+
+`supervise` watches that session **plus every descendant** it spawns
+(`parent_run_id` chain) and wakes your own session exactly once when none
+of them have a `pending`/`queued`/`running` run left, for 60s straight.
+Pass `forever=true` if you want to keep getting woken on every subsequent
+running→idle transition instead of just the first one. Full mechanism,
+wakeup payload shape, and the 4 tools (`supervise`, `stop_supervisor`,
+`supervisor_status`, `list_supervisors`) are in the `aw-supervisor-tool`
+skill — read it before using this for anything beyond the basic case above.
 
 ## When you create a new agent / workflow
 

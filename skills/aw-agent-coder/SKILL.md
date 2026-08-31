@@ -61,12 +61,53 @@ how to call them (never hand-roll curl to the MCP gateway), and the
 when this run has a card. If no `aw-kanban` skill/tools are available in
 this session, there's no card system wired up — skip this section entirely.
 
+## Definition of done — pushed *and* deployed, in a way that survives
+
+A task is not delivered when the diff is correct. It's delivered when the
+change has actually shipped through this repo's real path to production —
+pushed, and taken through whatever that repo's own CI/CD or deploy step is
+— so that a QA agent (or anyone else) can exercise the *running* thing, not
+your local working tree. This is a generic rule, not an aw-workspace
+peculiarity: every repo has its own answer to "how does a merged change
+actually reach the thing users hit", and finding that answer (reading the
+repo's CI config, its README, its `docs/`) is part of the task, not an
+optional extra.
+
+Two things follow from that:
+
+- **The design has to accommodate surviving the repo's own reset events.**
+  If this repo can be recreated from scratch (a fresh clone, a container
+  rebuild, an app reinstall) and your change would silently disappear or
+  need to be redone by hand, that's not done — it's a local workaround.
+  Concretely in **this** workspace: application state, config and secrets
+  belong under `AW_WORKSPACE_HOME` (`.aw-workspace/`) or the app's own
+  config/DB, never baked only into a running container or a file outside
+  version control — see the workspace's `AGENTS.md` and, for an
+  aw-workspace app specifically, its `contributes`/`app-config` pattern. A
+  change that only works "until the next `aw-workspace-cli agent sync` /
+  app reinstall / workspace redeploy" is not finished; say so explicitly if
+  you shipped something short of that rather than silently calling it done.
+- **Deploy the latest code yourself before handing off for review.** Don't
+  leave "someone still needs to deploy this" as an implicit follow-up. If
+  the repo has a CI/CD pipeline, push and let it run (and watch it — a
+  green push you didn't verify isn't verified). If it doesn't have one yet
+  and needs one for this kind of change to ever be reviewable, that's a
+  real finding — say so on the card rather than working around the gap by
+  hand every time.
+
+If you touched or added tests, also confirm the pipeline actually **runs**
+them — a test file that passes when you invoke it manually but sits outside
+the CI job's discovered path (wrong directory, wrong naming convention, not
+in the matrix) will bit-rot the first time someone doesn't know to run it by
+hand. Point at the CI config you checked, not just the test output.
+
 ### `is_live` / `is_deployment_needed`
 
 When this run has a Kanban card, set these two checkbox properties on the
 card via `set_kanban_property` before finishing, so whoever's tracking the
 board can tell at a glance whether a change is actually running or still
-needs a step from a human:
+needs a step from a human — these two properties are how you record the
+Definition of Done above, not a separate concern from it:
 
 - `is_deployment_needed` — `true` if the change needs a restart/build/deploy
   to take effect (e.g. edited backend code → the service needs a restart;
@@ -89,11 +130,11 @@ run's own Kanban-card context, so just call
 When this run has a Kanban card, you'll likely need these. `ToolSearch` with
 `select:<name>` for each up front instead of guessing keywords:
 
-- `mcp__aw-gateway__aw_knowledge_base__search_knowledge_base` — mandatory KB search (above), if installed
-- `mcp__aw-gateway__aw_kanban__add_kanban_comment` — leave a note on the card (e.g. a delivery report, a question)
-- `mcp__aw-gateway__aw_kanban__set_blocker` — call the moment you're stuck (missing tool, missing access, ambiguous ask) — don't burn many retries hunting for a workaround first
-- `mcp__aw-gateway__aw_kanban__set_kanban_property` — set `is_live` / `is_deployment_needed` (or any other board property) before finishing
-- `mcp__aw-gateway__notion__API-retrieve-a-page` — only if you need to re-read the card's raw properties beyond what the dispatch input already gave you
+- `mcp__aw-gateway__aw__kb__search_knowledge_base` — mandatory KB search (above), if installed
+- `mcp__aw-gateway__aw__aw_kanban__add_kanban_comment` — leave a note on the card (e.g. a delivery report, a question)
+- `mcp__aw-gateway__aw__aw_kanban__set_blocker` — call the moment you're stuck (missing tool, missing access, ambiguous ask) — don't burn many retries hunting for a workaround first. Check the knowledge base for the answer before concluding you're actually blocked.
+- `mcp__aw-gateway__aw__aw_kanban__set_kanban_property` — set `is_live` / `is_deployment_needed` (or any other board property) before finishing
+- `mcp__aw-gateway__aw__notion__API-retrieve-a-page` — only if you need to re-read the card's raw properties beyond what the dispatch input already gave you
 
 ## Conduct
 
@@ -110,12 +151,17 @@ When this run has a Kanban card, you'll likely need these. `ToolSearch` with
   it" / "couldn't reproduce" / "not possible" with no attached evidence is
   not an acceptable report — fabricated success reports with no
   verification behind them have burned real users before.
-- If scope is ambiguous, ask once — then proceed with a sensible default
-  rather than blocking on a round-trip.
+- If scope is ambiguous, check the knowledge base for the answer before
+  asking — it's often already documented. If it isn't, ask once, then
+  proceed with a sensible default rather than blocking on a round-trip.
 - Minimal diff for the task at hand. Don't refactor, abstract, or add
   guardrails beyond what was asked.
-- Don't commit or push unless explicitly asked to — leave changes in the
-  working tree for review unless the task says otherwise.
+- Push and deploy as part of finishing a delivery task (see Definition of
+  done above) — that's the default for anything dispatched as work to
+  ship, not an extra step you need permission for. The exception is a task
+  explicitly scoped as an investigation, spike or read-only report with no
+  delivery expected — leave that uncommitted unless the task says
+  otherwise.
 
 ## Bootstrap context block
 

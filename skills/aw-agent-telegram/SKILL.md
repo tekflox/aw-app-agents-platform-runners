@@ -272,6 +272,118 @@ page id.
 If no Notion MCP tool is available in this session, say so rather than
 pretending to save something.
 
+## Coordinating development work
+
+When the user asks you to build, fix, or investigate something in the
+codebase ("add X", "fix the bug where Y happens", "why is Z broken"), don't
+write the code yourself by default — **coordinate**: create a Kanban card,
+dispatch it into this workspace's Dev Team (`aw-app-devteam`'s
+`software-engineering` Agents Flow — Product Owner → Architect → Coders →
+QAs, plus Debugger / Doc Writer / Code Reviewer also reachable directly),
+and drive that card to completion. You're acting as that flow's **Source**
+— a dispatcher and watcher, not an implementer.
+
+**Exception:** if the user explicitly says to do it yourself ("you code it",
+"just fix it now, don't dispatch anyone"), act as the coder directly in
+this session and skip everything below.
+
+This is a lighter-weight path than the full `aw-agents` skill (no plan
+presentation, no approval gate) — dispatch and go, per how Frederico wants
+this run: decide, dispatch, chase, report, without a permission round-trip
+for a normal delivery. Still surface a genuine decision (something
+irreversible, outward-facing, or a fork with materially different
+outcomes) rather than silently picking for him.
+
+### Knowledge base first — for you and before escalating a question
+
+Every Dev Team agent (Coder, Architect, Product Owner, QA) already has a
+mandatory knowledge-base search built into its own contract before it starts
+digging. You have the same rule from the top of this skill — apply it here
+specifically: before opening a card, and before asking Frederico a
+clarifying question or firing off another agent run just to answer
+something, check the knowledge base yourself first. The answer to "have we
+tried this" or "why is it built this way" is often already written down.
+
+### 1. Pick where to enter the flow
+
+| Signal | Dispatch to |
+|---|---|
+| New feature / vague ask, scope needs shaping | `product-owner` |
+| Scope is already clear, it's a design/approach question | `architect` |
+| "Why is X broken" | `debugger` |
+| Small, well-scoped fix — no design decision in it | `coder-sonnet` directly |
+| "Review this diff / PR / branch" | `code-reviewer-sonnet` |
+| Docs only | `doc-writer` |
+
+When unsure, default to `product-owner` — it sits right after Source in the
+flow for a reason, and it routes onward to the Architect itself.
+
+### 2. Create the card, then dispatch directly — never rely on a status move
+
+Moving a card to `ready` only changes its status; it fires nothing (see the
+`aw-kanban` skill). Dispatch explicitly:
+
+```
+create_kanban_task(title="...", description="...", input_text="<the user's ask>")
+# → {page_id, url, ...}
+
+run_agent_async(
+  slug="product-owner",                 # or architect / debugger / coder-sonnet / ...
+  input="<the user's ask, in full — quote them, don't paraphrase away detail>",
+  target_slug="<a Target for this delivery — create_target first if none exists>",
+  notion_task_id="<page_id from create_kanban_task>",
+)
+# → {run_id, session_id, ...}
+```
+
+See the `aw-agents` skill for what a Target is and why `target_slug` is
+required on every dispatch.
+
+### 3. Watch without polling
+
+```
+supervise(session_id="<session_id from run_agent_async>")
+```
+
+You'll be woken once when the *entire* chain goes idle — including every
+internal hand-off the flow makes on its own (PO → Architect → Coders → QAs)
+— not just when the one run you dispatched ends its own turn. See the
+`aw-supervisor-tool` skill.
+
+### 4. Drive the card through completion
+
+When woken, read the card:
+
+```
+get_kanban_card(page_id="...", include_body=true, include_comments=true)
+```
+
+- **`done` / `ready_to_deploy`** → tell the user, with the evidence from the
+  card's comments. You're finished.
+- **`need_human`** → read the comment for why. If it's a real question only
+  Frederico can answer (a scope call, a product decision), check the
+  knowledge base first, then ask him directly in this chat; once he
+  answers, re-dispatch whichever agent needs it with his answer as input.
+  If it's QA bouncing a delivery back over a design question, route to the
+  Architect instead of guessing; a scope question goes to the Product
+  Owner.
+- **QA rejected the coder's delivery** → re-dispatch a coder with QA's
+  comment as input (see escalation below).
+
+Keep dispatching and watching — don't stop at "I kicked it off" and wait to
+be asked what happened. A card that's still open after you've gone quiet is
+a dropped thread, not a finished delegation.
+
+### 5. Default coder, escalate on judgement — not a hard count
+
+Default to `coder-sonnet` unless the user names a different model. If a
+card keeps bouncing back from QA on the same coder, that's a signal to use
+judgement on, not a counter to enforce mechanically: a repeat rejection —
+especially one QA flags as the same root cause as last time — is a good
+reason to re-dispatch to `coder-opus` instead of trying `coder-sonnet`
+again. There's no field on the card that tracks this; hold it in your own
+read of the conversation.
+
 ## Quick reference
 
 | What you want | How |
@@ -286,6 +398,7 @@ pretending to save something.
 | Decision buttons | `[[OPTIONS: q="…" a="…" b="…" c="…"]]` |
 | Mini-app button | `[[MINIAPP: url=https://… text="Open"]]` — usually unnecessary. |
 | User's current/last location | Only if a location MCP tool is installed → `[[LOCATION: lat=… lon=… label="…"]]`. |
+| Build/fix something in the codebase | Coordinate — create a Kanban card, dispatch into the Dev Team, `supervise()` the chain. See "Coordinating development work" above. Code it yourself only if explicitly asked. |
 
 When something fails, surface the error in one short line ("Couldn't
 render that — fonts didn't load") and ask what they want next.
