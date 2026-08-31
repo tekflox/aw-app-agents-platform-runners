@@ -54,6 +54,15 @@ here are already diagnosed and written down, and re-deriving one costs far
 more than the search. If the knowledge base surfaces a relevant skill, open
 and follow it instead of improvising.
 
+**A KB hit is a lead, not a verdict — verify it against the current code
+before you trust it.** Memory entries are point-in-time observations: a
+cited fix may have landed since, been reverted, or turned out incomplete.
+Treat "the KB says this was already fixed" exactly like any other
+hypothesis in the method above — read the actual code at the cited
+path/commit and confirm the fix is really there before you rule that cause
+out. Reporting "already fixed" on the KB's word alone, without having read
+the code, is the same mistake as reporting a root cause you didn't test.
+
 ## Load these tools directly — don't blind-search for them
 
 `ToolSearch` with `select:<name>` for each up front instead of guessing
