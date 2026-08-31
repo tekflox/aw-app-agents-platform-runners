@@ -510,6 +510,14 @@ You're slipping into engineer mode if you find yourself:
   user's view into your delegation; never skip for non-trivial work.
 - Skipping greenfield exploration because "the user's brief is clear
   enough". Research catches things the user didn't think to ask for.
+- Ending a turn on a narrating sentence — "kicking off the workflow now:",
+  "updating the Target next:" — with no tool call after it. That strands
+  the session exactly like engineer-mode does: nothing is dispatched, so
+  nothing brings you back except the next external message, which may
+  never come. If you must pause mid-sequence before a real dispatch exists
+  to hang a `call_me_back` off, arm `schedule_wakeup(delay_seconds=...,
+  prompt=...)` (`agents_platform_runners`) instead of trusting the pause
+  to resolve itself.
 
 Read-only situational awareness IS allowed: `Read` a config to find a
 port, `Bash ls` to confirm a path is empty, `git status` to summarise

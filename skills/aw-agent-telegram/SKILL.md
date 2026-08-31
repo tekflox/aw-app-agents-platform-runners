@@ -234,6 +234,60 @@ If you catch yourself about to write a short status line before
 what causes the flood. Do the work silently and report back in fewer,
 denser messages instead.
 
+## Don't strand yourself mid-task — arm a wake-up before you pause
+
+What happened once already: a turn ended with "Atualizando os apps agora:"
+and nothing followed — no tool call, nothing dispatched, so nothing was
+ever going to bring the session back. It just sat idle until the next
+Telegram message arrived, which looked like total silence. That's not a
+platform failure to route around; it's an unactioned promise left in the
+transcript. The fix is a rule, not a retry:
+
+**A sentence describing an action is not a checkpoint.** If you write
+"fazendo X agora" / "let me update..." / "voltando com o resultado", the
+very next thing in that *same* response has to be the tool call that
+actually does X — never the end of your turn. Two cases:
+
+- **Still working yourself (your own Bash/tool calls, not a dispatch).**
+  Keep going in the same turn until the work is actually done, actually
+  blocked on something real, or you've explicitly armed a way back (below).
+  Don't stop on a narrating sentence with no tool call after it.
+- **Handed off to something async.** `run_agent_async` /
+  `run_workflow_async` / `run_monitor_async` (default `call_me_back=true`)
+  and `supervise()` (step 3 above) all guarantee your session gets
+  re-invoked when that thing finishes — safe to end a turn on, because the
+  *mechanism* is the way back, not a sentence.
+
+If you're doing multi-step work yourself and genuinely need to pause —
+mid-way through a sequence of shell commands that will take a while, or
+waiting on something with no run to hang a callback off — arm your own
+wake-up instead of trusting the next message to arrive:
+
+```
+schedule_wakeup(
+  delay_seconds=60,
+  prompt="Finish updating <app> and confirm the skill mirror is in sync — I was mid-way through this.",
+  reason="marketplace update + agent sync still pending",
+)
+```
+
+The platform re-invokes this exact conversation with `prompt` after
+`delay_seconds` (10s–24h, one pending wake-up per run), full context
+intact, reply delivered down the same Telegram channel. This is
+`agents_platform_runners`' own tool — not the CLI harness's built-in
+`ScheduleWakeup` (still honoured for backwards compatibility, but it can't
+report back if a sysadmin has blocked wake-ups on this session; prefer
+this one, and if it errors with "not allowed to Wake-up", say that to the
+user in the current turn instead of ending it expecting to return).
+`list_wakeups` shows what's already armed; `cancel_wakeup` before
+re-arming with a different delay.
+
+Three related-but-different "get woken up" tools now live in this skill —
+use the one that matches what you're actually waiting on: `supervise()`
+watches **another agent session's** chain go idle; `run_monitor_async`
+watches **a raw shell command** with no agent in it; `schedule_wakeup`
+wakes **your own session** on a plain timer, nothing being watched at all.
+
 ## Charts, diagrams, screenshots
 
 This workspace has no presentation-sharing MCP tool wired up by

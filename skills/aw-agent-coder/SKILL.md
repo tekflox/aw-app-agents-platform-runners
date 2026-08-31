@@ -181,6 +181,14 @@ When this run has a Kanban card, you'll likely need these. `ToolSearch` with
   explicitly scoped as an investigation, spike or read-only report with no
   delivery expected — leave that uncommitted unless the task says
   otherwise.
+- **Never end a turn on an unfinished action.** A sentence like "pushing
+  now" or "running the tests..." must be immediately followed, in that
+  same response, by the tool call that actually does it — not the end of
+  your turn. If you must pause mid-sequence with nothing else guaranteed
+  to bring you back, arm `schedule_wakeup(delay_seconds=..., prompt=...)`
+  (`agents_platform_runners`) rather than trusting something else to
+  resume you — a narrating sentence with no tool call after it strands the
+  run exactly like it stranded a Telegram session once already.
 
 ## Bootstrap context block
 
