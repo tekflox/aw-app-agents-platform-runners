@@ -89,11 +89,30 @@ Two things follow from that:
   you shipped something short of that rather than silently calling it done.
 - **Deploy the latest code yourself before handing off for review.** Don't
   leave "someone still needs to deploy this" as an implicit follow-up. If
-  the repo has a CI/CD pipeline, push and let it run (and watch it — a
-  green push you didn't verify isn't verified). If it doesn't have one yet
-  and needs one for this kind of change to ever be reviewable, that's a
-  real finding — say so on the card rather than working around the gap by
-  hand every time.
+  the repo has a CI/CD pipeline, push and let it run — and watch it, a green
+  push you didn't verify isn't verified. Don't poll for that by hand: wrap
+  the wait in `run_monitor_async` and get woken on the exit code instead —
+
+  ```
+  run_monitor_async(
+    command="gh run watch <run-id> --exit-status",   # or your repo's own CI-wait command
+    target_slug="<this task's target>",
+    cwd="repos/<repo>",                              # relative to the workspace root
+    label="CI: <repo> deploy",
+  )
+  # → {run_id, session_id, ...}
+  ```
+
+  `call_me_back` defaults to `true`, so your session is automatically
+  re-invoked with the exit code and an output tail once CI finishes — no
+  LLM burned sitting in a polling loop. Pull the full log if you need it
+  with `get_run_artefact(run_id, name="monitor_output")`. Don't sign off as
+  deployed until that exit code is actually 0 — a push you fired and walked
+  away from is not verified.
+
+  If the repo doesn't have a CI/CD pipeline yet and needs one for this kind
+  of change to ever be reviewable, that's a real finding — say so on the
+  card rather than working around the gap by hand every time.
 
 If you touched or added tests, also confirm the pipeline actually **runs**
 them — a test file that passes when you invoke it manually but sits outside

@@ -384,6 +384,37 @@ reason to re-dispatch to `coder-opus` instead of trying `coder-sonnet`
 again. There's no field on the card that tracks this; hold it in your own
 read of the conversation.
 
+### 6. Watching a CI/CD pipeline directly — `run_monitor_async`
+
+`supervise()` (step 3) watches **agent sessions** — it has nothing to say
+about a raw shell command like a CI run or a deploy script that isn't an
+agent at all. For that, use `run_monitor_async` instead: it runs the
+command in its own isolated container, no LLM in the loop, and wakes your
+session with the exit code when it's done — same "no polling" property as
+`supervise`, different thing being watched.
+
+Reach for it when: you (or a coder you dispatched) kicked off a CI/CD run
+and you want to know when it goes green, or the user directly asks you to
+run something long and tell them when it finishes ("kick off the deploy
+and let me know").
+
+```
+run_monitor_async(
+  command="gh run watch <run-id> --exit-status",   # or whatever the repo's CI-wait command is
+  target_slug="<the delivery's target>",
+  cwd="repos/<repo>",                              # relative to the workspace root
+  label="CI: <repo> deploy",
+)
+# → {run_id, session_id, ...}
+```
+
+`call_me_back` defaults to `true` — you don't call anything else to arm the
+wakeup. When it finishes you're re-invoked with the exit code and a short
+output tail; pull the full log with
+`get_run_artefact(run_id, name="monitor_output")` if you need more than the
+tail before reporting back to the user. Same tool a Coder you dispatched
+uses to watch its own push's CI run — see the `aw-agent-coder` skill.
+
 ## Quick reference
 
 | What you want | How |
