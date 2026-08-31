@@ -100,6 +100,12 @@ def _board_client() -> "kanban_dispatch.BoardClient":
 _TOKEN = os.environ.get("AGENTS_PLATFORM_TOKEN", "")
 AUTH_HEADERS = {"Authorization": f"Bearer {_TOKEN}"} if _TOKEN else {}
 
+# Last-successful /api/agents and /api/workflows payloads, used by _list_tools()
+# to keep the dynamic agent_<slug>/workflow_<slug> runners around (stale but
+# present) across an AP-MT outage instead of dropping them from tools/list.
+_LAST_GOOD_AGENTS: list[dict] = []
+_LAST_GOOD_WORKFLOWS: list[dict] = []
+
 INSTRUCTIONS = """\
 You are connected to the **Agents Platform** — a local control plane for
 defining, running and observing AI agents + multi-agent workflows.
@@ -313,9 +319,19 @@ def _target_patch_schema() -> dict:
 @server.list_tools()
 async def _list_tools() -> list[Tool]:
     _ensure_running()
-    async with httpx.AsyncClient(timeout=10, headers=AUTH_HEADERS) as c:
-        agents = (await c.get(f"{BASE}/api/agents")).json()
-        workflows = (await c.get(f"{BASE}/api/workflows")).json()
+    global _LAST_GOOD_AGENTS, _LAST_GOOD_WORKFLOWS
+    try:
+        async with httpx.AsyncClient(timeout=10, headers=AUTH_HEADERS) as c:
+            agents = (await c.get(f"{BASE}/api/agents")).json()
+            workflows = (await c.get(f"{BASE}/api/workflows")).json()
+        _LAST_GOOD_AGENTS, _LAST_GOOD_WORKFLOWS = agents, workflows
+    except Exception:
+        # AP-MT hiccup (restart/deploy blip): fall back to the last-known-good
+        # dynamic runners instead of taking down the ENTIRE ~149-tool namespace —
+        # the static tools below don't need `agents`/`workflows` at all, and a
+        # stale agent_<slug>/workflow_<slug> just fails at call time (retryable)
+        # rather than vanishing from tools/list.
+        agents, workflows = _LAST_GOOD_AGENTS, _LAST_GOOD_WORKFLOWS
 
     static: list[Tool] = [
         # ----- discovery -----
