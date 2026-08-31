@@ -12,8 +12,8 @@ it stopped) — deciding whether that's good or bad is on the calling agent.
 ## The 4 tools
 
 ```
-supervise(session_id, forever=false) → {supervision_id, existing: bool}
-stop_supervisor(supervision_id | target_session_id | caller_session_id) → {ok, stopped:[ids], count}
+supervise(session_id, forever=false, debounce_s?) → {supervision_id, existing: bool}
+stop_supervisor(supervision_id | target_session_id | notion_task_id | caller_session_id) → {ok, stopped:[ids], count}
 supervisor_status(supervision_id?)
   → without arg: your own supervisions [{supervision_id, target_session_id, status, forever, wakeup_count}]
   → with arg: full detail {status, edge_state, discovered, last_activity_at, idle_since, stop_reason, wakeups}
@@ -46,6 +46,7 @@ telegram-opus" without a second lookup.
 |---|---|
 | `supervision_id` | that one supervision (the original form) |
 | `target_session_id` | every armed supervision WATCHING that session |
+| `notion_task_id` | every armed supervision watching that CARD |
 | `caller_session_id` | every armed supervision that session ARMED |
 
 The session forms exist because the id is precisely what a third party

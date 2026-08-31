@@ -82,7 +82,7 @@ user never touches raw code either. They watch it live in a browser tab
 
 ## Tool reference — MCP `aw-ux-proto`
 
-Load with `ToolSearch query="select:mcp__aw-gateway__aw_ux_proto__<name>"`
+Load with `ToolSearch query="select:mcp__aw-gateway__aw__aw_ux_proto__<name>"`
 before calling if not already available.
 
 ### Project lifecycle
