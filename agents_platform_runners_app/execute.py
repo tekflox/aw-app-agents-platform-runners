@@ -387,10 +387,31 @@ def _sync_home_creds_into_workspace(real_home: Path, spec: dict) -> None:
             log.warning("execute: creds resync %s -> %s failed", src, dst, exc_info=True)
 
 
+def _git_creds_volumes() -> dict[str, dict]:
+    """Read-only gh/git creds volumes mirrored by aw-app-git's
+    ``gh_auth.py._sync_creds_to_data_dir()`` into ``GIT_CREDS_REL``, if
+    present — same shape the pre-decoupling agents-platform host-path mount
+    used (``data/home/.gitconfig`` + ``.config/gh``, executor.py's
+    ``_perm_volumes["github"]``). Shared by the CLI-agent path (gated on the
+    Agent Config's "GitHub / Git" permission, see ``_build_container_kwargs``
+    below) and the raw monitor-run path (unconditional, see
+    ``_build_raw_kwargs``) so the mount logic and its ``.is_dir()``/
+    ``.is_file()`` guards exist in exactly one place."""
+    volumes: dict[str, dict] = {}
+    git_config_gh = Path(WORKSPACE_CONTAINER_DIR) / GIT_CREDS_REL / "config-gh"
+    git_gitconfig = Path(WORKSPACE_CONTAINER_DIR) / GIT_CREDS_REL / "gitconfig"
+    host = WORKSPACE_HOST_DIR.rstrip("/")
+    if git_config_gh.is_dir():
+        volumes[f"{host}/{GIT_CREDS_REL}/config-gh"] = {"bind": "/home/ubuntu/.config/gh", "mode": "ro"}
+    if git_gitconfig.is_file():
+        volumes[f"{host}/{GIT_CREDS_REL}/gitconfig"] = {"bind": "/home/ubuntu/.gitconfig", "mode": "ro"}
+    return volumes
+
+
 def _build_raw_kwargs(job: dict) -> tuple[str, list[str], dict]:
     """(image, command_argv, docker-SDK run kwargs) for a "monitor run" job —
-    a raw ``bash -lc "<command>"`` with NO CLI agent, no credentials, no MCP
-    config, no session. The counterpart of ``_build_container_kwargs`` for
+    a raw ``bash -lc "<command>"`` with NO CLI agent, no MCP config, no
+    session. The counterpart of ``_build_container_kwargs`` for
     agents-platform-multitenant's ``core.monitor_run.py``, which used to
     spawn this itself via ``docker run`` against ITS OWN bare-metal daemon —
     the wrong host, since ``/opt/aw-workspace`` there is a stale stub, not
@@ -422,6 +443,12 @@ def _build_raw_kwargs(job: dict) -> tuple[str, list[str], dict]:
     # Config to carry that permission through in the first place.
     if WORKSPACE_HOST_DIR:
         volumes[WORKSPACE_HOST_DIR.rstrip("/")] = {"bind": "/opt/aw-workspace", "mode": "rw"}
+    # Same reasoning applies to gh/git creds: a monitor run has no Agent
+    # Config to carry the "GitHub / Git" permission through in the first
+    # place, and it already receives the whole workspace (where the mirrored
+    # creds themselves live) rw — the mount only puts them where `gh`/`git`
+    # know to look. Unconditional, same as the workspace mount above.
+    volumes.update(_git_creds_volumes())
 
     kwargs: dict[str, Any] = {
         "name": f"aw-runner-monitor-{run_id[:12]}",
@@ -705,12 +732,7 @@ def _build_container_kwargs(job: dict) -> tuple[str, list[str], dict, str | None
     # container has no legitimate reason to write back into the credential
     # aw-app-git's own login flow owns.
     if _perms.get("github"):
-        _git_config_gh = Path(WORKSPACE_CONTAINER_DIR) / GIT_CREDS_REL / "config-gh"
-        _git_gitconfig = Path(WORKSPACE_CONTAINER_DIR) / GIT_CREDS_REL / "gitconfig"
-        if _git_config_gh.is_dir():
-            _mount(f"{GIT_CREDS_REL}/config-gh", "/home/ubuntu/.config/gh", ro=True)
-        if _git_gitconfig.is_file():
-            _mount(f"{GIT_CREDS_REL}/gitconfig", "/home/ubuntu/.gitconfig", ro=True)
+        volumes.update(_git_creds_volumes())
 
     # Workspace root mount — found live 2026-08-02: nothing above actually
     # mounted anything AT a container path named "aw-workspace" (creds go to

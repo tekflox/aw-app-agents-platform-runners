@@ -25,8 +25,12 @@ from agents_platform_runners_app import execute as execute_mod  # noqa: E402
 from agents_platform_runners_app.routes import build_routes  # noqa: E402
 
 
-def test_build_raw_kwargs_starts_bash_under_the_identity_mapped_workspace(monkeypatch):
+def test_build_raw_kwargs_starts_bash_under_the_identity_mapped_workspace(tmp_path, monkeypatch):
     monkeypatch.setattr(execute_mod, "WORKSPACE_HOST_DIR", "/home/aw-remote-host/aw-workspace")
+    # No mirrored git creds under here — isolates this test's exact-volumes
+    # assertion from whatever aw-app-git happens to have mirrored on the
+    # real host the tests run on (see the git-creds tests below).
+    monkeypatch.setattr(execute_mod, "WORKSPACE_CONTAINER_DIR", str(tmp_path))
     monkeypatch.setattr(execute_mod, "REGISTRY", "ghcr.io")
     monkeypatch.setattr(execute_mod, "IMAGE_PREFIX", "fredericowu/aw-sandbox-agent-cli")
     monkeypatch.setattr(execute_mod, "DEFAULT_TAG", "latest")
@@ -56,12 +60,46 @@ def test_build_raw_kwargs_starts_bash_under_the_identity_mapped_workspace(monkey
     assert kwargs["remove"] is False
 
 
-def test_build_raw_kwargs_defaults_to_the_workspace_root_with_no_cwd(monkeypatch):
+def test_build_raw_kwargs_defaults_to_the_workspace_root_with_no_cwd(tmp_path, monkeypatch):
     monkeypatch.setattr(execute_mod, "WORKSPACE_HOST_DIR", "/home/aw-remote-host/aw-workspace")
+    monkeypatch.setattr(execute_mod, "WORKSPACE_CONTAINER_DIR", str(tmp_path))
 
     _, _, kwargs = execute_mod._build_raw_kwargs({"run_id": "abc123", "raw_command": "ls"})
 
     assert kwargs["working_dir"] == "/opt/aw-workspace"
+
+
+def test_build_raw_kwargs_mounts_git_creds_read_only_when_mirrored(tmp_path, monkeypatch):
+    """A monitor run has no Agent Config, hence no `permissions.github` to
+    gate on (Kanban card agents-platform:monitor-run-no-git-creds-mount) —
+    it mounts the same aw-app-git-mirrored creds the CLI-agent path does,
+    unconditionally, since it already receives the whole workspace rw."""
+    monkeypatch.setattr(execute_mod, "WORKSPACE_HOST_DIR", "/home/aw-remote-host/aw-workspace")
+    monkeypatch.setattr(execute_mod, "WORKSPACE_CONTAINER_DIR", str(tmp_path))
+    git_dir = tmp_path / execute_mod.GIT_CREDS_REL
+    (git_dir / "config-gh").mkdir(parents=True)
+    (git_dir / "config-gh" / "hosts.yml").write_text("github.com:\n  oauth_token: abc\n")
+    (git_dir / "gitconfig").write_text("[user]\n\tname = octocat\n")
+
+    _, _, kwargs = execute_mod._build_raw_kwargs({"run_id": "abc123", "raw_command": "gh auth status"})
+
+    gh_src = f"/home/aw-remote-host/aw-workspace/{execute_mod.GIT_CREDS_REL}/config-gh"
+    gitconfig_src = f"/home/aw-remote-host/aw-workspace/{execute_mod.GIT_CREDS_REL}/gitconfig"
+    assert kwargs["volumes"][gh_src] == {"bind": "/home/ubuntu/.config/gh", "mode": "ro"}
+    assert kwargs["volumes"][gitconfig_src] == {"bind": "/home/ubuntu/.gitconfig", "mode": "ro"}
+
+
+def test_build_raw_kwargs_mounts_no_git_creds_when_never_mirrored(tmp_path, monkeypatch):
+    """aw-app-git never logged in (or was uninstalled) — must not crash,
+    must not mount a nonexistent source."""
+    monkeypatch.setattr(execute_mod, "WORKSPACE_HOST_DIR", "/home/aw-remote-host/aw-workspace")
+    monkeypatch.setattr(execute_mod, "WORKSPACE_CONTAINER_DIR", str(tmp_path))
+
+    _, _, kwargs = execute_mod._build_raw_kwargs({"run_id": "abc123", "raw_command": "echo hi"})
+
+    assert kwargs["volumes"] == {
+        "/home/aw-remote-host/aw-workspace": {"bind": "/opt/aw-workspace", "mode": "rw"}
+    }
 
 
 def test_build_container_kwargs_branches_to_raw_before_touching_cli_specs(monkeypatch):
