@@ -14,6 +14,8 @@ import json
 import sys
 from pathlib import Path
 
+import pytest
+
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
@@ -81,6 +83,120 @@ def test_a_missing_mcp_json_degrades_instead_of_failing_the_install(tmp_path):
 def test_an_entry_with_no_url_is_skipped(tmp_path):
     path = _mcp_json(tmp_path, servers={"aw-gateway": {"type": "http"}})
     assert ap.resolve_mcp_servers(["aw-gateway"], config_path=path) == {}
+
+
+# --- scoped profiles ---------------------------------------------------------
+#
+# The dict form names a SCOPED slice of the gateway (one of its own named
+# configs) without putting the bearer token in a public manifest: the server
+# entry is resolved exactly as above and the profile is appended to its path.
+
+
+def test_a_profile_is_appended_to_the_server_s_path(tmp_path):
+    got = ap.resolve_mcp_servers(
+        [{"name": "crispal", "server": "aw-gateway", "profile": "crispal-full"}],
+        config_path=_mcp_json(tmp_path),
+    )
+    assert got["crispal"]["url"] == "http://aw-app-mcp-gateway:9200/mcp/crispal-full"
+    assert got["crispal"]["headers"] == {"Authorization": TOKEN}
+
+
+def test_the_resolved_key_is_the_local_name_not_the_server_name(tmp_path):
+    """Renaming this key renames every tool the agent sees (mcp__<key>__*)."""
+    got = ap.resolve_mcp_servers(
+        [{"name": "crispal", "server": "aw-gateway", "profile": "crispal-full"}],
+        config_path=_mcp_json(tmp_path),
+    )
+    assert list(got) == ["crispal"]
+
+
+def test_the_key_falls_back_to_the_profile_then_the_server(tmp_path):
+    path = _mcp_json(tmp_path)
+    assert list(ap.resolve_mcp_servers(
+        [{"server": "aw-gateway", "profile": "crispal-full"}], config_path=path)) \
+        == ["crispal-full"]
+    assert list(ap.resolve_mcp_servers([{"server": "aw-gateway"}], config_path=path)) \
+        == ["aw-gateway"]
+
+
+def test_server_defaults_to_the_gateway(tmp_path):
+    got = ap.resolve_mcp_servers([{"name": "c", "profile": "crispal-full"}],
+                                 config_path=_mcp_json(tmp_path))
+    assert got["c"]["url"] == "http://aw-app-mcp-gateway:9200/mcp/crispal-full"
+
+
+def test_a_dict_without_a_profile_matches_the_string_form(tmp_path):
+    path = _mcp_json(tmp_path)
+    assert ap.resolve_mcp_servers([{"server": "aw-gateway"}], config_path=path) \
+        == ap.resolve_mcp_servers(["aw-gateway"], config_path=path)
+
+
+def test_the_url_override_applies_to_the_base_and_the_profile_follows(tmp_path):
+    """One knob still moves every by-reference config, scoped or not."""
+    got = ap.resolve_mcp_servers(
+        [{"name": "crispal", "server": "aw-gateway", "profile": "crispal-full"}],
+        config_path=_mcp_json(tmp_path),
+        url_overrides={"aw-gateway": "http://172.18.0.1:9200/mcp"},
+    )
+    assert got["crispal"]["url"] == "http://172.18.0.1:9200/mcp/crispal-full"
+
+
+def test_a_trailing_slash_on_the_base_does_not_double_up(tmp_path):
+    path = _mcp_json(tmp_path, servers={"aw-gateway": {
+        "type": "http", "url": "http://aw-app-mcp-gateway:9200/mcp/"}})
+    got = ap.resolve_mcp_servers([{"name": "c", "profile": "crispal-full"}],
+                                 config_path=path)
+    assert got["c"]["url"] == "http://aw-app-mcp-gateway:9200/mcp/crispal-full"
+
+
+def test_a_scoped_entry_with_an_unknown_server_is_skipped_not_raised(tmp_path):
+    got = ap.resolve_mcp_servers([{"name": "c", "server": "nope", "profile": "p"}],
+                                 config_path=_mcp_json(tmp_path))
+    assert got == {}
+
+
+def test_a_malformed_entry_is_skipped_not_raised(tmp_path):
+    path = _mcp_json(tmp_path)
+    assert ap.resolve_mcp_servers([None, 7, "", ["aw-gateway"]], config_path=path) == {}
+    # An empty dict is not malformed — every field defaults, so it means the
+    # gateway, unscoped, exactly like the string form.
+    assert list(ap.resolve_mcp_servers([{}], config_path=path)) == ["aw-gateway"]
+
+
+def test_a_scoped_expansion_is_still_marked_by_reference(tmp_path):
+    """The whole point of the card: _refresh_credentials re-asserts it, so a
+    hard-delete + reseed converges on the right scope instead of the wrong one."""
+    out = ap.apply_mcp_references(
+        _spec(mcp_servers=[{"name": "crispal", "server": "aw-gateway",
+                            "profile": "crispal-full"}]),
+        config_path=_mcp_json(tmp_path),
+    )
+    cfg = out["agent_configs"][0]
+    assert cfg["_mcp_by_reference"] is True
+    assert cfg["_mcp_scoped"] == ["crispal"]
+    assert cfg["mcp_config"]["servers"]["crispal"]["url"].endswith("/mcp/crispal-full")
+
+
+def test_an_unscoped_expansion_carries_no_scoped_marker(tmp_path):
+    out = ap.apply_mcp_references(_spec(), config_path=_mcp_json(tmp_path))
+    assert "_mcp_scoped" not in out["agent_configs"][0]
+
+
+def test_the_probe_never_raises_on_an_unreachable_profile(tmp_path):
+    """A seed must survive a gateway that is down, a DNS name that does not
+    resolve, or anything else the probe trips over."""
+    spec = ap.apply_mcp_references(
+        _spec(mcp_servers=[{"name": "crispal", "profile": "crispal-full"}]),
+        config_path=_mcp_json(tmp_path),
+        url_overrides={"aw-gateway": "http://127.0.0.1:1/mcp"},
+    )
+    ap.probe_scoped_profiles(spec, timeout=0.05)
+
+
+def test_the_probe_ignores_unscoped_entries(tmp_path, monkeypatch):
+    monkeypatch.setattr(ap.httpx, "post", lambda *a, **k: pytest.fail("probed"))
+    ap.probe_scoped_profiles(ap.apply_mcp_references(
+        _spec(), config_path=_mcp_json(tmp_path)))
 
 
 # --- spec expansion ----------------------------------------------------------

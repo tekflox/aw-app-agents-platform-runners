@@ -172,6 +172,9 @@ class AgentProvisioner:
         # before anything is POSTed — see apply_mcp_references below for why
         # the credential is resolved here and not carried in the manifest.
         spec = apply_mcp_references(spec, url_overrides=self.mcp_url_overrides)
+        # A profile the gateway doesn't have 404s per request and leaves the
+        # agent with zero tools, silently. Ask once; log; never block.
+        probe_scoped_profiles(spec)
         if not self.base or not self.token:
             log.warning(
                 "agent seeding skipped for %s: agents_platform_base/"
@@ -479,30 +482,73 @@ def _payload(kind: str, entry: dict[str, Any], allowed: frozenset[str]) -> dict[
 # "``.mcp.json`` at the repo root is the canonical config"), which the
 # gateway app already writes itself on boot — so a freshly created workspace
 # resolves correctly with nothing pasted by hand, which was the whole point.
+#
+# An app that needs a SCOPED slice of the gateway rather than all of it says
+# so with the dict form::
+#
+#     "mcp_servers": [
+#       {"name": "crispal", "server": "aw-gateway", "profile": "crispal-full"}
+#     ]
+#
+# which resolves the ``aw-gateway`` entry exactly as above and then appends
+# the profile to its path (``.../mcp`` -> ``.../mcp/crispal-full``), storing
+# it locally under ``name``. The gateway's ``/mcp/{name}`` route resolves a
+# named config per request, and the profile NAME is not a secret — it is
+# already visible in the gateway's own Settings UI — so this keeps the
+# by-reference guarantee intact: only the credential stays behind.
 
 #: Where the workspace's canonical MCP config lives.
 MCP_CONFIG_PATH = os.path.join(
     os.environ.get("AW_WORKSPACE_CONTAINER_DIR", "/opt/aw-workspace"), ".mcp.json"
 )
 
+#: The server a dict-form reference means when it doesn't say.
+DEFAULT_MCP_SERVER = "aw-gateway"
+
+
+def _mcp_reference(ref: Any) -> tuple[str, str, str] | None:
+    """Normalise one ``mcp_servers`` entry into ``(server, profile, key)``.
+
+    A plain string is the original form: a server named in ``.mcp.json``,
+    no profile, stored locally under that same name. A dict may also name a
+    scoped profile and the local key to store it under. ``server`` defaults
+    to the gateway and ``key`` to the profile (or the server when there is
+    none), so a dict *without* a profile resolves identically to the string
+    form. Anything else is malformed and yields ``None``.
+    """
+    if isinstance(ref, str):
+        return (ref, "", ref) if ref else None
+    if not isinstance(ref, dict):
+        return None
+    server = str(ref.get("server") or DEFAULT_MCP_SERVER)
+    profile = str(ref.get("profile") or "")
+    key = str(ref.get("name") or profile or server)
+    return (server, profile, key) if server and key else None
+
 
 def resolve_mcp_servers(
-    names: list[str], *, url_overrides: dict[str, str] | None = None,
+    names: list[Any], *, url_overrides: dict[str, str] | None = None,
     config_path: str | None = None,
 ) -> dict[str, dict[str, Any]]:
     """Turn ``["aw-gateway"]`` into the servers dict an AgentConfig stores.
 
-    Unknown names, an unreadable ``.mcp.json`` and a missing entry all
-    resolve to "not included" rather than raising: a contributed agent that
-    comes up without its gateway is degraded, while an app that refuses to
-    install is broken. Each omission is logged — this is precisely the kind
-    of gap that otherwise shows up as an agent mysteriously having no tools.
+    Entries are either a plain server name or the dict form documented
+    above (``{"name", "server", "profile"}``) for a scoped gateway profile.
+
+    Unknown names, a malformed entry, an unreadable ``.mcp.json`` and a
+    missing entry all resolve to "not included" rather than raising: a
+    contributed agent that comes up without its gateway is degraded, while
+    an app that refuses to install is broken. Each omission is logged — this
+    is precisely the kind of gap that otherwise shows up as an agent
+    mysteriously having no tools.
 
     ``url_overrides`` exists because the URL in ``.mcp.json`` is written for
     THIS container's network view (``http://aw-app-mcp-gateway:9200/mcp``),
     and a spawned agent container sits in a different one, where that name
     does not resolve. The token is identical in both; only the address
-    differs, so the address is the one thing configurable.
+    differs, so the address is the one thing configurable. It keys on the
+    BASE server name and the profile is appended to whatever it returns, so
+    one setting still moves every by-reference config, scoped or not.
     """
     resolved: dict[str, dict[str, Any]] = {}
     if not names:
@@ -519,7 +565,15 @@ def resolve_mcp_servers(
         return resolved
 
     overrides = url_overrides or {}
-    for name in names:
+    for ref in names:
+        parsed = _mcp_reference(ref)
+        if parsed is None:
+            log.warning(
+                "malformed mcp_servers entry %r — the agent config declaring "
+                "it will be seeded without it", ref,
+            )
+            continue
+        name, profile, key = parsed
         entry = servers.get(name)
         if not isinstance(entry, dict) or not entry.get("url"):
             log.warning(
@@ -527,14 +581,79 @@ def resolve_mcp_servers(
                 "declaring it will be seeded without it", name, path,
             )
             continue
+        url = overrides.get(name) or entry["url"]
+        if profile:
+            url = f"{url.rstrip('/')}/{profile}"
         server = {
             "type": entry.get("type") or "streamable-http",
-            "url": overrides.get(name) or entry["url"],
+            "url": url,
         }
         if entry.get("headers"):
             server["headers"] = dict(entry["headers"])
-        resolved[name] = server
+        resolved[key] = server
     return resolved
+
+
+#: A minimal MCP handshake — enough for the gateway to answer 200 or 404.
+_MCP_INITIALIZE = {
+    "jsonrpc": "2.0",
+    "id": 1,
+    "method": "initialize",
+    "params": {
+        "protocolVersion": "2025-06-18",
+        "capabilities": {},
+        "clientInfo": {"name": "aw-app-agents-platform-runners", "version": "1"},
+    },
+}
+
+
+def probe_scoped_profiles(spec: dict[str, Any], *, timeout: float = 2.0) -> None:
+    """Ask each scoped profile URL once whether it exists, and log if not.
+
+    A typo'd profile is not a soft failure. ``POST /mcp/nope-not-a-profile``
+    answers HTTP 404 ``{"error": "No such config: ..."}``, so the agent's MCP
+    client registers ZERO tools, the run continues normally, and nothing
+    anywhere reports it — the exact silent degradation the by-reference form
+    exists to prevent. One cheap ``initialize`` per distinct scoped URL turns
+    that into a line someone can find.
+
+    Never blocks and never fails a seed: short timeout, every exception
+    swallowed. Deliberately NOT called from ``apply_mcp_references`` so
+    resolution stays pure and its tests stay offline.
+    """
+    seen: set[str] = set()
+    for kind in ("agent_configs", "agents"):
+        for entry in spec.get(kind) or []:
+            if not isinstance(entry, dict):
+                continue
+            servers = ((entry.get("mcp_config") or {}).get("servers") or {})
+            for key in entry.get("_mcp_scoped") or ():
+                server = servers.get(key)
+                if not isinstance(server, dict) or server["url"] in seen:
+                    continue
+                seen.add(server["url"])
+                _probe_one(entry.get("slug") or "?", key, server, timeout)
+
+
+def _probe_one(slug: str, key: str, server: dict[str, Any], timeout: float) -> None:
+    """One handshake. Swallows everything — see probe_scoped_profiles."""
+    url = server["url"]
+    try:
+        headers = dict(server.get("headers") or {})
+        headers.setdefault("Accept", "application/json, text/event-stream")
+        resp = httpx.post(url, json=_MCP_INITIALIZE, headers=headers, timeout=timeout)
+        if resp.status_code != 200:
+            log.warning(
+                "scoped MCP profile for %r (server %r) answered HTTP %s at %s — "
+                "that agent will start with ZERO tools; check the profile name "
+                "against the gateway's scoped endpoints",
+                slug, key, resp.status_code, url,
+            )
+    except Exception as exc:  # noqa: BLE001 — a probe must never fail a seed
+        log.warning(
+            "could not reach the scoped MCP profile for %r (server %r) at %s: "
+            "%s — seeded anyway, unverified", slug, key, url, exc,
+        )
 
 
 def apply_mcp_references(
@@ -570,6 +689,14 @@ def apply_mcp_references(
                 # exists. Stripped before the POST by _payload (it is not in
                 # any kind's allowed set), so it never reaches the platform.
                 new["_mcp_by_reference"] = True
+                # Which of the resolved keys named a gateway profile, for
+                # probe_scoped_profiles. Same underscore-key contract.
+                scoped = [
+                    key for _, profile, key in filter(None, map(_mcp_reference, names))
+                    if profile and key in servers
+                ]
+                if scoped:
+                    new["_mcp_scoped"] = scoped
             expanded.append(new)
         out[kind] = expanded
     return out
