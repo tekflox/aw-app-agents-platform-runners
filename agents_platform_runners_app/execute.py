@@ -1134,9 +1134,10 @@ def _build_warm_kwargs_claude(job: dict, epoch_hash: str, redis_url: str) -> tup
     permissions — the cold path's `_build_container_kwargs` (see its own
     comment above the skip-permissions block) wires all of these into its
     `argv`, but this function built `claude_argv` from scratch and never
-    picked them up. Turn 1 of a session is always cold (no session_id yet
-    to key a warm container on — see `_run_job_blocking`), so the flags
-    silently vanishing only showed up starting turn 2, e.g.
+    picked them up. Turn 1 of a session was still always cold back then (no
+    session_id yet to key a warm container on — `mint_warm_session_id` only
+    arrived 2026-08-14), so the flags silently vanishing only showed up
+    starting turn 2, e.g.
     --dangerously-skip-permissions missing meant Claude Code's interactive
     permission gate kicked in for real on a supposedly-unattended runner
     ("This command requires approval") — found live 2026-08-11.
