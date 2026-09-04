@@ -25,6 +25,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
 import sys
 from typing import Any
 
@@ -1778,6 +1779,43 @@ def _err(status: int, text: str) -> list[TextContent]:
                         text=json.dumps({"error": True, "status": status, "message": text}, indent=2))]
 
 
+# Structural UUID shape only — 36 chars, 5 hyphenated hex groups (8-4-4-4-12).
+# Deliberately does NOT constrain the version/variant nibble: live session ids
+# include v4 (the common case), v7 (Codex mints these), and v3. A "canonical"
+# regex pinning the version to [1-5] would reject every Codex-backed session.
+_SESSION_ID_RE = re.compile(
+    r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+)
+# What a run_id looks like by default (uuid4().hex) — used only to make the
+# error message useful, never to validate a run_id itself: run ids minted by
+# api/telegram.py are hyphenated UUIDs too, so this is not a reliable format.
+_RUN_ID_HEX32_RE = re.compile(r"^[0-9a-fA-F]{32}$")
+
+
+def _session_id_format_error(value: str) -> list[TextContent] | None:
+    """400 (via ``_err``) if ``value`` isn't a canonical UUID session_id, else None.
+
+    Catches the exact mix-up that motivated this check: a ``run_id`` (32 hex
+    chars, no hyphens) passed where a ``session_id`` was expected. Before
+    this, that reached the backend, failed to resolve, and got handed to
+    ``claude --session-id <hex32>`` — which the CLI rejects — only after a
+    full async dispatch/run/callback cycle had already run. Catching the
+    shape here turns that into an immediate, synchronous error instead.
+    """
+    if _SESSION_ID_RE.match(value):
+        return None
+    looks_like_run_id = bool(_RUN_ID_HEX32_RE.match(value))
+    hint = (" That looks like a `run_id` (32 hex chars, no hyphens)."
+            if looks_like_run_id else "")
+    return _err(400, (
+        f"session_id must be a canonical UUID (36 chars, 8-4-4-4-12, hyphenated) "
+        f"— got `{value}`.{hint} They are different ids: a `run_id` names one run "
+        f"(`run_status`/`get_run`), a `session_id` names a conversation you can "
+        f"resume. Get a session_id from `list_sessions`, from `run_status(run_id)` "
+        f"on a finished run, or from `$AW_SESSION_ID` for your own."
+    ))
+
+
 async def _enrich_warm_containers(c, payload: dict) -> None:
     """Translate each warm container's session_id into what agents-platform
     knows about that session, in place.
@@ -2047,6 +2085,8 @@ async def _call_tool(name: str, arguments: dict[str, Any] | None) -> list[TextCo
             if args.get("target_slug"):
                 body["target_slug"] = args["target_slug"]
             if args.get("session_id"):
+                if (err := _session_id_format_error(args["session_id"])) is not None:
+                    return err
                 body["session_id"] = args["session_id"]
             if args.get("notion_task_id"):
                 body["notion_task_id"] = args["notion_task_id"]
@@ -2255,6 +2295,8 @@ async def _call_tool(name: str, arguments: dict[str, Any] | None) -> list[TextCo
             session_id = args.get("session_id")
             if not session_id:
                 return _err(400, "session_id is required")
+            if (err := _session_id_format_error(session_id)) is not None:
+                return err
             r = await c.post(f"{BASE}/api/supervisions",
                              json={"caller_run_id": own_run_id, "target_session_id": session_id,
                                    "forever": bool(args.get("forever")), "debounce_s": args.get("debounce_s")})
