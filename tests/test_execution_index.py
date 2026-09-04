@@ -120,7 +120,7 @@ def test_dead_kb_is_fail_open_after_run_fetch():
         transport=httpx.MockTransport(handler)) is False
 
 
-def test_start_is_daemon_and_raw_monitor_is_skipped(monkeypatch):
+def test_start_is_daemon(monkeypatch):
     idx.configure({"execution_index_mode": "interesting"})
     called = []
     monkeypatch.setattr(idx, "index_run", lambda run_id: called.append(run_id))
@@ -128,7 +128,6 @@ def test_start_is_daemon_and_raw_monitor_is_skipped(monkeypatch):
     thread.join(timeout=1)
     assert thread.daemon is True
     assert called == ["run-1"]
-    assert idx.start("raw-1", raw_command=True) is None
 
 
 def test_interesting_mode_skips_short_run_without_tools_or_error():
@@ -146,6 +145,24 @@ def test_interesting_mode_skips_short_run_without_tools_or_error():
         "kb_base_url": "http://kb", "execution_index_mode": "interesting"},
         transport=httpx.MockTransport(handler)) is False
     assert posted == []
+
+
+def test_filter_modes_and_compact_cancelled_exclusions():
+    tool = [{"kind": "tool_call", "payload": {"name": "shell"}}]
+    assert idx._interesting(_run(input="/compact"), tool, "all") is False
+    assert idx._interesting(_run(initiator_kind="auto_compact"), tool, "all") is False
+    assert idx._interesting(_run(initiator_kind="pending_compact"), tool, "all") is False
+    assert idx._interesting(_run(status="cancelled", output=""), tool, "all") is False
+    assert idx._interesting(_run(status="success"), tool, "failures") is False
+    assert idx._interesting(_run(status="error", error="boom"), [], "failures") is True
+
+
+def test_error_metadata_is_redacted_and_bounded_on_every_chunk():
+    chunks = idx._chunks(_run(status="error", error="sk-1234567890abcdef" + "x" * 5000),
+                         [{"kind": "tool_call"}], False)
+    assert chunks
+    assert all(len(chunk["metadata"]["error"]) <= 500 for chunk in chunks)
+    assert all("sk-1234567890abcdef" not in chunk["metadata"]["error"] for chunk in chunks)
 
 
 def test_warm_stream_watcher_waits_for_done_then_indexes(monkeypatch):

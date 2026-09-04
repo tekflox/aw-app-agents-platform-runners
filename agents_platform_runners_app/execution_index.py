@@ -104,7 +104,9 @@ def _chunks(run: dict, events: list[dict], events_truncated: bool) -> list[dict]
         "tokens_out": run.get("tokens_out"),
         "started_at": run.get("started_at"),
         "ended_at": run.get("ended_at"),
-        "error": redact(_text(run.get("error") or "")),
+        # Metadata is duplicated on every chunk; cap it so one traceback
+        # cannot bypass the 12x1500-character retention budget.
+        "error": redact(_text(run.get("error") or ""))[:500],
         "tool_names": tool_names,
         "events_truncated": events_truncated,
     }
@@ -194,8 +196,8 @@ def index_run(run_id: str, *, config: dict | None = None,
         return False
 
 
-def start(run_id: str, *, raw_command: bool = False) -> threading.Thread | None:
-    if raw_command or str(_config.get("execution_index_mode") or "interesting") == "off":
+def start(run_id: str) -> threading.Thread | None:
+    if str(_config.get("execution_index_mode") or "interesting") == "off":
         return None
     try:
         thread = threading.Thread(target=index_run, args=(run_id,),
