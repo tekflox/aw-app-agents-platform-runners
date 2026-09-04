@@ -231,7 +231,151 @@ CLI_SPECS: dict[str, dict] = {
 STREAM_MAXLEN = 50_000
 STREAM_TTL_S = 86400
 
+# codex's own "thread/resume failed: no rollout found for thread id ...
+# (code -32600)" — confirmed (2026-09-04, card 3d15bf3b) to fire even when
+# the rollout .jsonl and its state_5.sqlite `threads` row are both fully
+# intact, under concurrent load from every codex process this runner
+# dispatches against the ONE shared $CODEX_HOME (_cli_home_rel above).
+#
+# The 5s figure below IS verifiable, unlike an earlier "busy_timeout=0" claim
+# floated on the card (that came from a Python sqlite3 connect-timeout probe,
+# which proves nothing about codex's own connection settings): codex-rs's
+# `open_read_write_pool` (codex-rs/state/src/sqlite.rs, upstream openai/codex,
+# checked live 2026-09-04) sets `.busy_timeout(Duration::from_secs(5))` on
+# every writable SQLite connection it opens, state_5.sqlite included, with no
+# retry beyond that single wait and no way to configure it from outside.
+#
+# What is NOT verified: whether contention on THIS pool is actually what
+# produces the "no rollout found" error for a fully-intact rollout — that
+# remains the leading hypothesis (matches the shape of upstream reports
+# openai/codex#20213 and #35555), not a confirmed root cause. Treat it as
+# such; the retry below is the mitigation because it is correct whether or
+# not the hypothesis holds, not because the cause is settled.
+#
+# Mirrors aw-warm-relay-codex.py's own
+# _ROLLOUT_ERROR_SIGNATURE/_MAX_RESUME_ATTEMPTS — duplicated rather than
+# imported because that file ships into a different container image and is
+# loaded by path, not as a package (see its own module docstring).
+_CODEX_ROLLOUT_ERROR_SIGNATURE = "no rollout found for thread id"
+_CODEX_ROLLOUT_MAX_ATTEMPTS = 3  # 1 initial + 2 retries
+_CODEX_ROLLOUT_RETRY_BACKOFF_S = (0.3, 0.6)
 
+
+def _stream_cold_attempt(container, r, run_id: str, codex_retryable: bool,
+                          is_last_attempt: bool = False) -> tuple[int, bool]:
+    """Stream one cold container's log output, publishing complete lines to
+    the run's Redis stream. Returns (returncode, contention_hit).
+
+    Lines are held back (not published) only while it is still undecided
+    whether this is a doomed codex rollout-contention attempt — the same
+    "peek before publishing" contract as aw-warm-relay-codex.py's own
+    _run_codex_turn. contention_hit is True only when EVERY line seen before
+    the process exited matched _CODEX_ROLLOUT_ERROR_SIGNATURE and the process
+    failed — the caller decides whether to retry; this function never
+    retries or respawns anything itself, so it needs no image/argv/kwargs.
+
+    `is_last_attempt` must be True whenever the caller is NOT going to retry
+    — the caller doesn't know contention_hit until this function returns, so
+    it passes "this is the last attempt I'm willing to make regardless of
+    outcome" up front. Without it, an exhausted-retries contention hit would
+    never be published at all: contention_hit alone stayed True on the final
+    attempt exactly like every prior one, and nothing downstream of this
+    function gets a second chance to flush what it withheld (caught live by
+    test_execute_codex_rollout_retry.py::test_retry_loop_gives_up_after_max_attempts,
+    2026-09-04 — the withheld error vanished instead of surfacing after
+    retries ran out).
+
+    A `codex_retryable=False` caller (any non-codex CLI) streams unbuffered
+    from the first line, byte for byte what this loop did before retry
+    support existed.
+    """
+    buf = ""
+    live = False
+    saw_signature = False
+    buffered_lines: list[str] = []
+    for raw in container.logs(stream=True, follow=True):
+        buf += raw.decode("utf-8", errors="replace")
+        while "\n" in buf:
+            line, buf = buf.split("\n", 1)
+            if not line.strip():
+                continue
+            if live:
+                _publish_line(r, run_id, line)
+                continue
+            if codex_retryable and _CODEX_ROLLOUT_ERROR_SIGNATURE in line:
+                saw_signature = True
+                buffered_lines.append(line)
+                continue
+            live = True
+            for held in buffered_lines:
+                _publish_line(r, run_id, held)
+            buffered_lines = []
+            _publish_line(r, run_id, line)
+    try:
+        status = container.wait()
+        returncode = int(status.get("StatusCode", 1)) if isinstance(status, dict) else int(status)
+    except Exception:
+        returncode = 0
+
+    contention_hit = not live and saw_signature and returncode != 0
+    if not contention_hit or is_last_attempt:
+        # Flush whatever never got published so a real failure is still
+        # visible, never silently swallowed — including a contention hit on
+        # the final attempt, once the caller has given up retrying it.
+        for held in buffered_lines:
+            _publish_line(r, run_id, held)
+        if buf.strip():
+            _publish_line(r, run_id, buf)
+    return returncode, contention_hit
+
+
+def _run_cold_agent_with_retry(client, image, kwargs: dict, container, run_id: str, r,
+                                codex_retryable: bool) -> int:
+    """Own the cold-path attempt loop: stream `container` (already spawned
+    by the caller for attempt 1), and on a codex rollout-contention hit
+    (_stream_cold_attempt) respawn a fresh container from the same
+    image/kwargs and try again, up to _CODEX_ROLLOUT_MAX_ATTEMPTS. Returns
+    the final returncode.
+
+    Reusing the same image/argv/kwargs on a retry is safe: a contention hit
+    means codex never got past its own resume lookup, so nothing was
+    appended to the rollout being resumed.
+
+    Non-codex jobs (`codex_retryable=False`) get exactly one attempt,
+    byte-for-byte the loop that existed before retry support did.
+    """
+    max_attempts = _CODEX_ROLLOUT_MAX_ATTEMPTS if codex_retryable else 1
+    returncode = 1
+    for attempt in range(1, max_attempts + 1):
+        if attempt > 1:
+            # The previous attempt's container already exited (self-removes,
+            # remove=True for a non-raw_command job).
+            backoff = _CODEX_ROLLOUT_RETRY_BACKOFF_S[
+                min(attempt - 2, len(_CODEX_ROLLOUT_RETRY_BACKOFF_S) - 1)]
+            log.warning("execute: run=%s hit codex rollout-contention on attempt %d/%d "
+                        "— respawning in %.1fs", run_id, attempt - 1, max_attempts, backoff)
+            time.sleep(backoff)
+            try:
+                container = client.containers.run(image, **kwargs)
+            except Exception as e:
+                log.exception("execute: retry spawn failed run=%s (attempt %d)", run_id, attempt)
+                _publish_line(r, run_id, json.dumps({
+                    "type": "result", "subtype": "spawn_error", "is_error": True,
+                    "result": f"runner failed to respawn container on retry: {e}",
+                }))
+                return 1
+
+        try:
+            returncode, contention_hit = _stream_cold_attempt(
+                container, r, run_id, codex_retryable, is_last_attempt=(attempt == max_attempts))
+        except Exception:
+            log.exception("execute: log-stream failed run=%s", run_id)
+            return 1
+
+        if contention_hit and attempt < max_attempts:
+            continue
+        break
+    return returncode
 
 
 
@@ -1237,6 +1381,12 @@ def _build_warm_kwargs_codex(job: dict, epoch_hash: str, redis_url: str) -> tupl
     env = dict(kwargs.get("environment") or {})
     env["AW_REDIS_URL"] = redis_url
     env["AW_CODEX_CWD"] = "/opt/aw-workspace"
+    # DEFAULT_TAG is the (often unpinned, "latest") image tag this container
+    # was actually spawned from — aw-warm-relay-codex.py logs it alongside
+    # `codex --version`'s resolved output so a future "no rollout found"
+    # investigation can tell a floating-tag version drift apart from a
+    # same-version cause (see aw-warm-relay-codex.py's own _diag docstring).
+    env["AW_AGENT_TAG"] = DEFAULT_TAG
     kwargs["environment"] = env
 
     kwargs["entrypoint"] = ["/usr/local/bin/aw-warm-wrapper-codex"]
@@ -1593,7 +1743,6 @@ def _run_job_blocking(job: dict, redis_url: str) -> None:
             pass
         return
 
-    returncode = 1
     # `container.logs(stream=True)` yields raw byte chunks exactly as
     # delivered by the daemon's log API — these do NOT align with the
     # underlying process's newline-terminated lines (unlike the OLD local
@@ -1605,27 +1754,27 @@ def _run_job_blocking(job: dict, redis_url: str) -> None:
     # Redis Stream; the consumer's `json.loads` then fails on each half and
     # falls back to treating the fragment as plain assistant text — leaking
     # raw stream-json (e.g. `{"type":"user","message":{...,"tool_result"...}`)
-    # straight into the delivered Telegram message. Fix: buffer chunks and
-    # only publish on complete '\n'-terminated lines, carrying any trailing
-    # partial segment over to the next chunk (flushed at stream end).
-    buf = ""
+    # straight into the delivered Telegram message. _stream_cold_attempt
+    # buffers chunks and only publishes on complete '\n'-terminated lines.
+    #
+    # codex rollout-contention retry (see _CODEX_ROLLOUT_ERROR_SIGNATURE
+    # above): only codex jobs get more than one attempt, and only a doomed
+    # attempt (the contention error arrives before any real content — no
+    # thread.started, nothing else) is retried — see _run_cold_agent_with_retry.
+    cli = job.get("cli") or "claude"
+    codex_retryable = cli == "codex" and not job.get("raw_command")
+    returncode = 1
     try:
-        for raw in container.logs(stream=True, follow=True):
-            buf += raw.decode("utf-8", errors="replace")
-            while "\n" in buf:
-                line, buf = buf.split("\n", 1)
-                if line.strip():
-                    _publish_line(r, run_id, line)
-        if buf.strip():
-            _publish_line(r, run_id, buf)
-        try:
-            status = container.wait()
-            returncode = int(status.get("StatusCode", 1)) if isinstance(status, dict) else int(status)
-        except Exception:
-            returncode = 0
+        returncode = _run_cold_agent_with_retry(client, image, kwargs, container, run_id, r, codex_retryable)
     except Exception:
         log.exception("execute: log-stream failed run=%s", run_id)
     finally:
+        # Guaranteed on every exit path, including a mid-flush Redis failure
+        # inside _run_cold_agent_with_retry/_stream_cold_attempt — this used
+        # to sit unguarded after the call (2026-09-04 retry refactor), so a
+        # dropped Redis connection there left the run with no `done` event
+        # (looks hung forever to agents-platform) and, historically, an armed
+        # kill timer. See card 3d15bf3b-9510-8164-95c8-d1c26da0df00.
         if kill_timer:
             kill_timer.cancel()
         _publish_done(r, run_id, returncode)

@@ -43,8 +43,12 @@ from __future__ import annotations
 import json
 import os
 import shlex
+import socket
 import subprocess
 import sys
+import time
+from collections import deque
+from datetime import datetime, timezone
 
 import redis
 
@@ -70,6 +74,125 @@ def _read(path: str, default: str = "") -> str:
         return default
 
 
+# codex's own $CODEX_HOME is ONE directory shared by every concurrent codex
+# session this runner spawns (execute.py::_cli_home_rel — "one shared codex
+# home", deliberate since commit 106d993). It holds state_5.sqlite in WAL
+# mode; codex-rs itself explicitly sets a flat 5s busy_timeout on it
+# (.busy_timeout(Duration::from_secs(5)) in codex-rs/state/src/sqlite.rs —
+# NOT the SQLite library default, which is 0/no-wait) and does not retry
+# past that timeout, so a writer collision under concurrent processes either
+# waits up to 5s or surfaces as a hard failure — this is an open, upstream,
+# reproduced bug (openai/codex#20213: "Multi-terminal codex CLI freezes due
+# to SQLite lock contention with no BUSY retry"; openai/codex#35555: "CLI
+# hard-fails at startup when any process holds a write lock on logs_2.sqlite
+# ... flat 5s busy_timeout, no retry" — both verified live against the real
+# repo, 2026-09-04). Card 3d15bf3b-9510-8164-95c8-d1c26da0df00's debugger run
+# found a thread whose rollout .jsonl AND state_5.sqlite `threads` row were
+# both intact, correct and unarchived, yet `codex exec resume` still failed
+# with this exact error — the leading (evidenced here, not proven inside the
+# codex-rs binary itself) explanation is this same SQLITE_BUSY-class
+# contention, surfaced through codex's generic "no rollout found" message
+# rather than a lock-specific one. Retrying the whole subprocess is safe
+# here specifically because this failure happens before codex ever
+# processes the prompt — nothing has been double-applied.
+_ROLLOUT_ERROR_SIGNATURE = "no rollout found for thread id"
+_MAX_RESUME_ATTEMPTS = 3  # 1 initial + 2 retries
+_RETRY_BACKOFF_S = (0.3, 0.6)  # indexed by retry number, last value repeats
+_HOSTNAME = socket.gethostname()
+
+
+def _utc_now() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+
+
+def _publish_line(r, stream_key: str, run_id: str, line: str) -> None:
+    if aw_attach is not None:
+        try:
+            line = aw_attach.rewrite_stream_line(line, run_id)
+        except Exception as e:
+            print(f"aw-warm-relay-codex: attach rewrite failed ({e})", file=sys.stderr)
+    try:
+        r.xadd(stream_key, {"type": "stdout", "line": line}, maxlen=50_000, approximate=True)
+    except Exception as e:
+        print(f"aw-warm-relay-codex: XADD failed ({e})", file=sys.stderr)
+
+
+def _run_codex_turn(argv: list, cwd: str, env: dict, r, stream_key: str, run_id: str
+                     ) -> tuple[int, int, str]:
+    """Run one `codex exec resume` subprocess, retrying a resume that fails
+    with the known "no rollout found for thread id ... (code -32600)" error
+    before any real turn content was produced (see the module-level note on
+    _ROLLOUT_ERROR_SIGNATURE for why that's a safe thing to retry).
+
+    Buffers only the first attempt's lines until either the error signature
+    or real output appears, so a normal turn's live streaming is unaffected
+    — the added latency is confined to attempts that actually hit the
+    transient error.
+
+    Returns (returncode, attempts_made, tail_text) — the latter two feed
+    main()'s resume_end diagnostics line, so an attempt count and the exact
+    trailing output survive a single-attempt view of the run's Redis stream.
+    """
+    last_tail: deque = deque(maxlen=5)
+    for attempt in range(1, _MAX_RESUME_ATTEMPTS + 1):
+        try:
+            proc = subprocess.Popen(argv, cwd=cwd, stdin=subprocess.DEVNULL,
+                                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                    text=True, bufsize=1, env=env)
+        except Exception as e:
+            print(f"aw-warm-relay-codex: could not start codex ({e})", file=sys.stderr)
+            _publish_line(r, stream_key, run_id, json.dumps({
+                "type": "cli.stderr", "text": f"warm codex failed to start: {e}"}))
+            return 1, attempt, f"spawn failed: {e}"
+
+        buffered: list[str] = []
+        live = False
+        saw_signature = False
+        for out_line in proc.stdout:
+            out_line = out_line.rstrip("\n")
+            if not out_line:
+                continue
+            last_tail.append(out_line)
+            if live:
+                _publish_line(r, stream_key, run_id, out_line)
+                continue
+            if _ROLLOUT_ERROR_SIGNATURE in out_line:
+                saw_signature = True
+                buffered.append(out_line)
+                continue
+            # Real content arrived — this attempt is not hitting the
+            # transient error. Flush what we held and stream live from here.
+            live = True
+            for held in buffered:
+                _publish_line(r, stream_key, run_id, held)
+            buffered = []
+            _publish_line(r, stream_key, run_id, out_line)
+        rc = proc.wait()
+
+        retryable = not live and saw_signature and rc != 0
+        if retryable and attempt < _MAX_RESUME_ATTEMPTS:
+            backoff = _RETRY_BACKOFF_S[min(attempt - 1, len(_RETRY_BACKOFF_S) - 1)]
+            print(f"aw-warm-relay-codex[{_HOSTNAME}] {_utc_now()}: resume hit "
+                  f"'{_ROLLOUT_ERROR_SIGNATURE}' (attempt {attempt}/{_MAX_RESUME_ATTEMPTS}, "
+                  f"rc={rc}) — likely shared-$CODEX_HOME SQLite contention, retrying "
+                  f"after {backoff}s", file=sys.stderr)
+            time.sleep(backoff)
+            continue
+
+        # Final attempt (succeeded, hit a different error, or retries
+        # exhausted) — publish whatever never got flushed so a real failure
+        # is still visible, never silently swallowed.
+        for held in buffered:
+            _publish_line(r, stream_key, run_id, held)
+        if retryable:
+            print(f"aw-warm-relay-codex[{_HOSTNAME}] {_utc_now()}: resume still failing "
+                  f"after {_MAX_RESUME_ATTEMPTS} attempts, giving up — tail: "
+                  f"{list(last_tail)}", file=sys.stderr)
+        return rc, attempt, "\n".join(last_tail)
+
+    return 1, _MAX_RESUME_ATTEMPTS, ""  # unreachable — loop always returns
+
+
 def _turn_env(rundir: str) -> dict:
     """`turn_env` is written by warm_pool.dispatch_turn as shell `export`
     lines (the claude wrapper sources it). Here the turn is a subprocess, so
@@ -90,6 +213,56 @@ def _turn_env(rundir: str) -> dict:
     return env
 
 
+def _diagnostics_path(codex_home: str) -> str:
+    return os.path.join(codex_home, "diagnostics", "resume-activity.jsonl")
+
+
+def _diag(codex_home: str, event: str, **fields) -> None:
+    """Append one line to a diagnostics log INSIDE the shared, persistent
+    $CODEX_HOME — not the ephemeral container filesystem, not the Redis
+    stream (which expires in 86400s and needs a redis-cli to read). Added
+    2026-09-04 after a resume failure (bug:codex-warm-container-rollout-
+    lost-on-resume) turned out to have an intact rollout AND an intact
+    state_5.sqlite row, leaving version drift and concurrent-writer
+    contention on $CODEX_HOME as the two untested explanations — neither
+    could be checked after the fact because nothing recorded the codex
+    binary version in use or the wall-clock window of each resume attempt.
+
+    $CODEX_HOME is ONE directory shared by every concurrently-warm codex
+    session on this runner (by design, see execute.py's staged_home
+    comment), so EVERY session appends to this SAME file — a future failed
+    resume can be grepped here for another session's resume_start/
+    resume_end window overlapping it, which is direct evidence for or
+    against the SQLite-contention hypothesis without needing podman/docker
+    access (the exact gap the 2026-09-04 investigation hit).
+
+    Best-effort: a diagnostics write that fails must never fail the turn
+    itself, same reasoning as execute.py's own _log_recycle."""
+    try:
+        path = _diagnostics_path(codex_home)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        rec = {"ts": datetime.now(timezone.utc).isoformat(), "event": event,
+               "pid": os.getpid(), "host": socket.gethostname(), **fields}
+        with open(path, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps(rec) + "\n")
+    except Exception as e:
+        print(f"aw-warm-relay-codex: diagnostics write failed ({e})", file=sys.stderr)
+
+
+def _codex_version() -> str:
+    """Resolved ONCE per container lifetime (not per resume — the binary
+    cannot change mid-container-life, and shelling out on every single turn
+    would add latency for a value that is already constant). Logged into
+    every resume_start/resume_end diagnostics line below so it is still
+    visible per-resume without re-invoking the binary."""
+    try:
+        out = subprocess.run(["codex", "--version"], capture_output=True,
+                              text=True, timeout=10)
+        return (out.stdout or out.stderr or "").strip() or f"exit={out.returncode}"
+    except Exception as e:
+        return f"unresolved ({e})"
+
+
 def main() -> int:
     rundir = sys.argv[1] if len(sys.argv) > 1 else "/home/ubuntu/.aw-warm"
     redis_url = os.environ.get("AW_REDIS_URL") or ""
@@ -103,6 +276,17 @@ def main() -> int:
         print("aw-warm-relay-codex: AW_SESSION_ID is empty — a warm codex container "
               "has no thread to resume, refusing to start", file=sys.stderr)
         return 1
+
+    # codex_home: same container-side mount path _build_warm_kwargs_codex set
+    # CODEX_HOME to (staged_home in execute.py) — the persistent, host-visible,
+    # cross-session-shared directory. agent_tag: the (often unpinned, "latest"
+    # by default) image tag execute.py resolved this container from — compared
+    # against codex_version (what's actually running) to catch version drift.
+    codex_home = os.environ.get("CODEX_HOME") or os.path.expanduser("~/.codex")
+    codex_version = _codex_version()
+    agent_tag = os.environ.get("AW_AGENT_TAG") or "unknown"
+    _diag(codex_home, "container_start", session_id=session_id,
+          codex_version=codex_version, agent_tag=agent_tag)
 
     r = redis.from_url(redis_url, decode_responses=True)
 
@@ -135,39 +319,14 @@ def main() -> int:
 
         env = dict(os.environ)
         env.update(_turn_env(rundir))
-        rc = 1
-        try:
-            proc = subprocess.Popen(argv, cwd=cwd, stdin=subprocess.DEVNULL,
-                                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                                    text=True, bufsize=1, env=env)
-        except Exception as e:
-            print(f"aw-warm-relay-codex: could not start codex ({e})", file=sys.stderr)
-            try:
-                r.xadd(stream_key, {"type": "stdout", "line": json.dumps({
-                    "type": "cli.stderr", "text": f"warm codex failed to start: {e}"})},
-                    maxlen=50_000, approximate=True)
-            except Exception:
-                pass
-        else:
-            for out_line in proc.stdout:
-                out_line = out_line.rstrip("\n")
-                if not out_line:
-                    continue
-                # An [[ATTACH: /local/path]] is readable HERE and nowhere near
-                # the Telegram connector — swap it for a reference that side
-                # can resolve, same as the claude relay does.
-                if aw_attach is not None:
-                    try:
-                        out_line = aw_attach.rewrite_stream_line(out_line, run_id)
-                    except Exception as e:
-                        print(f"aw-warm-relay-codex: attach rewrite failed ({e})",
-                              file=sys.stderr)
-                try:
-                    r.xadd(stream_key, {"type": "stdout", "line": out_line},
-                           maxlen=50_000, approximate=True)
-                except Exception as e:
-                    print(f"aw-warm-relay-codex: XADD failed ({e})", file=sys.stderr)
-            rc = proc.wait()
+        turn_started = time.monotonic()
+        _diag(codex_home, "resume_start", session_id=session_id, run_id=run_id,
+              codex_version=codex_version, agent_tag=agent_tag)
+        rc, attempts, tail_text = _run_codex_turn(argv, cwd, env, r, stream_key, run_id)
+        _diag(codex_home, "resume_end", session_id=session_id, run_id=run_id,
+              rc=rc, duration_s=round(time.monotonic() - turn_started, 3),
+              attempts=attempts, is_rollout_error=_ROLLOUT_ERROR_SIGNATURE in tail_text,
+              error_excerpt=tail_text[-1500:] if rc != 0 else None)
 
         # The cold path's consumer finalises a run on this sentinel and on
         # nothing else — codex's own turn.completed event is usage data, not
