@@ -1066,6 +1066,18 @@ async def _list_tools() -> list[Tool]:
                           "signalled or killed while a turn is in flight (in particular "
                           "the warm relay, which is what puts your messages in front of "
                           "the user, is never touched).\n\n"
+                          "For the two SAFE levels the platform AUTO-ARMS a wake-up ~60s "
+                          "out, so there IS a next turn for the recycle to be applied on "
+                          "even when you are recycling yourself mid-task and no user "
+                          "message is coming. fresh_session gets no wake-up (it drops the "
+                          "conversation, so the woken session would not know who it was "
+                          "talking to). Arming can also be REFUSED — a sysadmin can block "
+                          "wake-ups, and only telegram and watch sessions can be woken at "
+                          "all, so an API- or flow-dispatched session gets none. The "
+                          "recycle is queued either way; read the `wakeup` field and the "
+                          "`applies` line in the response to see which happened, and if "
+                          "nothing was armed, say so instead of ending your turn expecting "
+                          "to come back.\n\n"
                           "Three levels, weakest first — try in this order:\n"
                           "  • reconnect_mcp (default, SAFE) — next turn gets a brand-new "
                           "CLI process with fresh MCP clients, resuming this same "
@@ -1080,7 +1092,8 @@ async def _list_tools() -> list[Tool]:
                           "silently; say so first, or use it only when the two safe "
                           "levels have already been tried and are recorded as having "
                           "failed.\n\n"
-                          "The response includes `preflight` (what your session's MCP "
+                          "The response includes `wakeup` (whether one was armed, and if "
+                          "not, why), `preflight` (what your session's MCP "
                           "surface actually looks like from the platform's side) and "
                           "`history` (previous recycle attempts on this session, "
                           "including ones made before a fresh_session replaced it). READ "
@@ -2420,8 +2433,36 @@ async def _call_tool(name: str, arguments: dict[str, Any] | None) -> list[TextCo
             h = await c.get(f"{BASE}/api/sessions/{sid}/recycle", params={"limit": "10"})
             out["history"] = h.json() if h.status_code == 200 else []
             out["preflight"] = await _mcp_preflight(own_run_id)
-            out["applies"] = ("right before this session's NEXT turn — this turn's reply "
-                              "is delivered first, nothing is killed mid-turn")
+            # `applies` used to promise a NEXT turn unconditionally. For an
+            # agent recycling itself mid-task nothing guarantees one ever
+            # happens, so the backend now auto-arms a wake-up for the two
+            # safe levels — and this sentence is only true when it did.
+            wk = out.get("wakeup") or {}
+            if wk.get("armed"):
+                out["applies"] = (f"right before this session's NEXT turn — this turn's "
+                                  f"reply is delivered first, nothing is killed mid-turn. "
+                                  f"A wake-up is armed {wk.get('delay_seconds')}s from now "
+                                  f"to BE that next turn, so you do not have to wait for "
+                                  f"one: end your turn normally and you will come back "
+                                  f"recycled.")
+            elif wk.get("duplicate"):
+                # A turn IS coming — this run had already armed its own
+                # wake-up and schedule_wakeup dedups by origin run. Saying
+                # "nothing will trigger a next turn" here would be as wrong
+                # as the unconditional promise this replaced.
+                out["applies"] = ("right before this session's NEXT turn — this turn's "
+                                  "reply is delivered first, nothing is killed mid-turn. "
+                                  "No NEW wake-up was armed because this run already had "
+                                  "one; that existing wake-up will be the next turn, at "
+                                  "whatever delay YOU chose for it, not 60s.")
+            else:
+                why = wk.get("reason") or "the platform did not report why"
+                out["applies"] = (f"right before this session's NEXT turn — this turn's "
+                                  f"reply is delivered first, nothing is killed mid-turn. "
+                                  f"NO wake-up is armed ({why}), so nothing will trigger "
+                                  f"that next turn on its own: this stays queued until "
+                                  f"something else resumes the session. Tell the user, or "
+                                  f"arm your own wake-up with schedule_wakeup.")
             if level == "fresh_session":
                 out["warning"] = ("DESTRUCTIVE: the next turn starts a new session with no "
                                   "--resume. This conversation's history will be gone.")

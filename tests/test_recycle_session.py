@@ -217,3 +217,117 @@ def test_logging_failure_never_breaks_the_recycle(monkeypatch):
     written must still happen — the caller has no working tools."""
     monkeypatch.setattr(execute_mod, "RECYCLE_LOG_DIR", Path("/proc/nonexistent/nope"))
     execute_mod._log_recycle({"run_id": "r4", "session_id": "s"}, container="c")
+
+
+# --------------------------------------------------------------------------
+# The tool surface — what the calling agent is actually told
+# --------------------------------------------------------------------------
+#
+# The backend (agents-platform-multitenant, POST /api/sessions/{sid}/recycle)
+# auto-arms a wake-up for the two SAFE levels, because a queued recycle is
+# only ever applied on a NEXT turn and an agent recycling itself mid-task has
+# nothing to guarantee one happens. That outcome rides back as a `wakeup`
+# field, and the tool's `applies` line — which used to promise a next turn
+# unconditionally — has to reflect it, or the tool goes on making exactly the
+# claim this feature exists to stop being false.
+
+#: The pristine class, captured before anything patches it. The patch below
+#: lands on the httpx MODULE (mcp_server just does `import httpx`), so a
+#: helper that re-read httpx.AsyncClient would stack its second stub on top
+#: of its first and keep serving the first test case's response.
+_REAL_ASYNC_CLIENT = None
+
+
+def _call_recycle(monkeypatch, wakeup, level="reconnect_mcp"):
+    """Drive the recycle_session handler against a stubbed AP-MT."""
+    import asyncio
+
+    import httpx
+
+    from agents_platform_runners_app import mcp_server
+
+    global _REAL_ASYNC_CLIENT
+    if _REAL_ASYNC_CLIENT is None:
+        _REAL_ASYNC_CLIENT = httpx.AsyncClient
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/recycle") and request.method == "POST":
+            return httpx.Response(200, json={"session_id": "sess-1", "level": level,
+                                             "status": "queued", "attempt": {},
+                                             "wakeup": wakeup})
+        if request.url.path.endswith("/recycle"):
+            return httpx.Response(200, json=[])
+        raise AssertionError(f"unexpected request: {request.url}")
+
+    def fake(*a, **kw):
+        kw["transport"] = httpx.MockTransport(handler)
+        return _REAL_ASYNC_CLIENT(*a, **kw)
+
+    monkeypatch.setattr(mcp_server.httpx, "AsyncClient", fake)
+    out = asyncio.run(mcp_server._call_tool(
+        "recycle_session", {"session_id": "sess-1", "level": level}))
+    return json.loads(out[0].text)
+
+
+def test_the_tool_surfaces_the_wakeup_the_backend_reports(monkeypatch):
+    """Pass-through, not re-derivation: only the backend knows whether the
+    wake-up was armed, deduped or refused, and the agent has to be able to
+    read all three."""
+    wk = {"armed": True, "wakeup_id": "wk-1", "delay_seconds": 60,
+          "fire_at": "2026-09-04T09:00:00", "channel": "telegram"}
+    out = _call_recycle(monkeypatch, wk)
+    assert out["wakeup"] == wk
+
+
+def test_applies_promises_a_next_turn_only_when_one_is_armed(monkeypatch):
+    """The whole point of the card. With a wake-up armed the agent can end
+    its turn and come back recycled; without one, 'applied before your NEXT
+    turn' is a promise nothing is going to keep, and saying it anyway is how
+    a self-healing agent strands itself waiting."""
+    armed = _call_recycle(monkeypatch, {"armed": True, "wakeup_id": "wk-1",
+                                        "delay_seconds": 60})["applies"]
+    refused = _call_recycle(monkeypatch, {
+        "armed": False,
+        "reason": "You are not allowed to Wake-up, talk to the user about it"})["applies"]
+
+    assert armed != refused
+    assert "wake-up is armed 60s from now" in armed
+    assert "NO wake-up is armed" in refused
+    # The refusal reason reaches the agent verbatim rather than being
+    # flattened into "something went wrong".
+    assert "You are not allowed to Wake-up" in refused
+
+
+def test_fresh_session_is_told_no_wakeup_is_coming(monkeypatch):
+    """fresh_session deliberately gets none. It must still read as a stated
+    decision with a consequence, not as a silent absence."""
+    out = _call_recycle(monkeypatch,
+                        {"armed": False, "reason": "fresh_session loses the "
+                                                   "conversation, so no wake-up is armed "
+                                                   "for it"},
+                        level="fresh_session")
+    assert "NO wake-up is armed" in out["applies"]
+    assert "DESTRUCTIVE" in out["warning"]
+
+
+def test_a_backend_that_reports_no_wakeup_field_does_not_break_the_tool(monkeypatch):
+    """Backend-first is the rollout order, but the tool must not explode if it
+    ever meets an older platform that predates the field."""
+    out = _call_recycle(monkeypatch, None)
+    assert "NO wake-up is armed" in out["applies"]
+    assert out["status"] == "queued"
+
+
+def test_a_deduped_wakeup_is_not_reported_as_no_wakeup(monkeypatch):
+    """schedule_wakeup dedups by origin run, so an agent that already armed
+    its own wake-up this run gets that one back instead of a second. A turn
+    IS coming — telling it 'nothing will trigger a next turn' would be as
+    wrong as the unconditional promise this replaced, just in the other
+    direction. What it does need to know is that the delay is its own, not
+    the 60s this feature picked."""
+    out = _call_recycle(monkeypatch, {"armed": False, "duplicate": True,
+                                      "existing_wakeup_id": "wk-mine",
+                                      "reason": "a wake-up is already armed for run r1"})
+    assert "NO wake-up is armed" not in out["applies"]
+    assert "already had" in out["applies"]
+    assert out["wakeup"]["existing_wakeup_id"] == "wk-mine"
