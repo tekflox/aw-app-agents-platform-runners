@@ -62,6 +62,7 @@ Design decisions, verified live (not assumed) on 2026-08-02:
 """
 from __future__ import annotations
 
+import fcntl
 import json
 import logging
 import os
@@ -260,6 +261,19 @@ _CODEX_ROLLOUT_ERROR_SIGNATURE = "no rollout found for thread id"
 _CODEX_ROLLOUT_MAX_ATTEMPTS = 3  # 1 initial + 2 retries
 _CODEX_ROLLOUT_RETRY_BACKOFF_S = (0.3, 0.6)
 
+# codex_login::auth::manager's own error codes when the OAuth refresh_token
+# stored in $CODEX_HOME/auth.json has been revoked/invalidated server-side —
+# distinct from the rollout-contention signature above (that one is about
+# session STATE, this one is about the CREDENTIAL itself). Card
+# bug:crispal-codex-oauth-token-not-persisted (2026-09-04): the shared
+# $CODEX_HOME/auth.json was only ever populated once (2026-08-23) and never
+# re-synced, so a revoked token here has no self-heal path — every run
+# against this shared home fails identically until a human notices. Logging
+# this loudly the first time it's seen (see _stream_cold_attempt and
+# aw-warm-relay-codex.py's own copy of this list) means that no longer takes
+# a debugger run to discover.
+_CODEX_AUTH_REVOKED_SIGNATURES = ("refresh_token_invalidated", "token_revoked")
+
 
 def _stream_cold_attempt(container, r, run_id: str, codex_retryable: bool,
                           is_last_attempt: bool = False) -> tuple[int, bool]:
@@ -292,6 +306,7 @@ def _stream_cold_attempt(container, r, run_id: str, codex_retryable: bool,
     buf = ""
     live = False
     saw_signature = False
+    auth_revoked_logged = False
     buffered_lines: list[str] = []
     for raw in container.logs(stream=True, follow=True):
         buf += raw.decode("utf-8", errors="replace")
@@ -299,6 +314,15 @@ def _stream_cold_attempt(container, r, run_id: str, codex_retryable: bool,
             line, buf = buf.split("\n", 1)
             if not line.strip():
                 continue
+            if not auth_revoked_logged and any(
+                    sig in line for sig in _CODEX_AUTH_REVOKED_SIGNATURES):
+                auth_revoked_logged = True
+                log.warning(
+                    "execute: run=%s codex reports its OAuth refresh_token was "
+                    "revoked/invalidated — $CODEX_HOME/auth.json needs a fresh "
+                    "login; every further codex turn against this shared home "
+                    "will fail identically until it is resynced. First "
+                    "offending line: %s", run_id, line[:500])
             if live:
                 _publish_line(r, run_id, line)
                 continue
@@ -530,6 +554,88 @@ def _sync_home_creds_into_workspace(real_home: Path, spec: dict) -> None:
                 shutil.copy2(src, dst)
         except Exception:
             log.warning("execute: creds resync %s -> %s failed", src, dst, exc_info=True)
+
+
+def _auth_last_refresh(path: Path) -> str | None:
+    """codex's own freshness marker inside an auth.json, when present — an
+    ISO-8601 string (directly, lexicographically comparable) codex itself
+    writes back after a successful token refresh. Confirmed present on this
+    workspace's own shared $CODEX_HOME/auth.json (card
+    bug:crispal-codex-oauth-token-not-persisted's debugger diagnosis).
+    Best-effort: an unreadable/malformed file just means "no signal"."""
+    try:
+        data = json.loads(path.read_text())
+    except Exception:
+        return None
+    return data.get("last_refresh") or (data.get("tokens") or {}).get("last_refresh")
+
+
+def _resync_shared_cli_home_auth(shared_home: Path, staged_creds_dir: Path,
+                                  auth_filename: str = "auth.json") -> None:
+    """Re-sync ``<shared_home>/<auth_filename>`` from this run's own staged
+    login snapshot (``<staged_creds_dir>/<auth_filename>`` — the ``/aw-creds``
+    source, itself a fresh copy of the real ``codex login`` home taken at
+    spawn time, see the ``creds_staged`` branch above) whenever their content
+    diverges — not only when the shared copy is missing.
+
+    ``shared_home`` (``$CODEX_HOME`` today — see ``_cli_home_rel``) is ONE
+    directory bind-mounted rw into EVERY codex container this runner spawns,
+    cold or warm. The old guard, applied only on the cold path's shell
+    entrypoint, was "copy only if ``<shared_home>/auth.json`` is missing" —
+    it populated the file once (2026-08-23) and never touched it again, so a
+    fresher login/refresh sitting in the staged snapshot never reached the
+    shared copy: a revoked refresh_token there had no self-heal path at all
+    (card bug:crispal-codex-oauth-token-not-persisted).
+
+    Guarded by an flock on a sibling lockfile inside ``shared_home`` so two
+    workers building a codex spawn at the same moment (AW_WORKSPACE_WORKERS
+    > 1, see aw-workspace-multiworker:w6-flip-workers-to-10) don't race a
+    read-compare-write on the same shared file.
+
+    Never overwrites a shared copy that is ALREADY as fresh or fresher than
+    the staged source — that would clobber a refresh_token some other
+    concurrent process (another codex container, a manual relogin) just
+    wrote there. Freshness is compared via ``_auth_last_refresh`` when both
+    sides carry that field; falls back to a raw content diff plus mtime
+    otherwise, so a first-ever populate or a plain account swap still lands.
+
+    Called from the codex branch of ``_build_container_kwargs`` for BOTH the
+    cold path and warm codex containers — ``_build_warm_kwargs_codex`` builds
+    its kwargs by calling ``_build_container_kwargs`` first, so this side
+    effect runs there too even though the warm branch discards the returned
+    argv.
+
+    Never raises: a resync that fails must not stop a run from starting —
+    the spawn simply falls back to whatever was already in ``shared_home``,
+    same as before this existed."""
+    src = staged_creds_dir / auth_filename
+    if not src.is_file():
+        return
+    try:
+        shared_home.mkdir(parents=True, exist_ok=True)
+        dst = shared_home / auth_filename
+        lock_path = shared_home / f".{auth_filename}.lock"
+        with open(lock_path, "a+") as lockfile:
+            fcntl.flock(lockfile.fileno(), fcntl.LOCK_EX)
+            try:
+                if not dst.is_file():
+                    shutil.copy2(src, dst)
+                    return
+                src_ts = _auth_last_refresh(src)
+                dst_ts = _auth_last_refresh(dst)
+                if src_ts and dst_ts:
+                    if src_ts > dst_ts:
+                        shutil.copy2(src, dst)
+                    return
+                if src.read_bytes() == dst.read_bytes():
+                    return
+                if src.stat().st_mtime >= dst.stat().st_mtime:
+                    shutil.copy2(src, dst)
+            finally:
+                fcntl.flock(lockfile.fileno(), fcntl.LOCK_UN)
+    except Exception:
+        log.warning("execute: shared-home auth resync %s -> %s failed",
+                    src, shared_home, exc_info=True)
 
 
 def _git_creds_volumes() -> dict[str, dict]:
@@ -1144,15 +1250,25 @@ def _build_container_kwargs(job: dict) -> tuple[str, list[str], dict, str | None
                     pass
         except Exception:
             log.exception("execute: could not prepare codex home %s", _home_abs)
+        if cli == "codex":
+            # Content/timestamp-aware, flock-guarded — see the function's own
+            # docstring for why the old "copy only if missing" guard left a
+            # revoked token stuck forever. Runs here (host-side, Python) so
+            # it covers BOTH the cold path AND warm codex containers, which
+            # build their kwargs by calling this same function first.
+            _resync_shared_cli_home_auth(_home_abs, creds_copy)
         staged_home = f"/aw-{creds_dir.lstrip('.')}-home"
         _mount(_home_rel, staged_home, ro=False)
         if spec.get("home_env"):
             env[spec["home_env"]] = staged_home
         _inner = " ".join(shlex.quote(a) for a in argv)
-        # Creds are copied in only when absent, so a refreshed token written
-        # by a previous turn is not clobbered by the staged copy.
+        # auth.json itself is resynced host-side above, before this shell
+        # ever runs. This cp only backfills the REST of the staged creds
+        # (config.toml etc.) the first time the shared home is populated —
+        # guarded on config.toml specifically (not auth.json) so a later
+        # spawn never re-touches the auth.json this same block just synced.
         argv = ["sh", "-lc",
-                f'[ -f {staged_home}/auth.json ] || cp -a /aw-creds/. {staged_home}/ 2>/dev/null; '
+                f'[ -f {staged_home}/config.toml ] || cp -a /aw-creds/. {staged_home}/ 2>/dev/null; '
                 f'chmod -R u+rwX {staged_home} 2>/dev/null; exec {_inner}']
 
     kwargs: dict[str, Any] = {

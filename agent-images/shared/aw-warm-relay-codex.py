@@ -100,6 +100,18 @@ _MAX_RESUME_ATTEMPTS = 3  # 1 initial + 2 retries
 _RETRY_BACKOFF_S = (0.3, 0.6)  # indexed by retry number, last value repeats
 _HOSTNAME = socket.gethostname()
 
+# codex_login::auth::manager's own error codes when the OAuth refresh_token
+# in the shared $CODEX_HOME/auth.json has been revoked/invalidated
+# server-side — duplicated from execute.py's own copy of this list for the
+# same reason _ROLLOUT_ERROR_SIGNATURE is duplicated (this file ships into a
+# different container image, loaded by path, not importable as a package).
+# Card bug:crispal-codex-oauth-token-not-persisted (2026-09-04): this shared
+# home had no self-heal path for a revoked token, so it cascaded silently
+# turn after turn until a human happened to look. Detecting and logging it
+# loudly here (plus a diagnostics record) means a future occurrence surfaces
+# without needing a debugger run to rediscover.
+_AUTH_REVOKED_SIGNATURES = ("refresh_token_invalidated", "token_revoked")
+
 
 def _utc_now() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
@@ -118,7 +130,7 @@ def _publish_line(r, stream_key: str, run_id: str, line: str) -> None:
 
 
 def _run_codex_turn(argv: list, cwd: str, env: dict, r, stream_key: str, run_id: str
-                     ) -> tuple[int, int, str]:
+                     ) -> tuple[int, int, str, bool]:
     """Run one `codex exec resume` subprocess, retrying a resume that fails
     with the known "no rollout found for thread id ... (code -32600)" error
     before any real turn content was produced (see the module-level note on
@@ -129,11 +141,16 @@ def _run_codex_turn(argv: list, cwd: str, env: dict, r, stream_key: str, run_id:
     — the added latency is confined to attempts that actually hit the
     transient error.
 
-    Returns (returncode, attempts_made, tail_text) — the latter two feed
-    main()'s resume_end diagnostics line, so an attempt count and the exact
-    trailing output survive a single-attempt view of the run's Redis stream.
+    Returns (returncode, attempts_made, tail_text, auth_revoked) — the first
+    three feed main()'s resume_end diagnostics line (attempt count and exact
+    trailing output survive a single-attempt view of the run's Redis stream);
+    auth_revoked is True the moment any attempt's output ever matched
+    _AUTH_REVOKED_SIGNATURES, so main() can log/diagnose it once per turn
+    instead of it cascading silently (card
+    bug:crispal-codex-oauth-token-not-persisted).
     """
     last_tail: deque = deque(maxlen=5)
+    auth_revoked = False
     for attempt in range(1, _MAX_RESUME_ATTEMPTS + 1):
         try:
             proc = subprocess.Popen(argv, cwd=cwd, stdin=subprocess.DEVNULL,
@@ -143,7 +160,7 @@ def _run_codex_turn(argv: list, cwd: str, env: dict, r, stream_key: str, run_id:
             print(f"aw-warm-relay-codex: could not start codex ({e})", file=sys.stderr)
             _publish_line(r, stream_key, run_id, json.dumps({
                 "type": "cli.stderr", "text": f"warm codex failed to start: {e}"}))
-            return 1, attempt, f"spawn failed: {e}"
+            return 1, attempt, f"spawn failed: {e}", auth_revoked
 
         buffered: list[str] = []
         live = False
@@ -153,6 +170,8 @@ def _run_codex_turn(argv: list, cwd: str, env: dict, r, stream_key: str, run_id:
             if not out_line:
                 continue
             last_tail.append(out_line)
+            if any(sig in out_line for sig in _AUTH_REVOKED_SIGNATURES):
+                auth_revoked = True
             if live:
                 _publish_line(r, stream_key, run_id, out_line)
                 continue
@@ -188,9 +207,9 @@ def _run_codex_turn(argv: list, cwd: str, env: dict, r, stream_key: str, run_id:
             print(f"aw-warm-relay-codex[{_HOSTNAME}] {_utc_now()}: resume still failing "
                   f"after {_MAX_RESUME_ATTEMPTS} attempts, giving up — tail: "
                   f"{list(last_tail)}", file=sys.stderr)
-        return rc, attempt, "\n".join(last_tail)
+        return rc, attempt, "\n".join(last_tail), auth_revoked
 
-    return 1, _MAX_RESUME_ATTEMPTS, ""  # unreachable — loop always returns
+    return 1, _MAX_RESUME_ATTEMPTS, "", auth_revoked  # unreachable — loop always returns
 
 
 def _turn_env(rundir: str) -> dict:
@@ -322,11 +341,22 @@ def main() -> int:
         turn_started = time.monotonic()
         _diag(codex_home, "resume_start", session_id=session_id, run_id=run_id,
               codex_version=codex_version, agent_tag=agent_tag)
-        rc, attempts, tail_text = _run_codex_turn(argv, cwd, env, r, stream_key, run_id)
+        rc, attempts, tail_text, auth_revoked = _run_codex_turn(
+            argv, cwd, env, r, stream_key, run_id)
         _diag(codex_home, "resume_end", session_id=session_id, run_id=run_id,
               rc=rc, duration_s=round(time.monotonic() - turn_started, 3),
               attempts=attempts, is_rollout_error=_ROLLOUT_ERROR_SIGNATURE in tail_text,
               error_excerpt=tail_text[-1500:] if rc != 0 else None)
+        if auth_revoked:
+            print(f"aw-warm-relay-codex[{_HOSTNAME}] {_utc_now()}: WARNING codex reports "
+                  f"its OAuth refresh_token was revoked/invalidated (session={session_id} "
+                  f"run={run_id}) — $CODEX_HOME/auth.json needs a fresh login; every "
+                  f"further turn against this shared home will fail identically until "
+                  f"it's resynced. See card bug:crispal-codex-oauth-token-not-persisted.",
+                  file=sys.stderr)
+            _diag(codex_home, "auth_revoked", session_id=session_id, run_id=run_id,
+                  codex_version=codex_version, agent_tag=agent_tag,
+                  error_excerpt=tail_text[-1500:])
 
         # The cold path's consumer finalises a run on this sentinel and on
         # nothing else — codex's own turn.completed event is usage data, not

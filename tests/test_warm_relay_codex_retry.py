@@ -87,7 +87,7 @@ def test_ordinary_turn_streams_live_no_retry(monkeypatch):
         (['{"type":"thread.started"}', '{"type":"turn.completed"}'], 0),
     ])
     r = _FakeRedis()
-    rc, attempts, tail = relay._run_codex_turn(["codex"], "/", {}, r, "run:x:events", "x")
+    rc, attempts, tail, _auth_revoked = relay._run_codex_turn(["codex"], "/", {}, r, "run:x:events", "x")
     assert rc == 0
     assert attempts == 1
     assert r.lines == ['{"type":"thread.started"}', '{"type":"turn.completed"}']
@@ -101,7 +101,7 @@ def test_contention_then_success_hides_the_failed_attempts(monkeypatch):
         (['{"type":"thread.started"}', '{"type":"turn.completed"}'], 0),
     ])
     r = _FakeRedis()
-    rc, attempts, tail = relay._run_codex_turn(["codex"], "/", {}, r, "run:x:events", "x")
+    rc, attempts, tail, _auth_revoked = relay._run_codex_turn(["codex"], "/", {}, r, "run:x:events", "x")
     assert rc == 0
     assert attempts == 3
     # Only the successful attempt's lines reached the run's event stream —
@@ -120,7 +120,7 @@ def test_retries_are_bounded_and_the_last_error_is_still_visible(monkeypatch):
         ([ROLLOUT_ERROR], 1),
     ])
     r = _FakeRedis()
-    rc, attempts, tail = relay._run_codex_turn(["codex"], "/", {}, r, "run:x:events", "x")
+    rc, attempts, tail, _auth_revoked = relay._run_codex_turn(["codex"], "/", {}, r, "run:x:events", "x")
     assert rc == 1
     assert attempts == relay._MAX_RESUME_ATTEMPTS
     assert r.lines == [ROLLOUT_ERROR]
@@ -136,7 +136,7 @@ def test_a_different_failure_is_not_retried(monkeypatch):
         (["this attempt must never run"], 0),
     ])
     r = _FakeRedis()
-    rc, attempts, tail = relay._run_codex_turn(["codex"], "/", {}, r, "run:x:events", "x")
+    rc, attempts, tail, _auth_revoked = relay._run_codex_turn(["codex"], "/", {}, r, "run:x:events", "x")
     assert rc == 2
     assert attempts == 1
     assert r.lines == ["error: unexpected argument '--foo' found"]
@@ -152,7 +152,7 @@ def test_signature_arriving_after_real_content_is_not_retried(monkeypatch):
         (['{"type":"thread.started"}', ROLLOUT_ERROR], 0),
     ])
     r = _FakeRedis()
-    rc, attempts, tail = relay._run_codex_turn(["codex"], "/", {}, r, "run:x:events", "x")
+    rc, attempts, tail, _auth_revoked = relay._run_codex_turn(["codex"], "/", {}, r, "run:x:events", "x")
     assert rc == 0
     assert attempts == 1
     assert r.lines == ['{"type":"thread.started"}', ROLLOUT_ERROR]
@@ -167,7 +167,7 @@ def test_signature_with_zero_returncode_is_not_treated_as_contention(monkeypatch
         ([ROLLOUT_ERROR], 0),
     ])
     r = _FakeRedis()
-    rc, attempts, tail = relay._run_codex_turn(["codex"], "/", {}, r, "run:x:events", "x")
+    rc, attempts, tail, _auth_revoked = relay._run_codex_turn(["codex"], "/", {}, r, "run:x:events", "x")
     assert rc == 0
     assert attempts == 1
     assert r.lines == [ROLLOUT_ERROR]
