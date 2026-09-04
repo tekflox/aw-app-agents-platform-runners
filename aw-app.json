@@ -935,6 +935,25 @@
         "x-secret": true,
         "description": "aw-backend identity JWT sent as Authorization: Bearer on every call to agents_platform_base \u2014 required, agents-platform-multitenant's require_identity() rejects unauthenticated requests with 401. Mint one inside the aw-backend container: python -c \"from src.api.identity_auth import create_identity_jwt; print(create_identity_jwt(<user_id>, [{'workspace': 'aw', 'role': 'owner'}], expiry_seconds=<seconds>))\""
       },
+      "kb_base_url": {
+        "type": "string",
+        "default": "http://aw-app-kb:8000",
+        "title": "KB base URL",
+        "description": "Direct URL used for best-effort execution indexing. Override when container DNS is unavailable."
+      },
+      "execution_index_secret": {
+        "type": "string",
+        "x-secret": true,
+        "title": "Execution index secret",
+        "description": "Shared secret sent as X-KB-Exec-Secret to aw-app-kb. Indexing fails open when blank or rejected."
+      },
+      "execution_index_mode": {
+        "type": "string",
+        "enum": ["all", "interesting", "failures", "off"],
+        "default": "interesting",
+        "title": "Execution indexing",
+        "description": "Choose which completed agent runs are indexed in KB. Off is the immediate kill switch."
+      },
       "execute_secret": {
         "type": "string",
         "x-secret": true,
@@ -990,6 +1009,11 @@
   },
   "dependencies": {
     "apps": [
+      {
+        "id": "kb",
+        "required": false,
+        "reason": "Optionally stores a bounded semantic index of completed execution dumps; runner delivery remains fail-open when KB is absent."
+      },
       {
         "id": "mcp-gateway",
         "version": ">=0.1.0",

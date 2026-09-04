@@ -23,6 +23,7 @@ import httpx
 from fastapi import FastAPI, HTTPException, Request
 
 from . import execute as execute_mod
+from . import execution_index as execution_index_mod
 from . import observability_push as observability_push_mod
 from . import shared_redis
 from . import warm_pool
@@ -66,6 +67,7 @@ def build_routes(config: dict | None = None) -> FastAPI:
     literal, a NEW dict) — use an explicit None-check instead."""
     app = FastAPI(title="agents-platform-runners")
     cfg = config if config is not None else {}
+    execution_index_mod.configure(cfg)
 
     @app.get("/status")
     async def status() -> dict:

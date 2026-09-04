@@ -74,6 +74,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from . import execution_index
 from . import warm_pool
 
 log = logging.getLogger("aw_apps.agents_platform_runners.execute")
@@ -1476,6 +1477,7 @@ def _run_job_blocking(job: dict, redis_url: str) -> None:
         try:
             client = docker_sdk.DockerClient(base_url="unix://" + CONTAINER_SOCKET)
             _dispatch_warm_turn(client, job, redis_url)
+            execution_index.start_after_stream_done(run_id, redis_url)
         except Exception as e:
             log.exception("execute: warm dispatch failed run=%s", run_id)
             _publish_line(r, run_id, json.dumps({
@@ -1483,6 +1485,7 @@ def _run_job_blocking(job: dict, redis_url: str) -> None:
                 "result": f"runner failed to dispatch warm turn: {e}",
             }))
             _publish_done(r, run_id, 1)
+            execution_index.start(run_id)
         finally:
             try:
                 r.close()
@@ -1515,6 +1518,7 @@ def _run_job_blocking(job: dict, redis_url: str) -> None:
             "result": f"runner failed to spawn container: {e}",
         }))
         _publish_done(r, run_id, 1)
+        execution_index.start(run_id)
         return
 
     # A raw_command (monitor run) job carries its own timeout_seconds — the
@@ -1625,6 +1629,7 @@ def _run_job_blocking(job: dict, redis_url: str) -> None:
         if kill_timer:
             kill_timer.cancel()
         _publish_done(r, run_id, returncode)
+        execution_index.start(run_id)
         try:
             r.close()
         except Exception:

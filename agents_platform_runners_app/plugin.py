@@ -33,6 +33,7 @@ from pathlib import Path
 
 from . import agent_provisioner as agent_provisioner_mod
 from . import execute as execute_mod
+from . import execution_index as execution_index_mod
 from . import kanban_dispatch as kanban_dispatch_mod
 from . import platform_settings as platform_settings_mod
 from . import routes as routes_mod
@@ -164,6 +165,7 @@ class AgentsPlatformRunnersAppPlugin:
         config = getattr(ctx, "config", {}) or {}
         self._live_config.clear()
         self._live_config.update(config)
+        execution_index_mod.configure(self._live_config)
         mcp_doc = write_mcp_json(ctx.package_dir, self._live_config)
 
         ctx.routes.register(routes_mod.build_routes(self._live_config))
@@ -423,6 +425,7 @@ class AgentsPlatformRunnersAppPlugin:
         config = getattr(ctx, "config", {}) or {}
         self._live_config.clear()
         self._live_config.update(config)
+        execution_index_mod.configure(self._live_config)
         mcp_doc = write_mcp_json(ctx.package_dir, self._live_config)
         log.info("aw-app-agents-platform-runners config saved: mcp.json servers=%s", list(mcp_doc["mcpServers"]))
 
