@@ -288,6 +288,76 @@ watches **another agent session's** chain go idle; `run_monitor_async`
 watches **a raw shell command** with no agent in it; `schedule_wakeup`
 wakes **your own session** on a plain timer, nothing being watched at all.
 
+## Manual session recycle — last resort when your own MCP client is stale
+
+There are two distinct failure modes and they need different fixes. Confuse
+them and you'll retry the wrong thing for an hour.
+
+1. **The gateway itself is down or hung** (e.g. an upstream handshake never
+   times out and the whole container never finishes booting). Fix this with
+   `aw-workspace-cli restart mcp-gateway` / `aw-workspace-cli doctor` over
+   plain Bash — those don't depend on MCP at all, so they still work when
+   MCP itself is what's broken. This is the right tool almost every time
+   `doctor` reports `gateway unreachable`.
+2. **The gateway is healthy, but THIS session's own client to it is stale**
+   (it was connected when the gateway restarted underneath it, and never
+   reconnects on its own — see the `dead-mcp-client-is-usually-a-bad-token`
+   and `telegram-agent-session-mcp-tools-dont-self-heal-after-gateway-outage`
+   knowledge-base notes). `aw-workspace-cli doctor` reports the gateway as
+   reachable with hundreds of tools, but `ToolSearch` on any
+   `mcp__aw-gateway__*` name — including `recycle_session`, the tool built
+   for exactly this — returns nothing. Restarting the gateway again does not
+   help; you've proven it isn't a gateway problem the moment `doctor` comes
+   back clean and your own tools still don't.
+
+For case 2, when nothing external is available to recycle you and you're
+authorized to try it yourself (this is a **destructive, unverified fallback**
+— confirm with the user first unless they've already told you to try it),
+the last resort is killing your own warm container's `claude` process so its
+wrapper respawns it fresh, with the connection re-established from scratch:
+
+```bash
+ps -eo pid,ppid,cmd   # find the `claude --resume <session_id> ...` row —
+                      # NOT the `aw-warm-wrapper` shell around it (that's the
+                      # supervisor that respawns the child; killing it takes
+                      # the whole container down instead of just the client)
+```
+
+**Arm your way back FIRST, or you may never resume at all.** Try
+`schedule_wakeup` with a short delay before killing anything:
+
+```
+schedule_wakeup(
+  delay_seconds=30,
+  prompt="Confirm MCP tools reconnected after the self-kill recycle and resume where you left off.",
+  reason="recovering from a stale MCP client via self-kill",
+)
+```
+
+This only works if `schedule_wakeup` itself is still reachable — it is an
+`agents_platform_runners` MCP tool routed through the same gateway
+connection as everything else. If your client is dead enough that
+`ToolSearch` can't even find `schedule_wakeup`, you cannot pre-arm a
+comeback: killing yourself at that point strands the session with no
+scheduled way back, and recovery depends entirely on the next real message
+from a human or an external recycle. Only self-kill in that degenerate case
+if the user has explicitly told you to — it trades a session that's stuck
+but talking for one that's fully silent until someone messages it again.
+
+If `schedule_wakeup` succeeds, then and only then:
+
+```bash
+kill -TERM <pid>   # the `claude --resume ...` pid, not the wrapper
+```
+
+**This exact procedure has not been verified end-to-end** — the one time it
+was attempted in practice, the user stopped the kill before it ran, and the
+gateway reconnected on its own moments later via a different path (a second
+`aw-workspace-cli restart mcp-gateway` cleared the stale client without an
+explicit self-kill). Treat this section as a documented hypothesis for the
+next time case 2 recurs and case 1's fix doesn't touch it, not a
+proven-working button.
+
 ## Charts, diagrams, screenshots
 
 This workspace has no presentation-sharing MCP tool wired up by
