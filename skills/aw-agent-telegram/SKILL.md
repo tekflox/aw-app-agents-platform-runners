@@ -306,57 +306,68 @@ them and you'll retry the wrong thing for an hour.
    knowledge-base notes). `aw-workspace-cli doctor` reports the gateway as
    reachable with hundreds of tools, but `ToolSearch` on any
    `mcp__aw-gateway__*` name — including `recycle_session`, the tool built
-   for exactly this — returns nothing. Restarting the gateway again does not
-   help; you've proven it isn't a gateway problem the moment `doctor` comes
-   back clean and your own tools still don't.
+   for exactly this — returns nothing, because that tool is *itself* just an
+   RPC call over the same dead connection. Restarting the gateway again does
+   not help; you've proven it isn't a gateway problem the moment `doctor`
+   comes back clean and your own tools still don't.
 
-For case 2, when nothing external is available to recycle you and you're
-authorized to try it yourself (this is a **destructive, unverified fallback**
-— confirm with the user first unless they've already told you to try it),
-the last resort is killing your own warm container's `claude` process so its
-wrapper respawns it fresh, with the connection re-established from scratch:
-
-```bash
-ps -eo pid,ppid,cmd   # find the `claude --resume <session_id> ...` row —
-                      # NOT the `aw-warm-wrapper` shell around it (that's the
-                      # supervisor that respawns the child; killing it takes
-                      # the whole container down instead of just the client)
-```
-
-**Arm your way back FIRST, or you may never resume at all.** Try
-`schedule_wakeup` with a short delay before killing anything:
-
-```
-schedule_wakeup(
-  delay_seconds=30,
-  prompt="Confirm MCP tools reconnected after the self-kill recycle and resume where you left off.",
-  reason="recovering from a stale MCP client via self-kill",
-)
-```
-
-This only works if `schedule_wakeup` itself is still reachable — it is an
-`agents_platform_runners` MCP tool routed through the same gateway
-connection as everything else. If your client is dead enough that
-`ToolSearch` can't even find `schedule_wakeup`, you cannot pre-arm a
-comeback: killing yourself at that point strands the session with no
-scheduled way back, and recovery depends entirely on the next real message
-from a human or an external recycle. Only self-kill in that degenerate case
-if the user has explicitly told you to — it trades a session that's stuck
-but talking for one that's fully silent until someone messages it again.
-
-If `schedule_wakeup` succeeds, then and only then:
+**For case 2, call the REST endpoint behind `recycle_session` directly with
+curl — it bypasses MCP entirely, so it works even when your MCP client is
+fully dark.** `recycle_session` is a thin wrapper around
+`POST /api/sessions/{session_id}/recycle` in agents-platform-multitenant
+(`backend/app/api/sessions.py`, `request_recycle`); Bash still works when
+every MCP tool is unreachable, so hit that route straight from a plain shell,
+same auth dance as the `aw-autoskill-ap-multitenant-rest-api` skill:
 
 ```bash
-kill -TERM <pid>   # the `claude --resume ...` pid, not the wrapper
+cd /opt/aw-workspace
+T=$(jq -r .agents_platform_token .aw-workspace/app-config/agents-platform-runners.json)
+B=http://172.18.0.1:10014
+SID="$AW_SESSION_ID"   # this session's own id — already in the environment
+RID="$AW_RUN_ID"       # this run's own id — also already in the environment;
+                        # REQUIRED for the auto-wake-up below, not optional
+
+curl -s -X POST "$B/api/sessions/$SID/recycle" \
+  -H "Authorization: Bearer $T" -H "Content-Type: application/json" \
+  -d "{\"level\":\"reconnect_mcp\",\"reason\":\"MCP client stale, gateway healthy per doctor\",\"requested_by_run_id\":\"$RID\"}"
 ```
 
-**This exact procedure has not been verified end-to-end** — the one time it
-was attempted in practice, the user stopped the kill before it ran, and the
-gateway reconnected on its own moments later via a different path (a second
-`aw-workspace-cli restart mcp-gateway` cleared the stale client without an
-explicit self-kill). Treat this section as a documented hypothesis for the
-next time case 2 recurs and case 1's fix doesn't touch it, not a
-proven-working button.
+`level` is one of `reconnect_mcp` (weakest — reconnects only, keeps the
+conversation and session_id), `recycle_container` (recreates the warm
+container, still keeps the conversation), or `fresh_session` (drops the
+session_id — a different, harder reset, not needed for a merely-stale
+client). Start with `reconnect_mcp`.
+
+This does not act immediately — the call queues the command against
+`pending_session_commands`, same mechanism as `/clear` and `/compact`, so it
+applies at the start of the *next* resumed turn rather than racing an
+in-flight one. That's exactly why the endpoint is worth calling even though
+nothing changes in this turn: for `reconnect_mcp` and `recycle_container`
+(but not `fresh_session`, which has no "this session" left to wake) it can
+**auto-arm its own wake-up** — no separate `schedule_wakeup` call needed,
+and no chicken-and-egg problem, because arming that wakeup happens
+server-side in agents-platform-multitenant, not through your dead MCP
+client. **This only fires if `requested_by_run_id` is set** — verified live
+against this exact session: the first call, made without it, came back
+`"wakeup": {"armed": false, "reason": "no requested_by_run_id was supplied,
+so there is no origin run to arm a wake-up on"}` even though the recycle
+itself queued fine (`"status": "queued"`). Always pass `$AW_RUN_ID`. A
+successful arm looks like `{"armed": true, "wakeup_id": ..., "fire_at":
+...}`; if it's still `false` with `$AW_RUN_ID` set, read the `reason` —
+most likely a wake-up was already pending for this run — and wait for that
+one to fire instead of retrying the POST.
+
+Only reach for killing the warm container's own `claude` process directly
+(`kill -TERM` on the `claude --resume <session_id> ...` pid from
+`ps -eo pid,ppid,cmd` — never the `aw-warm-wrapper` shell around it) if the
+agents-platform-multitenant backend itself is unreachable too, which is a
+third, much rarer failure mode than either case above. That path has no
+auto-armed wakeup of its own — arm one with `schedule_wakeup` first if it's
+still reachable, but note it's the same kind of MCP call that may not be:
+if `ToolSearch` can't find it either, killing yourself strands the session
+until a human messages it or someone recycles it from outside. Confirm with
+the user before doing this; it's the true last resort, superseded by the
+curl recipe above for the common case.
 
 ## Charts, diagrams, screenshots
 
