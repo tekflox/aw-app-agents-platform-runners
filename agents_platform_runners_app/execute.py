@@ -232,6 +232,15 @@ CLI_SPECS: dict[str, dict] = {
 STREAM_MAXLEN = 50_000
 STREAM_TTL_S = 86400
 
+# Env var name codex's own config.toml is told (once, statically — see
+# _patch_codex_warm_token_headers) to read for the X-Aw-Warm-Token header
+# value on its aw-gateway MCP connection. Only the NAME is baked into the
+# shared config.toml; the VALUE is set fresh in this container's own
+# `environment` below, per spawn — see CLI_SPECS's `mcp_config_flag: None`
+# comment and card bug:codex-warm-caller-run-id-unresolved for why codex
+# needed a mechanism claude's --mcp-config regeneration doesn't.
+CODEX_WARM_TOKEN_ENV_VAR = "AW_MCP_WARM_TOKEN"
+
 # codex's own "thread/resume failed: no rollout found for thread id ...
 # (code -32600)" — confirmed (2026-09-04, card 3d15bf3b) to fire even when
 # the rollout .jsonl and its state_5.sqlite `threads` row are both fully
@@ -638,6 +647,63 @@ def _resync_shared_cli_home_auth(shared_home: Path, staged_creds_dir: Path,
                     src, shared_home, exc_info=True)
 
 
+def _patch_codex_warm_token_headers(config_toml: Path, server_names) -> bool:
+    """Add ``env_http_headers`` (codex's config_types.rs — a header NAME
+    mapped to an env-var NAME, not a value) so codex forwards
+    ``X-Aw-Warm-Token`` on its already-configured MCP connections, sourced
+    from ``CODEX_WARM_TOKEN_ENV_VAR`` in its own process environment.
+
+    Deliberately does NOT touch any server name that isn't already a real
+    ``[mcp_servers.<name>]`` table with a ``url`` in this exact config.toml:
+    codex's own ``RawMcpServerConfig`` rejects a table with neither
+    ``command`` nor ``url`` as "invalid transport", so inventing a bare
+    ``env_http_headers`` subtable for a server this config.toml never
+    defined would break EVERY codex run reading this file, not just skip
+    one header. Idempotent — safe to call on every spawn, cold or warm.
+
+    Called against both the fresh per-run staged copy (so a brand-new
+    shared $CODEX_HOME inherits the patch the first time it's populated)
+    and the shared $CODEX_HOME itself (so an already-populated shared home
+    predating this fix gets patched too — see both call sites).
+    """
+    try:
+        text = config_toml.read_text()
+    except OSError:
+        return False
+    try:
+        import tomllib
+        configured = tomllib.loads(text).get("mcp_servers") or {}
+    except Exception:
+        log.warning("execute: could not parse %s as TOML — skipping warm-token "
+                    "header patch", config_toml, exc_info=True)
+        return False
+    changed = False
+    for name in server_names:
+        server = configured.get(name)
+        if not isinstance(server, dict) or not server.get("url"):
+            continue  # not a real streamable_http entry in THIS config.toml
+        if (server.get("env_http_headers") or {}).get("X-Aw-Warm-Token") == CODEX_WARM_TOKEN_ENV_VAR:
+            continue  # already patched
+        section = f"[mcp_servers.{name}.env_http_headers]"
+        line = f'X-Aw-Warm-Token = "{CODEX_WARM_TOKEN_ENV_VAR}"'
+        if section in text:
+            # A manual env_http_headers table already exists for this server —
+            # insert our key under it rather than emit a second [section]
+            # TOML would reject as redefining the same table.
+            text = text.replace(section, f"{section}\n{line}", 1)
+        else:
+            text = text.rstrip("\n") + f"\n\n{section}\n{line}\n"
+        changed = True
+    if changed:
+        try:
+            config_toml.write_text(text)
+        except OSError:
+            log.warning("execute: could not write warm-token header patch to %s",
+                        config_toml, exc_info=True)
+            return False
+    return changed
+
+
 def _git_creds_volumes() -> dict[str, dict]:
     """Read-only gh/git creds volumes mirrored by aw-app-git's
     ``gh_auth.py._sync_creds_to_data_dir()`` into ``GIT_CREDS_REL``, if
@@ -895,6 +961,12 @@ def _build_container_kwargs(job: dict) -> tuple[str, list[str], dict, str | None
                 shutil.rmtree(creds_copy, ignore_errors=True)
             shutil.copytree(_real_home / creds_dir, creds_copy,
                             ignore=shutil.ignore_patterns("isolated", "sessions", "cache"))
+            if cli == "codex" and (creds_copy / "config.toml").is_file():
+                # So a brand-new shared $CODEX_HOME inherits the warm-token
+                # header patch the first time it's ever populated from this
+                # staged copy (see the codex branch below for the case where
+                # the shared home already existed before this fix shipped).
+                _patch_codex_warm_token_headers(creds_copy / "config.toml", mcp_servers)
             for path in [creds_copy, *creds_copy.rglob("*")]:
                 path.chmod(0o777 if path.is_dir() else 0o666)
             _host_creds = str(isolated_host_dir).replace(
@@ -1176,6 +1248,23 @@ def _build_container_kwargs(job: dict) -> tuple[str, list[str], dict, str | None
         _oat = _claude_oauth_token()
         if _oat:
             env["CLAUDE_CODE_OAUTH_TOKEN"] = _oat
+    # Codex has no --mcp-config flag (mcp_config_flag: None) to regenerate a
+    # fresh caller-identity header every turn the way claude does — its MCP
+    # connection is configured once, statically, in config.toml. The VALUE
+    # still has to arrive fresh per spawn, so it rides in as a plain env var
+    # that config.toml's env_http_headers (patched by
+    # _patch_codex_warm_token_headers, above and below) tells codex to read
+    # for the X-Aw-Warm-Token header. Frozen for a warm container's whole
+    # life exactly like claude's mcp.json — see _build_runner_extra_headers'
+    # docstring on why that's safe (X-Aw-Warm-Token is stable per
+    # (agent,session); the backend resolves it to whichever run is CURRENT).
+    if cli == "codex":
+        _warm_token = next(
+            (h.get("X-Aw-Warm-Token") for h in
+             (cfg.get("headers") or {} for cfg in mcp_servers.values())
+             if h.get("X-Aw-Warm-Token")), None)
+        if _warm_token:
+            env[CODEX_WARM_TOKEN_ENV_VAR] = _warm_token
     # Must match the credential mount targets below (/home/ubuntu/...) so the
     # spawned CLI's own $HOME-relative lookups (~/.claude, ~/.config/gh, etc.)
     # resolve to them. podman DOES synthesize a passwd entry for the "user"
@@ -1257,6 +1346,13 @@ def _build_container_kwargs(job: dict) -> tuple[str, list[str], dict, str | None
             # it covers BOTH the cold path AND warm codex containers, which
             # build their kwargs by calling this same function first.
             _resync_shared_cli_home_auth(_home_abs, creds_copy)
+            # Unlike auth.json, config.toml is only ever copied into the
+            # shared home ONCE (see the "cp -a" guard below) — an already
+            # populated shared home (any codex run before this fix shipped)
+            # would otherwise never pick up the warm-token header patch.
+            # Idempotent, so cheap to re-check on every spawn.
+            if (_home_abs / "config.toml").is_file():
+                _patch_codex_warm_token_headers(_home_abs / "config.toml", mcp_servers)
         staged_home = f"/aw-{creds_dir.lstrip('.')}-home"
         _mount(_home_rel, staged_home, ro=False)
         if spec.get("home_env"):
