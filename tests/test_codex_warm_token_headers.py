@@ -16,6 +16,18 @@ once, unlike the per-turn `X-Aw-Caller-Run-Id` — reaches codex without ever
 writing a session's actual token into the ONE $CODEX_HOME shared across
 every codex run workspace-wide.
 
+A first version of this fix keyed the patch on `job["mcp_servers"]`'s own
+key names (e.g. "crispal", from that agent's agent-config) and shipped
+green — every unit test here passed — but a LIVE dispatch against
+crispal-codex still 400'd identically. Root cause: codex's
+`mcp_config_flag: None` means it never receives a job's per-agent-config
+server payload at all (unlike claude's regenerated `--mcp-config`), so
+every codex agent shares the ONE static entry `aw-workspace-cli agent
+sync` wrote (named "aw-gateway" here) regardless of which agent-config it
+runs under — a name that has nothing to do with the job's own server
+names. `test_patches_aw_gateway_even_when_job_uses_a_different_server_name`
+below pins exactly this gap.
+
 Run: python3 -m pytest tests/test_codex_warm_token_headers.py
 """
 from __future__ import annotations
@@ -48,7 +60,7 @@ def test_adds_env_http_headers_for_a_configured_server(tmp_path):
     config = tmp_path / "config.toml"
     config.write_text(CONFIG_TOML_BASE)
 
-    changed = execute_mod._patch_codex_warm_token_headers(config, ["aw-gateway"])
+    changed = execute_mod._patch_codex_warm_token_headers(config)
 
     assert changed is True
     text = config.read_text()
@@ -62,9 +74,9 @@ def test_is_idempotent(tmp_path):
     config = tmp_path / "config.toml"
     config.write_text(CONFIG_TOML_BASE)
 
-    execute_mod._patch_codex_warm_token_headers(config, ["aw-gateway"])
+    execute_mod._patch_codex_warm_token_headers(config)
     once = config.read_text()
-    changed_again = execute_mod._patch_codex_warm_token_headers(config, ["aw-gateway"])
+    changed_again = execute_mod._patch_codex_warm_token_headers(config)
 
     assert changed_again is False
     assert config.read_text() == once
@@ -72,20 +84,18 @@ def test_is_idempotent(tmp_path):
 
 
 def test_never_invents_a_server_this_config_toml_never_defined(tmp_path):
-    """A codex-unaware caller (e.g. an agent whose configured MCP servers
-    include something only claude/gemini use) must not get a bare
-    env_http_headers subtable — codex's own RawMcpServerConfig rejects a
-    [mcp_servers.<name>] table with neither `command` nor `url` as "invalid
-    transport", which would break EVERY codex run reading this file."""
+    """A config.toml with no real [mcp_servers.<name>] table at all (only
+    unrelated sections) must come back unchanged — codex's own
+    RawMcpServerConfig rejects a table with neither `command` nor `url` as
+    "invalid transport", which would break EVERY codex run reading this
+    file."""
     config = tmp_path / "config.toml"
-    config.write_text(CONFIG_TOML_BASE)
+    config.write_text('[projects."/opt/aw-workspace"]\ntrust_level = "trusted"\n')
 
-    changed = execute_mod._patch_codex_warm_token_headers(
-        config, ["aw-gateway", "some-other-server-codex-never-configured"])
+    changed = execute_mod._patch_codex_warm_token_headers(config)
 
-    assert changed is True  # aw-gateway still gets patched
-    text = config.read_text()
-    assert "some-other-server-codex-never-configured" not in text
+    assert changed is False
+    assert "env_http_headers" not in config.read_text()
 
 
 def test_inserts_under_an_existing_manual_env_http_headers_table(tmp_path):
@@ -96,7 +106,7 @@ def test_inserts_under_an_existing_manual_env_http_headers_table(tmp_path):
         + 'X-Some-Other-Header = "SOME_OTHER_ENV_VAR"\n'
     )
 
-    changed = execute_mod._patch_codex_warm_token_headers(config, ["aw-gateway"])
+    changed = execute_mod._patch_codex_warm_token_headers(config)
 
     assert changed is True
     text = config.read_text()
@@ -105,10 +115,26 @@ def test_inserts_under_an_existing_manual_env_http_headers_table(tmp_path):
     assert 'X-Aw-Warm-Token = "AW_MCP_WARM_TOKEN"' in text
 
 
+def test_patches_every_real_server_table_regardless_of_name(tmp_path):
+    config = tmp_path / "config.toml"
+    config.write_text(
+        CONFIG_TOML_BASE
+        + '\n[mcp_servers.a-second-server]\n'
+        + 'url = "http://somewhere-else:9999/mcp"\n'
+    )
+
+    changed = execute_mod._patch_codex_warm_token_headers(config)
+
+    assert changed is True
+    text = config.read_text()
+    assert "[mcp_servers.aw-gateway.env_http_headers]" in text
+    assert "[mcp_servers.a-second-server.env_http_headers]" in text
+
+
 def test_missing_config_toml_is_a_noop_not_an_error(tmp_path):
     config = tmp_path / "does-not-exist.toml"
 
-    changed = execute_mod._patch_codex_warm_token_headers(config, ["aw-gateway"])
+    changed = execute_mod._patch_codex_warm_token_headers(config)
 
     assert changed is False
     assert not config.exists()
@@ -118,7 +144,7 @@ def test_unparseable_toml_is_a_noop_not_an_error(tmp_path):
     config = tmp_path / "config.toml"
     config.write_text("this is not [ valid toml")
 
-    changed = execute_mod._patch_codex_warm_token_headers(config, ["aw-gateway"])
+    changed = execute_mod._patch_codex_warm_token_headers(config)
 
     assert changed is False
 
@@ -127,11 +153,11 @@ def test_unparseable_toml_is_a_noop_not_an_error(tmp_path):
 # End to end: a real codex spawn gets the env var AND the patched config.toml
 # ---------------------------------------------------------------------------
 
-def _mcp_servers_payload(warm_token: str = "warm-token-abc123") -> dict:
+def _mcp_servers_payload(warm_token: str = "warm-token-abc123", server_name: str = "aw-gateway") -> dict:
     return {
-        "aw-gateway": {
+        server_name: {
             "type": "streamable-http",
-            "url": "http://aw-app-mcp-gateway:9200/mcp",
+            "url": "http://aw-app-mcp-gateway:9200/mcp/some-profile",
             "headers": {
                 "Authorization": "Bearer some-static-gateway-token",
                 "X-Aw-Caller-Run-Id": "run-xyz",
@@ -168,6 +194,38 @@ def test_build_container_kwargs_sets_the_warm_token_env_var(tmp_path, monkeypatc
     # workspace tree.
     staged_config = home / ".codex" / "isolated" / "r-warm-token" / "creds" / "config.toml"
     assert 'X-Aw-Warm-Token = "AW_MCP_WARM_TOKEN"' in staged_config.read_text()
+
+
+def test_patches_aw_gateway_even_when_job_uses_a_different_server_name(tmp_path, monkeypatch):
+    """THE live-reproduced bug: crispal-codex's agent-config names its MCP
+    server "crispal" (a scoped gateway profile URL), which never appears
+    anywhere in codex's own static config.toml (only "aw-gateway" does,
+    from `aw-workspace-cli agent sync`). The header patch must land on
+    "aw-gateway" — the table codex ACTUALLY reads — not on "crispal", which
+    would silently no-op exactly like the first, live-broken version of
+    this fix did."""
+    ws = tmp_path / "ws"
+    home = tmp_path / "home"
+    codex_dir = home / ".codex"
+    codex_dir.mkdir(parents=True)
+    (codex_dir / "auth.json").write_text('{"last_refresh": "2026-09-05T00:00:00Z"}')
+    (codex_dir / "config.toml").write_text(CONFIG_TOML_BASE)
+
+    monkeypatch.setattr(execute_mod, "REAL_HOME", str(home))
+    monkeypatch.setattr(execute_mod, "WORKSPACE_HOME_HOST_DIR", "/host/aw-workspace-home")
+    monkeypatch.setattr(execute_mod, "WORKSPACE_HOST_DIR", "/host/aw-workspace")
+    monkeypatch.setattr(execute_mod, "WORKSPACE_CONTAINER_DIR", str(ws))
+
+    _, _, kwargs, _ = execute_mod._build_container_kwargs({
+        "run_id": "r-crispal-name-mismatch", "cli": "codex", "prompt": "hi",
+        "mcp_servers": _mcp_servers_payload("warm-token-xyz", server_name="crispal"),
+    })
+
+    assert kwargs["environment"][execute_mod.CODEX_WARM_TOKEN_ENV_VAR] == "warm-token-xyz"
+    staged_config = home / ".codex" / "isolated" / "r-crispal-name-mismatch" / "creds" / "config.toml"
+    text = staged_config.read_text()
+    assert "[mcp_servers.aw-gateway.env_http_headers]" in text
+    assert "crispal" not in text  # never invented — see the module docstring
 
 
 def test_build_container_kwargs_patches_an_already_populated_shared_home(tmp_path, monkeypatch):

@@ -647,16 +647,28 @@ def _resync_shared_cli_home_auth(shared_home: Path, staged_creds_dir: Path,
                     src, shared_home, exc_info=True)
 
 
-def _patch_codex_warm_token_headers(config_toml: Path, server_names) -> bool:
+def _patch_codex_warm_token_headers(config_toml: Path) -> bool:
     """Add ``env_http_headers`` (codex's config_types.rs — a header NAME
     mapped to an env-var NAME, not a value) so codex forwards
     ``X-Aw-Warm-Token`` on its already-configured MCP connections, sourced
     from ``CODEX_WARM_TOKEN_ENV_VAR`` in its own process environment.
 
-    Deliberately does NOT touch any server name that isn't already a real
-    ``[mcp_servers.<name>]`` table with a ``url`` in this exact config.toml:
+    Patches every ALREADY-CONFIGURED streamable_http server table found in
+    this exact config.toml — never one keyed by a job's own
+    ``mcp_servers`` names. Live-verified 2026-09-05 (card
+    bug:codex-warm-caller-run-id-unresolved) that those two are NOT the
+    same set: codex's ``mcp_config_flag: None`` means it never receives a
+    job's per-agent-config server payload at all (unlike claude's
+    ``--mcp-config``), so every codex agent — crispal-codex, coder-codex,
+    whichever — shares this ONE static entry from ``aw-workspace-cli agent
+    sync`` (named "aw-gateway" today, but the name itself isn't the
+    contract; PATCH WHAT'S ACTUALLY THERE). A first attempt keyed on the
+    job's server name ("crispal", from that agent's own agent-config) and
+    silently patched nothing, because that name was never in this file.
+
+    Also why this never invents a NEW ``[mcp_servers.<name>]`` table:
     codex's own ``RawMcpServerConfig`` rejects a table with neither
-    ``command`` nor ``url`` as "invalid transport", so inventing a bare
+    ``command`` nor ``url`` as "invalid transport", so a bare
     ``env_http_headers`` subtable for a server this config.toml never
     defined would break EVERY codex run reading this file, not just skip
     one header. Idempotent — safe to call on every spawn, cold or warm.
@@ -678,8 +690,7 @@ def _patch_codex_warm_token_headers(config_toml: Path, server_names) -> bool:
                     "header patch", config_toml, exc_info=True)
         return False
     changed = False
-    for name in server_names:
-        server = configured.get(name)
+    for name, server in configured.items():
         if not isinstance(server, dict) or not server.get("url"):
             continue  # not a real streamable_http entry in THIS config.toml
         if (server.get("env_http_headers") or {}).get("X-Aw-Warm-Token") == CODEX_WARM_TOKEN_ENV_VAR:
@@ -966,7 +977,7 @@ def _build_container_kwargs(job: dict) -> tuple[str, list[str], dict, str | None
                 # header patch the first time it's ever populated from this
                 # staged copy (see the codex branch below for the case where
                 # the shared home already existed before this fix shipped).
-                _patch_codex_warm_token_headers(creds_copy / "config.toml", mcp_servers)
+                _patch_codex_warm_token_headers(creds_copy / "config.toml")
             for path in [creds_copy, *creds_copy.rglob("*")]:
                 path.chmod(0o777 if path.is_dir() else 0o666)
             _host_creds = str(isolated_host_dir).replace(
@@ -1352,7 +1363,7 @@ def _build_container_kwargs(job: dict) -> tuple[str, list[str], dict, str | None
             # would otherwise never pick up the warm-token header patch.
             # Idempotent, so cheap to re-check on every spawn.
             if (_home_abs / "config.toml").is_file():
-                _patch_codex_warm_token_headers(_home_abs / "config.toml", mcp_servers)
+                _patch_codex_warm_token_headers(_home_abs / "config.toml")
         staged_home = f"/aw-{creds_dir.lstrip('.')}-home"
         _mount(_home_rel, staged_home, ro=False)
         if spec.get("home_env"):
