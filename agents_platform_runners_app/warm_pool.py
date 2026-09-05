@@ -511,7 +511,7 @@ def dispatch_turn(*, client, name: str, run_id: str, prompt: str, cli: str = "cl
     """
     c = client.containers.get(name)
 
-    turn_env = f"export NOTION_TASK_ID={_sh(notion_task_id)}\nexport AW_SOURCE_DEVICE={_sh(source_device)}\n"
+    turn_env = f"export AW_RUN_ID={_sh(run_id)}\nexport NOTION_TASK_ID={_sh(notion_task_id)}\nexport AW_SOURCE_DEVICE={_sh(source_device)}\n"
     setup_cmd = (
         f"printf '%s' {_sh(run_id)} > /home/ubuntu/.aw-warm/current_run_id && "
         f"printf '%s' {_sh(turn_env)} > /home/ubuntu/.aw-warm/turn_env"
