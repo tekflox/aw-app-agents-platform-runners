@@ -158,14 +158,39 @@ class AgentsPlatformRunnersAppPlugin:
         # next HTTP request, with no app or workspace restart needed.
         self._live_config: dict = {}
 
-    async def activate(self, ctx) -> None:
-        with open(os.path.join(ctx.package_dir, "aw-app.json"), encoding="utf-8") as f:
-            json.load(f)  # validated at install time — just confirms the file is readable here
-
+    def _refresh_derived_config(self, ctx) -> dict:
+        """In-process derived state ONLY, safe to run on every worker: mutate
+        ``self._live_config`` in place (never rebind — see the docstring on
+        the attribute) and re-point ``execution_index_mod`` at it. No disk,
+        no network, no podman — that's what makes this callable from
+        :meth:`on_config_reloaded`, which core runs on all
+        ``AW_WORKSPACE_WORKERS`` workers, not just the one that served the
+        config-save POST."""
         config = getattr(ctx, "config", {}) or {}
         self._live_config.clear()
         self._live_config.update(config)
         execution_index_mod.configure(self._live_config)
+        return config
+
+    async def on_config_reloaded(self, ctx) -> None:
+        """ATTACH half of a config save (``src/apps/base.py``'s ``Plugin``
+        contract) — core calls this on EVERY worker, either inline on the
+        request worker or via the ``apps:changed`` broadcast on the other
+        nine. Before this existed, ``self._live_config`` was only ever
+        refreshed in :meth:`activate` and :meth:`on_config_saved` — both of
+        which run on a SINGLE worker — so a worker that never served a
+        config-save POST (e.g. the Redis-lease leader running the kanban
+        sweep watchdog) could hold a stale ``_live_config`` forever. That is
+        the exact failure the kanban_sweep_enabled live test hit on
+        2026-09-06: the flag flipped on one worker and the leader never saw
+        it. This hook is the fix — no more, no less."""
+        self._refresh_derived_config(ctx)
+
+    async def activate(self, ctx) -> None:
+        with open(os.path.join(ctx.package_dir, "aw-app.json"), encoding="utf-8") as f:
+            json.load(f)  # validated at install time — just confirms the file is readable here
+
+        config = self._refresh_derived_config(ctx)
         mcp_doc = write_mcp_json(ctx.package_dir, self._live_config)
 
         ctx.routes.register(routes_mod.build_routes(self._live_config))
@@ -421,11 +446,14 @@ class AgentsPlatformRunnersAppPlugin:
         only updated the on-disk config — the routes' in-memory `cfg` was
         still the stale snapshot from activate(), so nothing short of a
         full workspace-process restart made a saved secret actually take
-        effect."""
-        config = getattr(ctx, "config", {}) or {}
-        self._live_config.clear()
-        self._live_config.update(config)
-        execution_index_mod.configure(self._live_config)
+        effect.
+
+        Core calls :meth:`on_config_reloaded` right before this, on this same
+        worker, so ``self._live_config`` is already fresh by the time this
+        runs — the refresh call below is therefore redundant on that path,
+        but stays so this method still works standalone (e.g. a test that
+        calls it directly, or a duck-typed caller predating the split)."""
+        config = self._refresh_derived_config(ctx)
         mcp_doc = write_mcp_json(ctx.package_dir, self._live_config)
         log.info("aw-app-agents-platform-runners config saved: mcp.json servers=%s", list(mcp_doc["mcpServers"]))
 
