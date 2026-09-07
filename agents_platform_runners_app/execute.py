@@ -101,7 +101,21 @@ CONTAINER_SOCKET = os.environ.get("AW_CONTAINER_SOCKET")
 # is THIS app's own podman socket used to spawn the agent container in the
 # first place — the permission is about what the spawned agent may reach,
 # not how it gets spawned.
-DOCKER_SOCKET_PATH = os.environ.get("AW_DOCKER_SOCKET_PATH", "/var/run/docker.sock")
+#
+# Falls back to CONTAINER_SOCKET, not a bare hardcoded "/var/run/docker.sock",
+# when AW_DOCKER_SOCKET_PATH is unset AND that literal path doesn't exist:
+# this workspace's own container engine is podman
+# (/run/user/<uid>/podman/podman.sock, see containers.py), which speaks the
+# Docker API — the same socket this app already uses via `docker_sdk.
+# DockerClient` above — but has no file at /var/run/docker.sock at all. Found
+# live 2026-09-07: the "docker" permission was silently no-op on every agent
+# on this podman-only deployment (confirmed via a running agent's own mount
+# table showing no /var/run/docker.sock despite its Agent Config's "docker"
+# permission being on) because `Path(DOCKER_SOCKET_PATH).exists()` below was
+# always False — no error, nothing logged, the checkbox just did nothing.
+DOCKER_SOCKET_PATH = os.environ.get("AW_DOCKER_SOCKET_PATH") or (
+    "/var/run/docker.sock" if os.path.exists("/var/run/docker.sock") else CONTAINER_SOCKET
+)
 # Persistent path where the workspace's long-lived Claude OAuth token
 # (`claude setup-token`, valid ~1 year) is stored. Lives under
 # `.aw-workspace/` — on the persistent /opt/aw-workspace bind-mount, preserved
@@ -1093,8 +1107,17 @@ def _build_container_kwargs(job: dict) -> tuple[str, list[str], dict, str | None
     # "docker" and "tmp_access" mirror executor.py's _perm_volumes entries of
     # the same name. They were dropped on this path entirely — a config could
     # tick either box and nothing happened, with no log to say so.
-    if _perms.get("docker") and Path(DOCKER_SOCKET_PATH).exists():
-        volumes[DOCKER_SOCKET_PATH] = {"bind": "/var/run/docker.sock", "mode": "rw"}
+    if _perms.get("docker"):
+        if DOCKER_SOCKET_PATH and Path(DOCKER_SOCKET_PATH).exists():
+            volumes[DOCKER_SOCKET_PATH] = {"bind": "/var/run/docker.sock", "mode": "rw"}
+        else:
+            # Keep this loud: a resolved-but-missing socket is exactly the
+            # "checkbox is cosmetic" bug found 2026-09-07 (see
+            # DOCKER_SOCKET_PATH's own comment) — silently continuing here
+            # would just reproduce it under a different cause next time.
+            log.warning("execute: run=%s has the 'docker' permission on but no usable docker "
+                        "socket was found (DOCKER_SOCKET_PATH=%r) — set AW_DOCKER_SOCKET_PATH "
+                        "or AW_CONTAINER_SOCKET; the mount was skipped", run_id, DOCKER_SOCKET_PATH)
     if _perms.get("tmp_access") and WORKSPACE_HOST_DIR:
         # Create it OURSELVES, 0777. This bind replaces the image's own /tmp
         # (1777) with a host dir; when that dir does not exist podman creates

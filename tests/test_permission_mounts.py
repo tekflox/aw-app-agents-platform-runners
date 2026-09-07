@@ -161,6 +161,85 @@ def test_docker_permission_with_no_socket_present_is_skipped(tmp_path, monkeypat
     assert "/var/run/docker.sock" not in _binds(vols)
 
 
+def test_docker_permission_with_no_socket_present_warns(tmp_path, monkeypatch, caplog):
+    """The 'checkbox does nothing' bug (found 2026-09-07) must never be silent
+    again — a granted-but-unmountable permission has to say so in the logs."""
+    import logging
+    _setup(tmp_path, monkeypatch)
+    monkeypatch.setattr(execute_mod, "DOCKER_SOCKET_PATH", str(tmp_path / "nope.sock"))
+
+    with caplog.at_level(logging.WARNING, logger="aw_apps.agents_platform_runners.execute"):
+        _volumes(_job(permissions={"workspace_access": True, "docker": True}))
+    assert any("docker" in rec.message and "permission" in rec.message
+               for rec in caplog.records)
+
+
+def test_docker_permission_with_no_socket_configured_warns(tmp_path, monkeypatch, caplog):
+    """DOCKER_SOCKET_PATH itself can resolve to None (both AW_DOCKER_SOCKET_PATH
+    and AW_CONTAINER_SOCKET unset, no /var/run/docker.sock on this host) — must
+    not raise on Path(None) and must still warn rather than mount nothing
+    quietly."""
+    import logging
+    _setup(tmp_path, monkeypatch)
+    monkeypatch.setattr(execute_mod, "DOCKER_SOCKET_PATH", None)
+
+    with caplog.at_level(logging.WARNING, logger="aw_apps.agents_platform_runners.execute"):
+        vols = _volumes(_job(permissions={"workspace_access": True, "docker": True}))
+    assert "/var/run/docker.sock" not in _binds(vols)
+    assert any("docker" in rec.message and "permission" in rec.message
+               for rec in caplog.records)
+
+
+# --- DOCKER_SOCKET_PATH's own module-level fallback --------------------------
+
+
+def test_docker_socket_path_defaults_to_container_socket_on_a_podman_host(monkeypatch):
+    """The actual live bug: this workspace's container engine is podman, not
+    docker — there is no /var/run/docker.sock at all, only the podman socket
+    already resolved into AW_CONTAINER_SOCKET (used elsewhere in this file via
+    docker_sdk.DockerClient, which podman's socket also speaks). Without a
+    fallback, DOCKER_SOCKET_PATH stayed hardcoded to a path that never exists
+    on such a host, and the 'docker' permission was cosmetic for every agent
+    here — found live 2026-09-07 via a running agent's own mount table."""
+    import importlib
+
+    monkeypatch.delenv("AW_DOCKER_SOCKET_PATH", raising=False)
+    monkeypatch.setenv("AW_CONTAINER_SOCKET", "/run/user/1001/podman/podman.sock")
+    monkeypatch.setattr("os.path.exists",
+                         lambda p: False if p == "/var/run/docker.sock" else True)
+    try:
+        reloaded = importlib.reload(execute_mod)
+        assert reloaded.DOCKER_SOCKET_PATH == "/run/user/1001/podman/podman.sock"
+    finally:
+        importlib.reload(execute_mod)  # restore the real module state for later tests
+
+
+def test_docker_socket_path_prefers_the_real_docker_socket_when_present(monkeypatch):
+    """A genuine docker host must keep working exactly as before — the podman
+    fallback only kicks in when /var/run/docker.sock truly doesn't exist."""
+    import importlib
+
+    monkeypatch.delenv("AW_DOCKER_SOCKET_PATH", raising=False)
+    monkeypatch.setenv("AW_CONTAINER_SOCKET", "/run/user/1001/podman/podman.sock")
+    monkeypatch.setattr("os.path.exists", lambda p: True)
+    try:
+        reloaded = importlib.reload(execute_mod)
+        assert reloaded.DOCKER_SOCKET_PATH == "/var/run/docker.sock"
+    finally:
+        importlib.reload(execute_mod)  # restore the real module state for later tests
+
+
+def test_docker_socket_path_honours_an_explicit_override(monkeypatch):
+    import importlib
+
+    monkeypatch.setenv("AW_DOCKER_SOCKET_PATH", "/custom/docker.sock")
+    try:
+        reloaded = importlib.reload(execute_mod)
+        assert reloaded.DOCKER_SOCKET_PATH == "/custom/docker.sock"
+    finally:
+        importlib.reload(execute_mod)  # restore the real module state for later tests
+
+
 # --- tmp_access --------------------------------------------------------------
 
 
