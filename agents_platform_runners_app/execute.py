@@ -67,6 +67,7 @@ import json
 import logging
 import os
 import shutil
+import stat
 import threading
 import time
 import uuid
@@ -96,6 +97,27 @@ WORKSPACE_HOME_HOST_DIR = os.environ.get("AW_WORKSPACE_HOME_HOST_DIR", "")
 # live credentials the workspace's own login writes actually resolve.
 REAL_HOME = os.environ.get("HOME") or "/home/ubuntu"
 CONTAINER_SOCKET = os.environ.get("AW_CONTAINER_SOCKET")
+
+
+def _is_usable_socket(path: str | None) -> bool:
+    """True only for a real, connectable AF_UNIX socket at *path*.
+
+    `Path.exists()` is not enough here: several base images (and this one,
+    confirmed live 2026-09-07) ship a plain placeholder DIRECTORY at
+    /var/run/docker.sock — `Path("/var/run/docker.sock").exists()` reports
+    True for that, so a naive existence check would "successfully" resolve
+    DOCKER_SOCKET_PATH to a path that can never actually be bind-mounted as a
+    working docker socket, silently reproducing the exact bug this file's
+    other DOCKER_SOCKET_PATH comment describes fixing. `stat.S_ISSOCK` is the
+    one check that can't be fooled by a directory or a stray empty file."""
+    if not path:
+        return False
+    try:
+        return stat.S_ISSOCK(os.stat(path).st_mode)
+    except OSError:
+        return False
+
+
 # Host path of the docker socket handed to an agent that has the Agent
 # Config's "docker" permission. Distinct from CONTAINER_SOCKET above, which
 # is THIS app's own podman socket used to spawn the agent container in the
@@ -103,18 +125,19 @@ CONTAINER_SOCKET = os.environ.get("AW_CONTAINER_SOCKET")
 # not how it gets spawned.
 #
 # Falls back to CONTAINER_SOCKET, not a bare hardcoded "/var/run/docker.sock",
-# when AW_DOCKER_SOCKET_PATH is unset AND that literal path doesn't exist:
-# this workspace's own container engine is podman
+# when AW_DOCKER_SOCKET_PATH is unset AND that literal path isn't a real
+# socket: this workspace's own container engine is podman
 # (/run/user/<uid>/podman/podman.sock, see containers.py), which speaks the
 # Docker API — the same socket this app already uses via `docker_sdk.
-# DockerClient` above — but has no file at /var/run/docker.sock at all. Found
-# live 2026-09-07: the "docker" permission was silently no-op on every agent
-# on this podman-only deployment (confirmed via a running agent's own mount
-# table showing no /var/run/docker.sock despite its Agent Config's "docker"
-# permission being on) because `Path(DOCKER_SOCKET_PATH).exists()` below was
-# always False — no error, nothing logged, the checkbox just did nothing.
+# DockerClient` above — but /var/run/docker.sock is a placeholder directory
+# here, not a socket. Found live 2026-09-07: the "docker" permission was
+# silently no-op on every agent on this deployment (confirmed via a running
+# agent's own mount table showing no /var/run/docker.sock despite its Agent
+# Config's "docker" permission being on) because `Path(DOCKER_SOCKET_PATH)
+# .exists()` below was always False — no error, nothing logged, the checkbox
+# just did nothing.
 DOCKER_SOCKET_PATH = os.environ.get("AW_DOCKER_SOCKET_PATH") or (
-    "/var/run/docker.sock" if os.path.exists("/var/run/docker.sock") else CONTAINER_SOCKET
+    "/var/run/docker.sock" if _is_usable_socket("/var/run/docker.sock") else CONTAINER_SOCKET
 )
 # Persistent path where the workspace's long-lived Claude OAuth token
 # (`claude setup-token`, valid ~1 year) is stored. Lives under
@@ -1108,7 +1131,7 @@ def _build_container_kwargs(job: dict) -> tuple[str, list[str], dict, str | None
     # the same name. They were dropped on this path entirely — a config could
     # tick either box and nothing happened, with no log to say so.
     if _perms.get("docker"):
-        if DOCKER_SOCKET_PATH and Path(DOCKER_SOCKET_PATH).exists():
+        if _is_usable_socket(DOCKER_SOCKET_PATH):
             volumes[DOCKER_SOCKET_PATH] = {"bind": "/var/run/docker.sock", "mode": "rw"}
         else:
             # Keep this loud: a resolved-but-missing socket is exactly the

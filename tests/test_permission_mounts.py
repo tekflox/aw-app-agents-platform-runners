@@ -15,6 +15,9 @@ Run: python3 -m pytest -c /dev/null tests/test_permission_mounts.py
 """
 from __future__ import annotations
 
+import os
+import socket
+import stat
 import sys
 from pathlib import Path
 
@@ -25,6 +28,17 @@ from agents_platform_runners_app import execute as execute_mod  # noqa: E402
 
 WS_HOST = "/host/aw-workspace"
 WS_BIND = "/opt/aw-workspace"
+
+
+def _make_socket(path):
+    """A real AF_UNIX socket at *path* — execute.py's docker-permission mount
+    now requires `stat.S_ISSOCK`, not just Path.exists(), precisely because a
+    plain file/dir at the well-known docker socket path is exactly the
+    false-positive that made the permission cosmetic in production
+    (2026-09-07)."""
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    sock.bind(str(path))
+    return sock
 
 
 def _setup(tmp_path, monkeypatch):
@@ -133,21 +147,54 @@ def test_the_two_executors_agree_on_every_input(tmp_path, monkeypatch):
 
 def test_docker_permission_mounts_the_socket(tmp_path, monkeypatch):
     _setup(tmp_path, monkeypatch)
-    sock = tmp_path / "docker.sock"
-    sock.write_text("")
-    monkeypatch.setattr(execute_mod, "DOCKER_SOCKET_PATH", str(sock))
+    sock_path = tmp_path / "docker.sock"
+    sock = _make_socket(sock_path)
+    try:
+        monkeypatch.setattr(execute_mod, "DOCKER_SOCKET_PATH", str(sock_path))
 
-    vols = _volumes(_job(permissions={"workspace_access": True, "docker": True}))
-    assert vols[str(sock)] == {"bind": "/var/run/docker.sock", "mode": "rw"}
+        vols = _volumes(_job(permissions={"workspace_access": True, "docker": True}))
+        assert vols[str(sock_path)] == {"bind": "/var/run/docker.sock", "mode": "rw"}
+    finally:
+        sock.close()
 
 
 def test_docker_permission_off_leaves_the_socket_out(tmp_path, monkeypatch):
     _setup(tmp_path, monkeypatch)
-    sock = tmp_path / "docker.sock"
-    sock.write_text("")
-    monkeypatch.setattr(execute_mod, "DOCKER_SOCKET_PATH", str(sock))
+    sock_path = tmp_path / "docker.sock"
+    sock = _make_socket(sock_path)
+    try:
+        monkeypatch.setattr(execute_mod, "DOCKER_SOCKET_PATH", str(sock_path))
 
-    vols = _volumes(_job(permissions={"workspace_access": True}))
+        vols = _volumes(_job(permissions={"workspace_access": True}))
+        assert "/var/run/docker.sock" not in _binds(vols)
+    finally:
+        sock.close()
+
+
+def test_docker_permission_with_a_plain_file_at_the_path_is_skipped(tmp_path, monkeypatch):
+    """The actual false positive found live 2026-09-07: this workspace's own
+    /var/run/docker.sock is a placeholder directory, not a socket — a bare
+    Path.exists() check treats it as usable and 'successfully' resolves to a
+    path that can never be bind-mounted as a working docker socket. A plain
+    file reproduces the same false-positive shape and must be rejected too."""
+    _setup(tmp_path, monkeypatch)
+    not_a_socket = tmp_path / "docker.sock"
+    not_a_socket.write_text("")
+    monkeypatch.setattr(execute_mod, "DOCKER_SOCKET_PATH", str(not_a_socket))
+
+    vols = _volumes(_job(permissions={"workspace_access": True, "docker": True}))
+    assert "/var/run/docker.sock" not in _binds(vols)
+
+
+def test_docker_permission_with_a_directory_at_the_path_is_skipped(tmp_path, monkeypatch):
+    """The literal shape of the live bug: a directory at the well-known
+    default path, exactly what /var/run/docker.sock turned out to be here."""
+    _setup(tmp_path, monkeypatch)
+    a_directory = tmp_path / "docker.sock"
+    a_directory.mkdir()
+    monkeypatch.setattr(execute_mod, "DOCKER_SOCKET_PATH", str(a_directory))
+
+    vols = _volumes(_job(permissions={"workspace_access": True, "docker": True}))
     assert "/var/run/docker.sock" not in _binds(vols)
 
 
@@ -194,19 +241,25 @@ def test_docker_permission_with_no_socket_configured_warns(tmp_path, monkeypatch
 
 
 def test_docker_socket_path_defaults_to_container_socket_on_a_podman_host(monkeypatch):
-    """The actual live bug: this workspace's container engine is podman, not
-    docker — there is no /var/run/docker.sock at all, only the podman socket
-    already resolved into AW_CONTAINER_SOCKET (used elsewhere in this file via
-    docker_sdk.DockerClient, which podman's socket also speaks). Without a
-    fallback, DOCKER_SOCKET_PATH stayed hardcoded to a path that never exists
-    on such a host, and the 'docker' permission was cosmetic for every agent
-    here — found live 2026-09-07 via a running agent's own mount table."""
+    """The actual live bug: this workspace's /var/run/docker.sock is a
+    placeholder DIRECTORY (not a socket) — the podman socket already resolved
+    into AW_CONTAINER_SOCKET (used elsewhere in this file via
+    docker_sdk.DockerClient, which podman's socket also speaks) is the one
+    that actually works. Without this fallback, DOCKER_SOCKET_PATH stayed
+    hardcoded to a path that exists-but-isn't-a-socket, and the 'docker'
+    permission was cosmetic for every agent here — found live 2026-09-07 via
+    a running agent's own mount table."""
     import importlib
+    import types
 
     monkeypatch.delenv("AW_DOCKER_SOCKET_PATH", raising=False)
     monkeypatch.setenv("AW_CONTAINER_SOCKET", "/run/user/1001/podman/podman.sock")
-    monkeypatch.setattr("os.path.exists",
-                         lambda p: False if p == "/var/run/docker.sock" else True)
+    real_stat = os.stat
+    monkeypatch.setattr(
+        "os.stat",
+        lambda p, *a, **k: types.SimpleNamespace(st_mode=stat.S_IFDIR)
+        if p == "/var/run/docker.sock" else real_stat(p, *a, **k),
+    )
     try:
         reloaded = importlib.reload(execute_mod)
         assert reloaded.DOCKER_SOCKET_PATH == "/run/user/1001/podman/podman.sock"
@@ -216,12 +269,16 @@ def test_docker_socket_path_defaults_to_container_socket_on_a_podman_host(monkey
 
 def test_docker_socket_path_prefers_the_real_docker_socket_when_present(monkeypatch):
     """A genuine docker host must keep working exactly as before — the podman
-    fallback only kicks in when /var/run/docker.sock truly doesn't exist."""
+    fallback only kicks in when /var/run/docker.sock isn't a real socket."""
     import importlib
+    import types
 
     monkeypatch.delenv("AW_DOCKER_SOCKET_PATH", raising=False)
     monkeypatch.setenv("AW_CONTAINER_SOCKET", "/run/user/1001/podman/podman.sock")
-    monkeypatch.setattr("os.path.exists", lambda p: True)
+    monkeypatch.setattr(
+        "os.stat",
+        lambda p, *a, **k: types.SimpleNamespace(st_mode=stat.S_IFSOCK),
+    )
     try:
         reloaded = importlib.reload(execute_mod)
         assert reloaded.DOCKER_SOCKET_PATH == "/var/run/docker.sock"
