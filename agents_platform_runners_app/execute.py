@@ -169,28 +169,51 @@ DOCKER_SOCKET_HOST_PATH = os.environ.get("AW_DOCKER_SOCKET_HOST_PATH", "")
 _DOCKER_SOCKET_BIND_SOURCE: str | None = None
 
 
+def _has_workspace_mount(container) -> bool:
+    """True when *container* carries the workspace bind whose BOTH sides we
+    already know (WORKSPACE_CONTAINER_DIR <- WORKSPACE_HOST_DIR) — the one
+    identity signal available here that needs neither a hostname nor an id."""
+    want_src = WORKSPACE_HOST_DIR.rstrip("/")
+    want_dst = WORKSPACE_CONTAINER_DIR.rstrip("/")
+    for m in (container.attrs.get("Mounts") or []):
+        if (str(m.get("Destination") or "").rstrip("/") == want_dst
+                and str(m.get("Source") or "").rstrip("/") == want_src):
+            return True
+    return False
+
+
 def _self_container(client):
     """This process's own container as the daemon sees it, or None.
 
-    $HOSTNAME is the short container id under both podman and docker unless
-    something passed --hostname, so it is verified rather than trusted: a real
-    match has to carry the workspace bind-mount whose host side we already know
-    (WORKSPACE_CONTAINER_DIR <- WORKSPACE_HOST_DIR)."""
-    name = (os.environ.get("HOSTNAME") or "").strip()
-    if not name:
+    The hostname is the short container id under both podman and docker unless
+    something passed --hostname, so it's the cheap first guess — verified, not
+    trusted, against the workspace mount above. `socket.gethostname()` rather
+    than $HOSTNAME because the env var is only set for a container's PRIMARY
+    process: under `podman exec` (how this gets verified live) it is absent,
+    while the UTS namespace an exec session joins still answers correctly.
+
+    Falls back to finding ourselves by that same workspace mount when the
+    hostname is no help at all — a custom --hostname, or an engine that won't
+    resolve a short id."""
+    import socket as _socket
+    for name in ((os.environ.get("HOSTNAME") or "").strip(),
+                 (_socket.gethostname() or "").strip()):
+        if not name:
+            continue
+        try:
+            c = client.containers.get(name)
+        except Exception:
+            continue
+        if not WORKSPACE_HOST_DIR or _has_workspace_mount(c):
+            return c
+    if not WORKSPACE_HOST_DIR:
         return None
     try:
-        c = client.containers.get(name)
+        for c in client.containers.list():
+            if _has_workspace_mount(c):
+                return c
     except Exception:
         return None
-    if not WORKSPACE_HOST_DIR:
-        return c
-    want_src = WORKSPACE_HOST_DIR.rstrip("/")
-    want_dst = WORKSPACE_CONTAINER_DIR.rstrip("/")
-    for m in (c.attrs.get("Mounts") or []):
-        if (str(m.get("Destination") or "").rstrip("/") == want_dst
-                and str(m.get("Source") or "").rstrip("/") == want_src):
-            return c
     return None
 
 

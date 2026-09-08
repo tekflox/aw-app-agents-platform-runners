@@ -279,6 +279,9 @@ def _fake_docker_sdk(monkeypatch, container, expect_base_url=None):
                 raise RuntimeError("no such container")
             return container
 
+        def list(self):
+            return [container] if container is not None else []
+
     class _Client:
         def __init__(self, base_url=None):
             if expect_base_url is not None:
@@ -357,6 +360,29 @@ def test_bind_source_is_none_when_the_socket_is_not_bind_mounted_in(monkeypatch)
     ]))
 
     assert execute_mod._docker_socket_bind_source() is None
+
+
+def test_bind_source_found_by_mount_scan_when_the_hostname_is_no_help(monkeypatch):
+    """`podman exec` does not set $HOSTNAME (it is only in the PRIMARY process's
+    env) — found the hard way running the live check, where discovery fell back
+    to our own path and the test still failed. When neither name resolves us,
+    the workspace mount whose host side we already know identifies our container
+    on its own."""
+    _reset_bind_source_cache(monkeypatch)
+    monkeypatch.setattr(execute_mod, "DOCKER_SOCKET_PATH", "/run/podman.sock")
+    monkeypatch.setattr(execute_mod, "CONTAINER_SOCKET", "/run/podman.sock")
+    monkeypatch.setattr(execute_mod, "WORKSPACE_HOST_DIR", WS_HOST)
+    monkeypatch.setattr(execute_mod, "WORKSPACE_CONTAINER_DIR", WS_BIND)
+    monkeypatch.delenv("HOSTNAME", raising=False)
+    us = _FakeContainer([
+        {"Source": "/run/podman/podman.sock", "Destination": "/run/podman.sock"},
+        {"Source": WS_HOST, "Destination": WS_BIND},
+    ])
+    _fake_docker_sdk(monkeypatch, us)
+    import socket as _socket
+    monkeypatch.setattr(_socket, "gethostname", lambda: "")
+
+    assert execute_mod._docker_socket_bind_source() == "/run/podman/podman.sock"
 
 
 def test_bind_source_ignores_a_container_that_is_not_us(monkeypatch):
