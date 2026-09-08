@@ -237,6 +237,167 @@ def test_docker_permission_with_no_socket_configured_warns(tmp_path, monkeypatch
                for rec in caplog.records)
 
 
+def test_docker_permission_mounts_the_daemons_path_not_ours(tmp_path, monkeypatch):
+    """The 2026-09-08 root cause: the socket we can stat is a path in OUR mount
+    namespace, but the daemon resolves a bind SOURCE in ITS own. On this
+    podman-out-of-podman host /var/run/docker.sock and /run/podman.sock are both
+    real from in here and neither exists on the outer host, so mounting either
+    one handed the agent an empty DIRECTORY at /var/run/docker.sock."""
+    _setup(tmp_path, monkeypatch)
+    sock_path = tmp_path / "docker.sock"
+    sock = _make_socket(sock_path)
+    try:
+        monkeypatch.setattr(execute_mod, "DOCKER_SOCKET_PATH", str(sock_path))
+        monkeypatch.setattr(execute_mod, "_docker_socket_bind_source",
+                            lambda: "/run/podman/podman.sock")
+
+        vols = _volumes(_job(permissions={"workspace_access": True, "docker": True}))
+        assert vols["/run/podman/podman.sock"] == {"bind": "/var/run/docker.sock",
+                                                   "mode": "rw"}
+        assert str(sock_path) not in vols
+    finally:
+        sock.close()
+
+
+# --- the bind SOURCE's own resolution ----------------------------------------
+
+
+class _FakeContainer:
+    def __init__(self, mounts):
+        self.attrs = {"Mounts": mounts}
+
+
+def _fake_docker_sdk(monkeypatch, container, expect_base_url=None):
+    """A stand-in `docker` module whose DockerClient serves *container* for any
+    lookup — enough for _self_container/_docker_socket_bind_source, which only
+    ever call containers.get() and read .attrs."""
+    import types
+
+    class _Containers:
+        def get(self, _name):
+            if container is None:
+                raise RuntimeError("no such container")
+            return container
+
+    class _Client:
+        def __init__(self, base_url=None):
+            if expect_base_url is not None:
+                assert base_url == expect_base_url
+            self.containers = _Containers()
+
+    mod = types.ModuleType("docker")
+    mod.DockerClient = _Client
+    monkeypatch.setitem(sys.modules, "docker", mod)
+
+
+def _reset_bind_source_cache(monkeypatch):
+    monkeypatch.setattr(execute_mod, "_DOCKER_SOCKET_BIND_SOURCE", None)
+    monkeypatch.setattr(execute_mod, "DOCKER_SOCKET_HOST_PATH", "")
+
+
+def test_bind_source_env_override_wins(monkeypatch):
+    """The explicit escape hatch, mirroring AW_WORKSPACE_HOST_DIR — no daemon
+    call at all when the provisioner already told us the answer."""
+    _reset_bind_source_cache(monkeypatch)
+    monkeypatch.setattr(execute_mod, "DOCKER_SOCKET_HOST_PATH", "/somewhere/else.sock")
+    _fake_docker_sdk(monkeypatch, _FakeContainer([]))
+
+    assert execute_mod._docker_socket_bind_source() == "/somewhere/else.sock"
+
+
+def test_bind_source_discovered_from_our_own_mount_table(monkeypatch):
+    """The live shape: /var/run/docker.sock is a symlink to the destination the
+    socket was actually bound at, and the daemon's side of that bind is the only
+    valid mount source."""
+    _reset_bind_source_cache(monkeypatch)
+    monkeypatch.setattr(execute_mod, "DOCKER_SOCKET_PATH", "/run/podman.sock")
+    monkeypatch.setattr(execute_mod, "CONTAINER_SOCKET", "/run/podman.sock")
+    monkeypatch.setattr(execute_mod, "WORKSPACE_HOST_DIR", WS_HOST)
+    monkeypatch.setattr(execute_mod, "WORKSPACE_CONTAINER_DIR", WS_BIND)
+    monkeypatch.setenv("HOSTNAME", "5584662f4f57")
+    _fake_docker_sdk(monkeypatch, _FakeContainer([
+        {"Source": "/run/podman/podman.sock", "Destination": "/run/podman.sock"},
+        {"Source": WS_HOST, "Destination": WS_BIND},
+    ]), expect_base_url="unix:///run/podman.sock")
+
+    assert execute_mod._docker_socket_bind_source() == "/run/podman/podman.sock"
+
+
+def test_bind_source_follows_a_symlinked_socket_path(monkeypatch, tmp_path):
+    """DOCKER_SOCKET_PATH can be /var/run/docker.sock while the mount table
+    records /run/podman.sock — exactly this deployment. Matching on the literal
+    string alone would miss it and silently fall back to our own path."""
+    _reset_bind_source_cache(monkeypatch)
+    real = tmp_path / "podman.sock"
+    real.write_text("")
+    link = tmp_path / "docker.sock"
+    link.symlink_to(real)
+    monkeypatch.setattr(execute_mod, "DOCKER_SOCKET_PATH", str(link))
+    monkeypatch.setattr(execute_mod, "CONTAINER_SOCKET", str(real))
+    monkeypatch.setattr(execute_mod, "WORKSPACE_HOST_DIR", "")
+    monkeypatch.setenv("HOSTNAME", "5584662f4f57")
+    _fake_docker_sdk(monkeypatch, _FakeContainer([
+        {"Source": "/run/podman/podman.sock", "Destination": str(real)},
+    ]))
+
+    assert execute_mod._docker_socket_bind_source() == "/run/podman/podman.sock"
+
+
+def test_bind_source_is_none_when_the_socket_is_not_bind_mounted_in(monkeypatch):
+    """A plain (non-nested) docker host: the daemon shares our namespace, the
+    socket was never bind-mounted in, and DOCKER_SOCKET_PATH is already a valid
+    source. Must resolve to None so the caller keeps the old behaviour."""
+    _reset_bind_source_cache(monkeypatch)
+    monkeypatch.setattr(execute_mod, "DOCKER_SOCKET_PATH", "/var/run/docker.sock")
+    monkeypatch.setattr(execute_mod, "CONTAINER_SOCKET", "/var/run/docker.sock")
+    monkeypatch.setattr(execute_mod, "WORKSPACE_HOST_DIR", "")
+    monkeypatch.setenv("HOSTNAME", "5584662f4f57")
+    _fake_docker_sdk(monkeypatch, _FakeContainer([
+        {"Source": "/host/aw-workspace", "Destination": "/opt/aw-workspace"},
+    ]))
+
+    assert execute_mod._docker_socket_bind_source() is None
+
+
+def test_bind_source_ignores_a_container_that_is_not_us(monkeypatch):
+    """$HOSTNAME is the short container id unless someone passed --hostname —
+    so a lookup that comes back WITHOUT the workspace mount we already know the
+    host side of is somebody else's container, and its socket mount would be a
+    wrong answer stated confidently."""
+    _reset_bind_source_cache(monkeypatch)
+    monkeypatch.setattr(execute_mod, "DOCKER_SOCKET_PATH", "/run/podman.sock")
+    monkeypatch.setattr(execute_mod, "CONTAINER_SOCKET", "/run/podman.sock")
+    monkeypatch.setattr(execute_mod, "WORKSPACE_HOST_DIR", WS_HOST)
+    monkeypatch.setattr(execute_mod, "WORKSPACE_CONTAINER_DIR", WS_BIND)
+    monkeypatch.setenv("HOSTNAME", "some-other-box")
+    _fake_docker_sdk(monkeypatch, _FakeContainer([
+        {"Source": "/wrong/host/path.sock", "Destination": "/run/podman.sock"},
+    ]))
+
+    assert execute_mod._docker_socket_bind_source() is None
+
+
+def test_bind_source_survives_an_unreachable_daemon(monkeypatch):
+    """A daemon that can't be reached must not raise out of the spawn path, and
+    must not be written off for the life of the process either — only successes
+    are cached."""
+    import types
+    _reset_bind_source_cache(monkeypatch)
+    monkeypatch.setattr(execute_mod, "DOCKER_SOCKET_PATH", "/run/podman.sock")
+    monkeypatch.setattr(execute_mod, "CONTAINER_SOCKET", "/run/podman.sock")
+
+    mod = types.ModuleType("docker")
+
+    def _boom(*a, **k):
+        raise OSError("connection refused")
+
+    mod.DockerClient = _boom
+    monkeypatch.setitem(sys.modules, "docker", mod)
+
+    assert execute_mod._docker_socket_bind_source() is None
+    assert execute_mod._DOCKER_SOCKET_BIND_SOURCE is None
+
+
 # --- DOCKER_SOCKET_PATH's own module-level fallback --------------------------
 
 

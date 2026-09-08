@@ -107,7 +107,15 @@ def test_a_freshly_spawned_agent_container_gets_a_real_docker_socket_mount():
         f"the exact 2026-09-07 incident: code fixed, unit tests green, "
         f"production still serving the old mount."
     )
-    assert execute_mod._is_usable_socket(host_source), (
-        f"host_source={host_source!r} (what got bind-mounted in) is not a "
-        "real socket from this process's own view either"
+    # NOT asserted: that host_source is a real socket from THIS process's view.
+    # It is a path in the DAEMON's mount namespace, and on a nested (podman-out-
+    # of-podman) host the two genuinely differ — here the daemon's
+    # /run/podman/podman.sock isn't visible in this container at all. Asserting
+    # local usability on it is the exact confusion this file was catching the
+    # symptom of (2026-09-08); the container's own `stat` above is the proof
+    # that survives the namespace gap.
+    assert host_source == (execute_mod._docker_socket_bind_source()
+                           or execute_mod.DOCKER_SOCKET_PATH), (
+        f"host_source={host_source!r} is not what _docker_socket_bind_source() "
+        "resolves — the spawn path and the resolution helper have drifted apart"
     )

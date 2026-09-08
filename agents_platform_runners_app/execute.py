@@ -139,6 +139,92 @@ def _is_usable_socket(path: str | None) -> bool:
 DOCKER_SOCKET_PATH = os.environ.get("AW_DOCKER_SOCKET_PATH") or (
     "/var/run/docker.sock" if _is_usable_socket("/var/run/docker.sock") else CONTAINER_SOCKET
 )
+# Where that SAME socket lives on the PODMAN DAEMON's own filesystem — i.e. the
+# value that may legitimately be used as a bind-mount SOURCE. Exactly the
+# distinction WORKSPACE_HOST_DIR already draws against WORKSPACE_CONTAINER_DIR,
+# and for the same reason: DOCKER_SOCKET_PATH above is a path in THIS
+# container's mount namespace, which is correct for opening the socket
+# ourselves (`DockerClient(base_url=...)` is a plain local file open) and wrong
+# for a mount source, because the daemon resolves mount sources in ITS
+# namespace, not ours.
+#
+# Found live 2026-09-08, one layer under the 2026-09-07 incident above: on this
+# deployment /var/run/docker.sock is a symlink to /run/podman.sock and DOES
+# stat() as a real socket in here, so DOCKER_SOCKET_PATH resolved happily — but
+# on the outer host neither of those paths exists as a socket (both are empty
+# placeholder directories there; the real one is /run/podman/podman.sock), so
+# an agent with the "docker" permission got an empty DIRECTORY mounted at
+# /var/run/docker.sock. Verified by spawning real sibling containers with both
+# candidate sources — both produced 'directory'.
+#
+# Set it explicitly with AW_DOCKER_SOCKET_HOST_PATH. Left unset, it is
+# discovered from the daemon itself (_docker_socket_bind_source below): our own
+# container's mount table already records which host path was bound to the
+# socket we talk to, so this is right with no provisioning change — which
+# matters, because aw-remote-host's install.sh (where AW_WORKSPACE_HOST_DIR and
+# AW_WORKSPACE_HOME_HOST_DIR are set) is embedded in a Go binary, so a new env
+# var there reaches an installed host only after a rebuild, redeploy and
+# re-bootstrap.
+DOCKER_SOCKET_HOST_PATH = os.environ.get("AW_DOCKER_SOCKET_HOST_PATH", "")
+_DOCKER_SOCKET_BIND_SOURCE: str | None = None
+
+
+def _self_container(client):
+    """This process's own container as the daemon sees it, or None.
+
+    $HOSTNAME is the short container id under both podman and docker unless
+    something passed --hostname, so it is verified rather than trusted: a real
+    match has to carry the workspace bind-mount whose host side we already know
+    (WORKSPACE_CONTAINER_DIR <- WORKSPACE_HOST_DIR)."""
+    name = (os.environ.get("HOSTNAME") or "").strip()
+    if not name:
+        return None
+    try:
+        c = client.containers.get(name)
+    except Exception:
+        return None
+    if not WORKSPACE_HOST_DIR:
+        return c
+    want_src = WORKSPACE_HOST_DIR.rstrip("/")
+    want_dst = WORKSPACE_CONTAINER_DIR.rstrip("/")
+    for m in (c.attrs.get("Mounts") or []):
+        if (str(m.get("Destination") or "").rstrip("/") == want_dst
+                and str(m.get("Source") or "").rstrip("/") == want_src):
+            return c
+    return None
+
+
+def _docker_socket_bind_source() -> str | None:
+    """Bind-mount SOURCE for the "docker" permission — a daemon-side path.
+
+    Env override first, then the daemon's own record of how our socket got in
+    here, then None for the caller to fall back on the container-side path
+    (correct on a non-nested host, where there is no namespace gap to bridge).
+    Only successful discovery is cached: a daemon that was briefly unreachable
+    should be asked again, not written off for the life of the process."""
+    global _DOCKER_SOCKET_BIND_SOURCE
+    if DOCKER_SOCKET_HOST_PATH:
+        return DOCKER_SOCKET_HOST_PATH
+    if _DOCKER_SOCKET_BIND_SOURCE:
+        return _DOCKER_SOCKET_BIND_SOURCE
+    if not (DOCKER_SOCKET_PATH and CONTAINER_SOCKET):
+        return None
+    # The socket may reach us through a symlink (/var/run -> /run here), while
+    # the mount table records the destination it was actually bound at.
+    wanted = {DOCKER_SOCKET_PATH, os.path.realpath(DOCKER_SOCKET_PATH)}
+    try:
+        import docker as docker_sdk
+        client = docker_sdk.DockerClient(base_url="unix://" + CONTAINER_SOCKET)
+        me = _self_container(client)
+        for m in ((me.attrs.get("Mounts") if me is not None else None) or []):
+            if str(m.get("Destination") or "") in wanted and m.get("Source"):
+                _DOCKER_SOCKET_BIND_SOURCE = str(m["Source"])
+                return _DOCKER_SOCKET_BIND_SOURCE
+    except Exception:
+        log.warning("execute: could not ask the container engine where %r lives on "
+                    "ITS own filesystem — falling back to the container-side path "
+                    "as the bind source", DOCKER_SOCKET_PATH, exc_info=True)
+    return None
 # Persistent path where the workspace's long-lived Claude OAuth token
 # (`claude setup-token`, valid ~1 year) is stored. Lives under
 # `.aw-workspace/` — on the persistent /opt/aw-workspace bind-mount, preserved
@@ -1132,7 +1218,12 @@ def _build_container_kwargs(job: dict) -> tuple[str, list[str], dict, str | None
     # tick either box and nothing happened, with no log to say so.
     if _perms.get("docker"):
         if _is_usable_socket(DOCKER_SOCKET_PATH):
-            volumes[DOCKER_SOCKET_PATH] = {"bind": "/var/run/docker.sock", "mode": "rw"}
+            # Usability is judged on OUR path (that's where we can stat it);
+            # the mount is made from the DAEMON's path (that's where it will be
+            # resolved). Conflating the two is what made this permission mount
+            # an empty directory — see DOCKER_SOCKET_HOST_PATH's own comment.
+            volumes[_docker_socket_bind_source() or DOCKER_SOCKET_PATH] = {
+                "bind": "/var/run/docker.sock", "mode": "rw"}
         else:
             # Keep this loud: a resolved-but-missing socket is exactly the
             # "checkbox is cosmetic" bug found 2026-09-07 (see
@@ -1140,7 +1231,9 @@ def _build_container_kwargs(job: dict) -> tuple[str, list[str], dict, str | None
             # would just reproduce it under a different cause next time.
             log.warning("execute: run=%s has the 'docker' permission on but no usable docker "
                         "socket was found (DOCKER_SOCKET_PATH=%r) — set AW_DOCKER_SOCKET_PATH "
-                        "or AW_CONTAINER_SOCKET; the mount was skipped", run_id, DOCKER_SOCKET_PATH)
+                        "or AW_CONTAINER_SOCKET (and AW_DOCKER_SOCKET_HOST_PATH if the daemon "
+                        "sees it at a different path); the mount was skipped",
+                        run_id, DOCKER_SOCKET_PATH)
     if _perms.get("tmp_access") and WORKSPACE_HOST_DIR:
         # Create it OURSELVES, 0777. This bind replaces the image's own /tmp
         # (1777) with a host dir; when that dir does not exist podman creates
