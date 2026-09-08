@@ -66,6 +66,7 @@ import fcntl
 import json
 import logging
 import os
+import re
 import shutil
 import stat
 import threading
@@ -861,6 +862,77 @@ def _patch_codex_warm_token_headers(config_toml: Path) -> bool:
     return changed
 
 
+# Headers agents-platform-multitenant puts on every runner MCP server that
+# must NOT be frozen into a codex config.toml. X-Aw-Warm-Token's VALUE changes
+# per spawn (it rides in as an env var instead — env_http_headers below), and
+# X-Aw-Caller-Run-Id / X-Aw-Context-* change per TURN, which a warm container
+# holding one config.toml for its whole life cannot follow. Codex has never had
+# any of these as static headers; leaving them out keeps that exactly true and
+# keeps this change about WHICH server codex talks to, nothing else.
+_CODEX_UNSTABLE_HEADERS = ("X-Aw-Warm-Token", "X-Aw-Caller-Run-Id")
+
+_TOML_TABLE_HEADER_RE = re.compile(r"^\s*\[{1,2}\s*([^\[\]]+?)\s*\]{1,2}\s*(?:#.*)?$")
+
+
+def _render_codex_config_toml(base_text: str, mcp_servers: dict) -> str:
+    """``base_text`` (the shared $CODEX_HOME/config.toml) with its ENTIRE
+    ``[mcp_servers]`` tree replaced by *this job's own* resolved servers.
+
+    This is the codex half of what ``--mcp-config`` does for claude, and its
+    absence was the isolation leak of 2026-09-08: codex has no such flag
+    (``mcp_config_flag: None``), so every codex agent read the ONE static
+    config.toml ``aw-workspace-cli agent sync`` writes — a single ``aw-gateway``
+    entry pointing at the gateway's UNSCOPED ROOT ``/mcp``. crispal-codex, whose
+    agent config names only the scoped ``/mcp/crispal-full`` profile, therefore
+    wrote knowledge-base documents at the workspace root instead of under
+    ``crispal/``, and could read every other tenant's. Bypassing ``/mcp/<profile>``
+    bypasses that profile's ``kb_index``, its ``upstreams`` allow-list, its
+    ``tools_allow`` and its run policy alike — the KB paths were just the part
+    that left visible evidence.
+
+    Everything OUTSIDE ``[mcp_servers*]`` is preserved verbatim (the
+    ``[projects.*] trust_level`` entries codex needs to run non-interactively,
+    chief among them). Replaced wholesale rather than merged: a job that names
+    no gateway server at all — agent-config-crispal-dev/-image/-social are
+    exactly this shape — must end up with NO gateway server, and a merge would
+    leave the unscoped one standing.
+
+    Headers: static ones (``Authorization``) are written as ``http_headers``;
+    ``X-Aw-Warm-Token`` keeps riding in through ``env_http_headers`` +
+    ``CODEX_WARM_TOKEN_ENV_VAR``, unchanged from _patch_codex_warm_token_headers
+    (see _CODEX_UNSTABLE_HEADERS for why the per-turn ones are dropped).
+    """
+    kept: list[str] = []
+    in_mcp_table = False
+    for line in base_text.splitlines():
+        m = _TOML_TABLE_HEADER_RE.match(line)
+        if m:
+            table = m.group(1)
+            in_mcp_table = table == "mcp_servers" or table.startswith("mcp_servers.")
+        if not in_mcp_table:
+            kept.append(line)
+
+    out = "\n".join(kept).rstrip("\n")
+    for name, cfg in (mcp_servers or {}).items():
+        url = cfg.get("url")
+        if not url:
+            continue
+        # TOML basic-string quoting == JSON string quoting. Quoted because a
+        # server name is free text from an agent config and may hold characters
+        # ("aw-gateway/crispal") that a bare TOML key rejects.
+        key = json.dumps(name)
+        headers = {k: v for k, v in (cfg.get("headers") or {}).items()
+                   if k not in _CODEX_UNSTABLE_HEADERS}
+        out += f"\n\n[mcp_servers.{key}]\nurl = {json.dumps(url)}\n"
+        if headers:
+            out += f"\n[mcp_servers.{key}.http_headers]\n"
+            out += "".join(f"{json.dumps(k)} = {json.dumps(str(v))}\n"
+                           for k, v in headers.items())
+        out += (f"\n[mcp_servers.{key}.env_http_headers]\n"
+                f'"X-Aw-Warm-Token" = "{CODEX_WARM_TOKEN_ENV_VAR}"\n')
+    return out.lstrip("\n") + "\n"
+
+
 def _git_creds_volumes() -> dict[str, dict]:
     """Read-only gh/git creds volumes mirrored by aw-app-git's
     ``gh_auth.py._sync_creds_to_data_dir()`` into ``GIT_CREDS_REL``, if
@@ -1526,8 +1598,47 @@ def _build_container_kwargs(job: dict) -> tuple[str, list[str], dict, str | None
             # Idempotent, so cheap to re-check on every spawn.
             if (_home_abs / "config.toml").is_file():
                 _patch_codex_warm_token_headers(_home_abs / "config.toml")
+            else:
+                # The "cp -a /aw-creds/." below is guarded on config.toml, and
+                # the per-run override mounted at the end of this branch makes
+                # that guard read TRUE unconditionally — so a never-populated
+                # shared home would silently never get the rest of the staged
+                # creds. Do that first-populate here instead, host-side, with
+                # the same source and the same "only when config.toml is
+                # missing" condition the shell had.
+                try:
+                    shutil.copytree(creds_copy, _home_abs, dirs_exist_ok=True)
+                except Exception:
+                    log.warning("execute: could not populate codex home %s from "
+                                "the staged creds", _home_abs, exc_info=True)
         staged_home = f"/aw-{creds_dir.lstrip('.')}-home"
         _mount(_home_rel, staged_home, ro=False)
+        if cli == "codex":
+            # THE agent-scoping fix (2026-09-08). Everything above hands codex
+            # the ONE config.toml every codex agent shares, whose single
+            # `aw-gateway` entry is the gateway's unscoped root — so an agent
+            # config naming only a scoped profile got the whole gateway anyway.
+            # Render this job's OWN servers over that base and bind the result
+            # read-only across the shared copy: a single FILE, deliberately,
+            # not a repointed $CODEX_HOME — auth.json, the rollouts and
+            # state_*.sqlite all live in that same dir and codex loses its
+            # login (and every resumable thread) the moment they move.
+            _rendered = isolated_host_dir / "codex-config.toml"
+            try:
+                _base = _home_abs / "config.toml"
+                _base_text = _base.read_text() if _base.is_file() else ""
+                _rendered.write_text(_render_codex_config_toml(_base_text, mcp_servers))
+                _rendered.chmod(0o666)
+                _mount_abs(f"{_host_creds}/codex-config.toml",
+                           f"{staged_home}/config.toml", ro=True)
+            except Exception:
+                # Fail OPEN rather than kill the run: without the override codex
+                # falls back to the shared config.toml, i.e. exactly the
+                # behaviour of every run before this fix. Loud, because that
+                # behaviour is the leak.
+                log.exception("execute: could not render a scoped codex config for "
+                              "run=%s — falling back to the SHARED config.toml, "
+                              "which is NOT scoped to this agent", run_id)
         if spec.get("home_env"):
             env[spec["home_env"]] = staged_home
         _inner = " ".join(shlex.quote(a) for a in argv)
