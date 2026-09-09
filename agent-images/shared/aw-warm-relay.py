@@ -49,6 +49,17 @@ session_id is known BEFORE spawn (it's the container's key —
 branch / cli.py's `_warm_get_or_create`) — this relay no longer needs to
 parse it out of claude's `system`/`init` event turn-by-turn.
 
+Deliberately has no `_turn_env()` counterpart to aw-warm-relay-codex.py's
+(card 3d65bf3b-9510-81b0-8b50-d8f3b74f4374): that mechanism merges
+`turn_env` into a FRESH `codex exec resume` subprocess's env every turn,
+which is only meaningful because codex re-execs per turn. This relay never
+spawns claude at all — aw-warm-wrapper does, ONCE, for the container's whole
+life — so there is no per-turn process here to merge an env into; a
+process's own env is fixed at exec() time with no live-patch path back in.
+The actual fix for claude's per-turn identity lives in
+warm_pool.dispatch_turn()'s `_with_claude_turn_context`, which puts it in
+the prompt text instead — see that function's docstring for why.
+
 Usage: aw-warm-relay.py <rundir>   (reads claude's stdout on its own stdin)
 """
 from __future__ import annotations

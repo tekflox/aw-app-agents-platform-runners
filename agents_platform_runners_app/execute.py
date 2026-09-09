@@ -875,14 +875,44 @@ def _patch_codex_warm_token_headers(config_toml: Path) -> bool:
     return changed
 
 
-# Headers agents-platform-multitenant puts on every runner MCP server that
-# must NOT be frozen into a codex config.toml. X-Aw-Warm-Token's VALUE changes
-# per spawn (it rides in as an env var instead — env_http_headers below), and
-# X-Aw-Caller-Run-Id / X-Aw-Context-* change per TURN, which a warm container
-# holding one config.toml for its whole life cannot follow. Codex has never had
-# any of these as static headers; leaving them out keeps that exactly true and
-# keeps this change about WHICH server codex talks to, nothing else.
-_CODEX_UNSTABLE_HEADERS = ("X-Aw-Warm-Token", "X-Aw-Caller-Run-Id")
+# Headers agents-platform-multitenant sends per-TURN (X-Aw-Caller-Run-Id,
+# and any X-Aw-Context-* — e.g. X-Aw-Context-Notion-Task-Id) that must NOT be
+# frozen into a WARM container's config — codex's config.toml (no per-run
+# --mcp-config equivalent, so this file IS the warm config) or claude's
+# mcp.json alike (has --mcp-config, but only the cold path and
+# warm-container-creation ever (re)write it — see _build_container_kwargs's
+# call site below; dispatch_turn() never regenerates it on later turns).
+# Stripping both from a warm container's frozen config is what makes it fall
+# through to aw-backend's gateway.py::_resolve_warm_context — the
+# stable-token -> Redis lookup that agents-platform-multitenant's
+# executor.py::_build_runner_extra_headers keeps current on EVERY turn via
+# set_warm_token_run, independent of whatever this container's own config
+# was frozen with at creation. Leaving even ONE of these in place defeats
+# that: gateway.py only consults the Redis fallback when the header-derived
+# value is ABSENT (`if not caller_run_id`, `if ... not in context`) — a
+# stale header is worse than no header, because it silently wins over the
+# fresh one.
+#
+# X-Aw-Warm-Token itself is deliberately NOT in this set — it is the STABLE
+# key the Redis fallback above is resolved BY, so dropping it would leave
+# nothing for gateway.py to key off at all. Its value changes only per
+# container spawn, not per turn, so a warm container holding one frozen copy
+# for its whole life is exactly correct. Codex additionally drops it from
+# `http_headers` for an unrelated reason (its VALUE has to ride in through
+# `env_http_headers` instead — see `_render_codex_config_toml`); claude has
+# no such indirection and keeps it as a plain static header.
+_STALE_PER_TURN_HEADER_NAMES = ("X-Aw-Caller-Run-Id",)
+
+
+def _strip_stale_identity_headers(headers: dict | None) -> dict:
+    """``headers`` with every per-turn-changing identity entry removed — see
+    _STALE_PER_TURN_HEADER_NAMES's docstring. X-Aw-Context-* is matched by
+    prefix (its suffix is the context key, e.g. ``X-Aw-Context-Notion-Task-Id``),
+    case-insensitively since HTTP header names are case-insensitive."""
+    return {k: v for k, v in (headers or {}).items()
+            if k not in _STALE_PER_TURN_HEADER_NAMES
+            and not k.lower().startswith("x-aw-context-")}
+
 
 _TOML_TABLE_HEADER_RE = re.compile(r"^\s*\[{1,2}\s*([^\[\]]+?)\s*\]{1,2}\s*(?:#.*)?$")
 
@@ -913,7 +943,7 @@ def _render_codex_config_toml(base_text: str, mcp_servers: dict) -> str:
     Headers: static ones (``Authorization``) are written as ``http_headers``;
     ``X-Aw-Warm-Token`` keeps riding in through ``env_http_headers`` +
     ``CODEX_WARM_TOKEN_ENV_VAR``, unchanged from _patch_codex_warm_token_headers
-    (see _CODEX_UNSTABLE_HEADERS for why the per-turn ones are dropped).
+    (see _strip_stale_identity_headers for why the per-turn ones are dropped).
     """
     kept: list[str] = []
     in_mcp_table = False
@@ -934,8 +964,11 @@ def _render_codex_config_toml(base_text: str, mcp_servers: dict) -> str:
         # server name is free text from an agent config and may hold characters
         # ("aw-gateway/crispal") that a bare TOML key rejects.
         key = json.dumps(name)
-        headers = {k: v for k, v in (cfg.get("headers") or {}).items()
-                   if k not in _CODEX_UNSTABLE_HEADERS}
+        # X-Aw-Warm-Token dropped here too, but for its own reason (its
+        # VALUE is per-spawn, not per-turn) — it comes back below via
+        # env_http_headers, unlike the per-turn names this shares with claude.
+        headers = {k: v for k, v in _strip_stale_identity_headers(cfg.get("headers")).items()
+                   if k != "X-Aw-Warm-Token"}
         out += f"\n\n[mcp_servers.{key}]\nurl = {json.dumps(url)}\n"
         if headers:
             out += f"\n[mcp_servers.{key}.http_headers]\n"
@@ -1116,13 +1149,29 @@ def _build_container_kwargs(job: dict) -> tuple[str, list[str], dict, str | None
     # own mcp-config directory, so the config itself crosses the wire
     # instead of a path to it. Written straight into the isolated run dir
     # (already mounted rw below), no separate mount needed.
+    #
+    # Headers are stripped of the same per-turn-changing set codex's
+    # _render_codex_config_toml already drops (_strip_stale_identity_headers)
+    # — this file is written once per container (cold run, or warm-container
+    # creation; dispatch_turn() never rewrites it on later turns), so an
+    # X-Aw-Caller-Run-Id/X-Aw-Context-* baked in here would freeze turn 1's
+    # values for that container's whole life. Dropping them lets a warm
+    # container fall through to gateway.py's `_resolve_warm_context` —
+    # resolved from the STILL-PRESENT, stable X-Aw-Warm-Token header (kept,
+    # unlike codex, which sources it from an env var instead — claude has no
+    # such indirection) via the Redis mapping agents-platform-multitenant's
+    # own executor.py::_build_runner_extra_headers keeps current on every
+    # turn. Harmless on the cold (non-warm) path too: that Redis mapping is
+    # written unconditionally, "session or no session" (see that function's
+    # own docstring), so it resolves to the same value the stripped header
+    # would have carried anyway.
     mcp_config_container_path: str | None = None
     mcp_servers = job.get("mcp_servers") or {}
     if mcp_servers and spec.get("mcp_config_flag"):
         claude_mcp = {
             "mcpServers": {
                 name: {"type": cfg.get("type", "streamable-http"), "url": cfg["url"],
-                       **({"headers": cfg["headers"]} if cfg.get("headers") else {})}
+                       **({"headers": h} if (h := _strip_stale_identity_headers(cfg.get("headers"))) else {})}
                 for name, cfg in mcp_servers.items() if cfg.get("url")
             }
         }

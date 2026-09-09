@@ -486,6 +486,44 @@ def _sh(s: str | None) -> str:
     return shlex.quote(s or "")
 
 
+def _with_claude_turn_context(prompt: str, run_id: str, notion_task_id: str | None,
+                              source_device: str | None) -> str:
+    """Prepend the CURRENT turn's identity to the prompt text itself, for claude only.
+
+    Codex's per-turn staleness (card 3d25bf3b-9510-814a-acd9-d06f9c28d10b) was fixed
+    by merging ``turn_env`` into the fresh subprocess env `aw-warm-relay-codex.py`
+    spawns for every turn — real, because codex re-execs `codex exec resume` per
+    turn. claude has no equivalent: `aw-warm-wrapper` spawns ONE claude process for
+    the container's whole (up to 6h) life, so nothing can push an updated
+    NOTION_TASK_ID/AW_RUN_ID/AW_SOURCE_DEVICE into its OS environment after turn 1 —
+    a process's env is fixed at exec() time, and there is no live-patch mechanism
+    for it. `turn_env` (written above, every turn) has no reader on the claude side
+    for exactly this reason.
+
+    agents-platform-multitenant's own (separate) CliLLM warm-container path hit
+    this identical problem and tried BASH_ENV first — verified dead-end: the Bash
+    tool spawns commands via `/bin/sh` (dash in this image), which does not source
+    BASH_ENV at all. Its shipped fix, reused verbatim here: put the current turn's
+    values directly in the prompt text the model reads, independent of whichever
+    shell a later `echo $NOTION_TASK_ID` runs under.
+    """
+    parts = []
+    if notion_task_id:
+        parts.append(f"NOTION_TASK_ID={notion_task_id}")
+    if source_device:
+        parts.append(f"AW_SOURCE_DEVICE={source_device}")
+    if run_id:
+        parts.append(f"AW_RUN_ID={run_id}")
+    if not parts:
+        return prompt
+    return (
+        "[SYSTEM]\nExecution context for this turn: " + " ".join(parts) + ". "
+        "$NOTION_TASK_ID/$AW_SOURCE_DEVICE/$AW_RUN_ID may read empty or stale via "
+        "the Bash tool in a warm container — use the values above instead if so.\n\n"
+        + prompt
+    )
+
+
 def dispatch_turn(*, client, name: str, run_id: str, prompt: str, cli: str = "claude",
                   notion_task_id: str | None = None,
                   source_device: str | None = None) -> None:
@@ -504,6 +542,11 @@ def dispatch_turn(*, client, name: str, run_id: str, prompt: str, cli: str = "cl
     sentinel itself the moment it sees the CLI's own turn-complete event
     (claude: ``{"type":"result",...}``; codex: a ``turn/completed``
     notification for this container's thread).
+
+    claude's turn payload also carries the current turn's identity inline
+    (see `_with_claude_turn_context`) — its OS env goes stale after turn 1
+    with nothing able to refresh it, unlike codex's (see that function's
+    docstring for the full story).
 
     Uses the docker-py exec API's raw socket mode for the FIFO write (the
     original's subprocess `docker exec -i ... | cat > fifo_in` translated to
@@ -530,7 +573,8 @@ def dispatch_turn(*, client, name: str, run_id: str, prompt: str, cli: str = "cl
         # request/response correlation has to live there instead of here).
         payload = (json.dumps({"prompt": prompt}) + "\n").encode("utf-8")
     else:
-        payload = (json.dumps({"type": "user", "message": {"role": "user", "content": prompt}}) + "\n").encode("utf-8")
+        content = _with_claude_turn_context(prompt, run_id, notion_task_id, source_device)
+        payload = (json.dumps({"type": "user", "message": {"role": "user", "content": content}}) + "\n").encode("utf-8")
     exec_id = client.api.exec_create(
         c.id, ["sh", "-c", "cat > /home/ubuntu/.aw-warm/fifo_in"], stdin=True,
     )["Id"]
