@@ -320,7 +320,20 @@ CLI_SPECS: dict[str, dict] = {
     },
     "codex": {
         "bin": "codex", "subcmd": "exec", "prompt_flag": None,
-        "default_extra": ["--skip-git-repo-check", "--json"],
+        # "--disable", "apps" turns off Codex CLI's own native Apps/connectors
+        # system (GitHub, Gmail, Sites, Booking.com, Expedia, Uber,
+        # plugin_management, safety_settings — 184 tools under mcp__codex_apps,
+        # tied to whatever ChatGPT account this install is logged into, and
+        # entirely outside aw-gateway's scoping). `features.apps = false` in
+        # config.toml — what _render_codex_config_toml would otherwise be the
+        # place to add — does NOT work: confirmed live against this workspace's
+        # codex-cli 0.147.0 (`codex features list` still reports
+        # `apps stable true` with that key in config.toml, `--strict-config`
+        # accepts the key without complaint) — openai/codex#17588 is closed
+        # upstream but still reproduces on this version. The CLI flag (or
+        # equivalently `-c features.apps=false`) is the only form that actually
+        # flips the effective flag, verified the same way.
+        "default_extra": ["--skip-git-repo-check", "--json", "--disable", "apps"],
         "skip_perms_flag": "--dangerously-bypass-approvals-and-sandbox",
         "model_flag": "-c", "add_dir_flag": None,
         "mcp_config_flag": None,  # codex has no --mcp-config flag — see write-up below
