@@ -477,13 +477,21 @@ required on every dispatch.
 ### 3. Watch without polling
 
 ```
-supervise(session_id="<session_id from run_agent_async>")
+supervise(session_id="<session_id from run_agent_async>", forever=true)
 ```
 
-You'll be woken once when the *entire* chain goes idle — including every
-internal hand-off the flow makes on its own (PO → Architect → Coders → QAs)
-— not just when the one run you dispatched ends its own turn. See the
-`aw-supervisor-tool` skill.
+`forever=true` on purpose: a multi-hop card (PO → Architect → Coder → QA)
+routinely outlasts the one-shot's 60s auto-give-up window, and a one-shot
+that gives up mid-flow leaves you silently unwatching a card that's still
+being worked. You'll be woken once when the *entire* chain goes idle —
+including every internal hand-off the flow makes on its own — not just when
+the one run you dispatched ends its own turn. See the `aw-supervisor-tool`
+skill.
+
+`forever=true` also means it stays armed after you're woken and the chain
+resumes — it does **not** disarm itself. Step 4 below is what closes that
+loop once the card is actually done; skipping that step is how a
+supervision outlives the work it was watching.
 
 ### 4. Drive the card through completion
 
@@ -493,8 +501,15 @@ When woken, read the card:
 get_kanban_card(page_id="...", include_body=true, include_comments=true)
 ```
 
-- **`done` / `ready_to_deploy`** → tell the user, with the evidence from the
-  card's comments. You're finished.
+- **`done` / `ready_to_deploy`** → call
+  `stop_supervisor(notion_task_id="<page_id of this card>")` first — the
+  card is genuinely finished, so nothing should still be watching it (a
+  `forever=true` supervision never disarms itself; see step 3). Select by
+  `notion_task_id`, not `target_session_id`: a multi-hop card accumulates
+  several different target_session_id values across re-dispatches, and
+  `notion_task_id` already exists as a selector for exactly this reason.
+  Then tell the user, with the evidence from the card's comments. You're
+  finished.
 - **`need_human`** → read the comment for why. If it's a real question only
   Frederico can answer (a scope call, a product decision), check the
   knowledge base first, then ask him directly in this chat; once he
