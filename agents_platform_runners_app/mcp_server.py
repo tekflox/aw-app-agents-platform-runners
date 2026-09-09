@@ -2123,6 +2123,13 @@ async def _call_tool(name: str, arguments: dict[str, Any] | None) -> list[TextCo
                 body["target_slug"] = args["target_slug"]
             if _rid := _caller_run_id(args):
                 body["caller_run_id"] = _rid
+            # Forward call_me_back itself, not just its redirect — without
+            # this the backend's RunInput.call_me_back defaults to False for
+            # every workflow dispatch regardless of what the caller asked
+            # for, since (unlike run_agent_async) nothing else here ever set
+            # it. Confirmed missing 2026-09-09, kanban
+            # 3d65bf3b-9510-817e-a98e-d700441f5d65.
+            body["call_me_back"] = args.get("call_me_back") is not False
             if args.get("call_me_back_on"):
                 body["call_me_back_on"] = args["call_me_back_on"]
             r = await c.post(f"{BASE}/api/workflows/{args['slug']}/run", json=body)
@@ -2147,6 +2154,13 @@ async def _call_tool(name: str, arguments: dict[str, Any] | None) -> list[TextCo
                 body["notion_task_id"] = args["notion_task_id"]
             if _rid := _caller_run_id(args):
                 body["caller_run_id"] = _rid
+            # Forward call_me_back/call_me_back_on — neither was ever
+            # forwarded here before, so /api/monitor/run had no way to know
+            # a callback was requested at all. Confirmed missing 2026-09-09,
+            # kanban 3d65bf3b-9510-817e-a98e-d700441f5d65.
+            body["call_me_back"] = args.get("call_me_back") is not False
+            if args.get("call_me_back_on"):
+                body["call_me_back_on"] = args["call_me_back_on"]
             r = await c.post(f"{BASE}/api/monitor/run", json=body)
             return _err(r.status_code, r.text) if r.status_code != 200 else _ok(r.json())
         if name == "return_to_caller_agent":
@@ -2441,7 +2455,23 @@ async def _call_tool(name: str, arguments: dict[str, Any] | None) -> list[TextCo
         if name == "run_agents_parallel":
             if not args.get("target_slug") and not args.get("target_id"):
                 return _err(400, "target_slug is required. Use list_targets to find an existing Target or create_target to make one, then pass target_slug.")
-            r = await c.post(f"{BASE}/api/runs/parallel", json=args)
+            # Forwarding `args` wholesale (the old behavior) never surfaced
+            # the TRUE caller run id to the backend: the LLM never sets one
+            # itself, and the raw arg it might carry
+            # (`_gateway_caller_run_id`) isn't the field name
+            # `_ParallelDispatch.caller_run_id` expects — `_caller_run_id()`
+            # is the one place that resolves it correctly (warm-container
+            # turn file first, then the gateway-injected header). Without
+            # this, call_me_back on a parallel fan-out had no origin_run_id
+            # to arm against. Confirmed missing 2026-09-09, kanban
+            # 3d65bf3b-9510-817e-a98e-d700441f5d65.
+            body = dict(args)
+            if _rid := _caller_run_id(args):
+                body["caller_run_id"] = _rid
+            body["call_me_back"] = args.get("call_me_back") is not False
+            if args.get("call_me_back_on"):
+                body["call_me_back_on"] = args["call_me_back_on"]
+            r = await c.post(f"{BASE}/api/runs/parallel", json=body)
             return _err(r.status_code, r.text) if r.status_code != 200 else _ok(r.json())
         if name == "cancel_run":
             r = await c.post(f"{BASE}/api/runs/{args['run_id']}/cancel")
