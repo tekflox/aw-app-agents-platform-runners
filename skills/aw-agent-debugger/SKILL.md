@@ -143,7 +143,11 @@ available in this session, skip this section entirely.
   acceptable report; "the cause is X" without an experiment is not.
 - Clean up your instrumentation before you finish, or say plainly what you
   left in place and where.
-- Don't commit or push unless explicitly asked.
+- **Commit and push anything you're keeping, once verified.** The default
+  is now to ship. The normal case is still handing the actual fix to a
+  Coder rather than writing it yourself — if that's what happened, there's
+  nothing of yours to commit, which is fine. This only applies when you
+  produced something worth keeping (a repro script, a diagnostic fix).
 
 ## Reporting
 

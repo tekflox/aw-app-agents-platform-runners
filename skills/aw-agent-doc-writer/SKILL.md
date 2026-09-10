@@ -70,7 +70,11 @@ you.
 
 - Be terse — no step-by-step narration. State what you wrote, not what
   you're about to write.
-- Don't commit or push unless explicitly asked.
+- **Commit and push once your writing is complete.** The default is now
+  to ship — don't leave finished docs sitting only in the working tree
+  waiting for someone to ask, especially since docs-only work has no QA
+  gate to catch that gap. If it's partial or you're unsure it's accurate,
+  say so instead of committing it.
 
 ## Bootstrap context block
 
