@@ -501,5 +501,35 @@ class AgentsPlatformRunnersAppPlugin:
             if redis_url:
                 warm_pool_mod.bump_generation(redis_url)
 
+    async def on_workspace_mcp_changed(self, ctx) -> None:
+        """SOME OTHER app was installed, updated or uninstalled on this
+        workspace, so the MCP tool surface moved (aw-workspace core's
+        ``Plugin.on_workspace_mcp_changed``, fired from
+        ``Reconciler._trigger_gateway_reload``).
+
+        That surface is exactly what a warm container's CLI process built its
+        MCP clients against — once, at process start, with nothing
+        re-initialising them for the container's whole 6h life (see
+        :func:`warm_pool.reuse_or_drain`). So a warm container spawned before
+        the change keeps serving the old tool list until something condemns
+        it, which until this hook existed was a human noticing and recycling
+        the session by hand.
+
+        Same one-line answer as :meth:`on_config_saved`'s tail, for the same
+        reason, and it fits this hook's contract: one Redis write, globally
+        effective, idempotent, and non-disruptive by construction — nothing
+        is killed synchronously, each condemned container drains and respawns
+        on its own NEXT dispatch. ``bump_generation`` never raises and has 3s
+        timeouts, which matters because core awaits this on the install
+        critical path.
+
+        Deliberately does NOT re-read config or touch disk: core calls this on
+        ONE worker only, so anything per-process would be wrong here."""
+        if not warm_pool_mod.enabled():
+            return
+        redis_url = shared_redis_mod.resolve(self._live_config)
+        if redis_url:
+            warm_pool_mod.bump_generation(redis_url)
+
     async def deactivate(self) -> None:
         log.info("aw-app-agents-platform-runners deactivated")
