@@ -20,10 +20,11 @@ import subprocess
 import uuid
 
 import httpx
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import Body, FastAPI, HTTPException, Request
 
 from . import execute as execute_mod
 from . import execution_index as execution_index_mod
+from . import notion_token_sync as notion_token_sync_mod
 from . import observability_push as observability_push_mod
 from . import shared_redis
 from . import warm_pool
@@ -163,6 +164,53 @@ def build_routes(config: dict | None = None) -> FastAPI:
         actual two-hop logic."""
         import asyncio
         return await asyncio.to_thread(observability_push_mod.push_once, cfg)
+
+    # ------------------------------------------------------------------
+    # Notion token relay — see notion_token_sync.py for why this app is the
+    # one making the AP-MT call for a token it does not own. Callers are
+    # aw-app-notion over loopback (workspace X-Api-Key); nothing here reads
+    # or returns a token, only stores/clears one and reports a fingerprint.
+    # ------------------------------------------------------------------
+
+    def _notion_token_failure(exc: Exception) -> HTTPException:
+        """409 when this workspace has no agents-platform at all, 502 when it
+        has one that failed. aw-app-notion's logout treats those differently —
+        "there is no remote copy" must let a logout through, "I could not
+        delete the remote copy" must stop it — so the distinction has to
+        survive the hop as a status code, not just prose."""
+        if isinstance(exc, notion_token_sync_mod.NotionTokenNotConfigured):
+            return HTTPException(409, str(exc))
+        return HTTPException(502, str(exc))
+
+    @app.post("/notion-token")
+    async def notion_token_push(data: dict = Body(...)) -> dict:
+        import asyncio
+
+        token = (data.get("token") or "").strip()
+        if not token:
+            raise HTTPException(400, "token is required")
+        try:
+            return await asyncio.to_thread(notion_token_sync_mod.push, cfg, token)
+        except notion_token_sync_mod.NotionTokenSyncError as exc:
+            raise _notion_token_failure(exc) from exc
+
+    @app.delete("/notion-token")
+    async def notion_token_delete() -> dict:
+        import asyncio
+
+        try:
+            return await asyncio.to_thread(notion_token_sync_mod.delete, cfg)
+        except notion_token_sync_mod.NotionTokenSyncError as exc:
+            raise _notion_token_failure(exc) from exc
+
+    @app.get("/notion-token/state")
+    async def notion_token_state() -> dict:
+        import asyncio
+
+        try:
+            return await asyncio.to_thread(notion_token_sync_mod.state, cfg)
+        except notion_token_sync_mod.NotionTokenSyncError as exc:
+            raise _notion_token_failure(exc) from exc
 
     @app.post("/execute")
     async def execute_job(request: Request) -> dict:

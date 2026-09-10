@@ -3,7 +3,7 @@ repo: architecture
 path: docs/architecture/aw-app-agents-platform-runners.md
 source: generated
 edited: false
-checksum: sha256:4173bb992dd560b4915b9a3e72c8e9ab2cda9c0a3840c4c7c48d957d5b908545
+checksum: sha256:5e0f72a6563d70d33424b1e2a4b74eeff730b16d432cf691c8ac6dd0122eb03d
 ---
 # Agents Platform Runners
 
@@ -17,6 +17,7 @@ Depends on the code-agent-clis app (claude/codex/copilot/cursor-agent already in
 ## Connections
 - `http` → **aw-workspace** — routes mounted at /api/apps/agents-platform-runners
 - `other` → **aw-app-code-agent-clis** — This app doesn't install the CLIs itself — it depends on code-agent-clis having already put claude/codex/copilot/cursor-agent on /usr/local/bin, same path aw-workspace installs already reuse: one app owns installing each runner, this app just depends on that instead of re-implementing it
+- `other` → **aw-app-kb** — Optionally stores a bounded semantic index of completed execution dumps; runner delivery remains fail-open when KB is absent
 
 ## MCP tools
 _none exposed_

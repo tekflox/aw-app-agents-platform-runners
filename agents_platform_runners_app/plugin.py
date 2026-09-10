@@ -35,6 +35,7 @@ from . import agent_provisioner as agent_provisioner_mod
 from . import execute as execute_mod
 from . import execution_index as execution_index_mod
 from . import kanban_dispatch as kanban_dispatch_mod
+from . import notion_token_sync as notion_token_sync_mod
 from . import platform_settings as platform_settings_mod
 from . import routes as routes_mod
 from . import shared_redis as shared_redis_mod
@@ -251,8 +252,27 @@ class AgentsPlatformRunnersAppPlugin:
             log.info("skills_sync delta: %s", result)
 
         async def _reconcile() -> None:
-            result = await asyncio.to_thread(client.sync_full)
-            log.info("skills_sync reconcile: %s", result)
+            try:
+                result = await asyncio.to_thread(client.sync_full)
+                log.info("skills_sync reconcile: %s", result)
+            finally:
+                # The Notion-token reconcile rides THIS tick rather than
+                # registering a cadence of its own (Kanban
+                # architecture:notion-token-per-tenant-ap-mt-step1): 360s is
+                # already the interval that bounds how stale AP-MT's derived
+                # state may be, and a second watchdog at the same period is
+                # two things to reason about instead of one.
+                #
+                # In `finally` deliberately — a skills-sync failure (AP-MT
+                # briefly down, a 409 storm) must not be able to stop a token
+                # rotation from propagating. reconcile_once never raises, so
+                # it cannot mask the skills exception on its way out.
+                outcome = await asyncio.to_thread(
+                    notion_token_sync_mod.reconcile_once, self._live_config)
+                # Quiet on the steady state ("fingerprints match", every 6
+                # minutes, forever); loud on anything that changed or broke.
+                if outcome.get("changed") or not outcome.get("reconciled"):
+                    log.info("notion token reconcile: %s", outcome)
 
         ctx.watchdog.register("skills-sync-delta", _delta, DELTA_INTERVAL_S,
                               run_immediately=True)
