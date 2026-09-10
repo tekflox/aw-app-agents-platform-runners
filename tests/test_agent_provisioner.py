@@ -173,6 +173,29 @@ def test_unknown_manifest_fields_are_dropped_before_the_post():
     assert body["name"] == "G"
 
 
+def test_disable_harness_tools_survives_the_create_post():
+    # ENDPOINTS["agents"] filters both the create POST and the reconcile PUT
+    # (test_reconcile_keeps_disable_harness_tools below) — missing this field
+    # in either allowlist drops it silently, no 422, no log.
+    platform = FakePlatform()
+    _seed(platform, {"agents": [{"slug": "sec-reviewer", "name": "Security Reviewer",
+                                 "disable_harness_tools": True}]})
+    _, body = platform.posts[0]
+    assert body["disable_harness_tools"] is True
+
+
+def test_reconcile_keeps_disable_harness_tools():
+    platform = RecordingPlatform(existing={"/api/agents": ["sec-reviewer"]})
+    provisioner = AgentProvisioner(base="http://ap.test", token="tok",
+                                   transport=platform.transport())
+
+    assert provisioner.update("agents", "sec-reviewer",
+                              {"disable_harness_tools": True}) is True
+    assert platform.puts == [
+        ("/api/agents/sec-reviewer", {"disable_harness_tools": True})
+    ]
+
+
 def test_a_model_gets_a_display_name_it_did_not_declare():
     platform = FakePlatform()
     _seed(platform, {"models": [{"slug": "sonnet", "provider": "anthropic",

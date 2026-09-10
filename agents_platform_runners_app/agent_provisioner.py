@@ -97,7 +97,7 @@ ENDPOINTS: dict[str, tuple[str, frozenset[str]]] = {
     "agents": ("/api/agents", frozenset({
         "slug", "name", "description", "system_prompt", "inherit_from",
         "agent_config_slug", "group_slug", "kanban_target_status",
-        "capabilities", "hidden_from_flow", "use_cases", "model_slug",
+        "capabilities", "hidden_from_flow", "disable_harness_tools", "use_cases", "model_slug",
         "tool_specs", "skill_slugs", "params", "mcp_config", "extra_volumes",
         "permissions", "icon", "color",
     })),

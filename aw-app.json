@@ -548,6 +548,7 @@
             "send a file or a chart back to chat"
           ],
           "hidden_from_flow": false,
+          "disable_harness_tools": true,
           "icon": "bot",
           "color": "#58a6ff"
         },
@@ -568,6 +569,7 @@
             "send a file or a chart back to chat"
           ],
           "hidden_from_flow": false,
+          "disable_harness_tools": true,
           "icon": "bot",
           "color": "#b794f4"
         },
@@ -588,6 +590,7 @@
             "send a file or a chart back to chat"
           ],
           "hidden_from_flow": false,
+          "disable_harness_tools": true,
           "icon": "bot",
           "color": "#2dd4bf"
         },
@@ -608,6 +611,7 @@
             "send a file or a chart back to chat"
           ],
           "hidden_from_flow": false,
+          "disable_harness_tools": true,
           "icon": "bot",
           "color": "#f6ad55"
         },
@@ -628,6 +632,7 @@
             "use Codex through a Telegram conversation"
           ],
           "hidden_from_flow": false,
+          "disable_harness_tools": true,
           "icon": "bot",
           "color": "#ffa657"
         },
@@ -635,6 +640,7 @@
           "slug": "monitor-shell",
           "name": "Monitor (shell)",
           "description": "Internal agent backing the run_monitor_async MCP tool \u2014 runs a raw shell command in an isolated container with no LLM involved, then wakes the caller via the same call_me_back rails run_agent_async uses. Dispatched only via POST /api/monitor/run (core.monitor_run.dispatch_monitor_run), never through the normal agent-run path.",
+          "disable_harness_tools": true,
           "icon": "terminal",
           "color": "#94a3b8"
         },
@@ -649,6 +655,7 @@
             "code.grep",
             "code.read_file"
           ],
+          "disable_harness_tools": true,
           "icon": "search",
           "color": "#2dd4bf"
         },
@@ -663,6 +670,7 @@
             "code.glob",
             "code.grep"
           ],
+          "disable_harness_tools": true,
           "icon": "list",
           "color": "#b794f4"
         },
@@ -677,6 +685,7 @@
             "code.grep",
             "code.glob"
           ],
+          "disable_harness_tools": true,
           "icon": "shield-check",
           "color": "#f0c000"
         },
@@ -697,6 +706,7 @@
             "Continuous-improvement feedback loop \u2014 feeds Phase-1.5 of future deliveries",
             "Identify time-wasters / dead-ends / tooling gaps / cost traps"
           ],
+          "disable_harness_tools": true,
           "icon": "history",
           "color": "#c4b5fd"
         },
@@ -707,6 +717,7 @@
           "system_prompt_file": "prompts/researcher.md",
           "model_slug": "claude-cli-readonly",
           "tool_specs": [],
+          "disable_harness_tools": true,
           "icon": "globe",
           "color": "#a5d6ff"
         },
@@ -724,6 +735,7 @@
             "code.glob",
             "code.grep"
           ],
+          "disable_harness_tools": true,
           "icon": "code",
           "color": "#58a6ff"
         }
