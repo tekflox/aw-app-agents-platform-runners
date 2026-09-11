@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import sys
 from pathlib import Path
+from types import ModuleType
 from unittest.mock import MagicMock
 
 import pytest
@@ -38,8 +39,28 @@ def _job(**over) -> dict:
 @pytest.fixture
 def dispatched(monkeypatch):
     """Run `_dispatch_warm_turn` with everything around the flag stubbed, and
-    hand back the kwargs `dispatch_turn` was actually called with."""
+    hand back the kwargs `dispatch_turn` was actually called with.
+
+    The `docker` SDK is stubbed into sys.modules rather than imported:
+    `_dispatch_warm_turn` does a function-local `import docker as docker_sdk`
+    for one `except docker_sdk.errors.APIError` clause, and this app's release
+    workflow installs only `pytest jsonschema fastapi httpx uvicorn` — so a
+    test that relies on the real SDK being present passes on a dev box and
+    fails the release gate, which is exactly what it did on first push.
+    """
     seen: dict = {}
+
+    if "docker" not in sys.modules:
+        fake_docker = ModuleType("docker")
+        fake_errors = ModuleType("docker.errors")
+
+        class _APIError(Exception):
+            pass
+
+        fake_errors.APIError = _APIError
+        fake_docker.errors = fake_errors
+        monkeypatch.setitem(sys.modules, "docker", fake_docker)
+        monkeypatch.setitem(sys.modules, "docker.errors", fake_errors)
 
     monkeypatch.setattr(warm_pool, "get_generation", lambda _url: "epoch-1")
     monkeypatch.setattr(warm_pool, "get_or_create", lambda **_kw: "aw-warm-sess-1")
