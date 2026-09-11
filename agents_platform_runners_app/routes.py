@@ -332,6 +332,13 @@ def build_routes(config: dict | None = None) -> FastAPI:
             "extra_args": body.get("extra_args"),
             "notion_task_id": body.get("notion_task_id"),
             "source_device": body.get("source_device"),
+            # This turn is a bare CLI slash command ("/compact") and must reach
+            # the container at position 0 — the warm path's own per-turn
+            # context header would displace it. See
+            # warm_pool._with_claude_turn_context. Absent on an older
+            # agents-platform's body, which reads as False: the pre-2026-09-11
+            # behaviour, i.e. the bug this exists to fix, not a new one.
+            "raw_prompt": body.get("raw_prompt"),
             "mcp_servers": body.get("mcp_servers"),
             "dangerous_skip_permissions": body.get("dangerous_skip_permissions", True),
             "permissions": body.get("permissions"),

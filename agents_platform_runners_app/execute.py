@@ -2045,6 +2045,10 @@ def _dispatch_warm_turn(client, job: dict, redis_url: str) -> None:
     warm_pool.dispatch_turn(
         client=client, name=name, run_id=run_id, prompt=prompt, cli=cli,
         notion_task_id=job.get("notion_task_id"), source_device=job.get("source_device"),
+        # A raw turn is a CLI slash command and must reach the container at
+        # position 0 — see _with_claude_turn_context. Absent on an older
+        # caller's job, which reads as False and keeps the old behaviour.
+        raw_prompt=bool(job.get("raw_prompt")),
     )
     # Dead warm containers are only ever produced BY this path (drain, TTL
     # expiry), so this is where it costs least to notice them. Throttled and

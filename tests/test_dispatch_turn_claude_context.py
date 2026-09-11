@@ -122,3 +122,80 @@ def test_codex_prompt_is_unmodified_plain_json():
 
     raw = b"".join(c.args[0] for c in sock._sock.sendall.call_args_list)
     assert json.loads(raw.decode("utf-8")) == {"prompt": "hi"}
+
+
+# ---------------------------------------------------------------------------
+# …and must NOT carry it on a raw turn
+# ---------------------------------------------------------------------------
+# The header above is correct for an ordinary turn and wrong for a raw one.
+# A raw turn is a CLI slash command; the claude CLI only recognises one at
+# position 0 of the prompt, and this header puts it at ~position 230. The
+# model then answers "/compact" as a chat message and nothing is compacted.
+#
+# Live proof, session 4d86e8e6-85c1-4759-86c5-f4e7e47b58fe: nine
+# initiator_kind='auto_compact' runs between 2026-09-10 09:20Z and
+# 2026-09-11 08:20Z wrote no `compact_boundary` at all. Transcript line 3131
+# is what they wrote instead — "*Sem resposta necessária — `/compact` é
+# comando de nível do harness*" — against a 542,314-token context, billed.
+# It is 2026-07-05's `ap-auto-compact-not-compacting` root cause #1 (framing
+# displaces the slash command), reproduced in this app.
+#
+# Re-proved live on 2026-09-11 AFTER agents-platform-multitenant fixed the
+# identical prepend in its OWN CliLLM warm path: a probe run through this
+# Runner still came back "Understood. I've compacted the conversation
+# context…" with no boundary, because THIS is the prepend that is actually on
+# the live path. Two implementations of the same workaround, one of them
+# dormant — fixing only the dormant one is a green no-op.
+
+def test_a_raw_turn_reaches_the_container_at_position_zero():
+    client, _container, sock = _fake_client_and_container()
+
+    warm_pool.dispatch_turn(
+        client=client, name="aw-warm-claude-session", run_id="compact-run",
+        prompt="/compact", cli="claude",
+        notion_task_id="task-1", source_device="telegram", raw_prompt=True,
+    )
+
+    content = _sent_content(sock)
+    assert content == "/compact", (
+        "a slash command must be the WHOLE prompt — anything prepended turns "
+        "it into a question the model answers instead of a command the CLI runs"
+    )
+    assert "[SYSTEM]" not in content
+    assert "Execution context for this turn" not in content
+
+
+def test_a_raw_clear_is_not_reframed_either():
+    """`/clear` is not dispatched raw by agents-platform today (it is a
+    verified headless no-op, so it is implemented as a fresh session binding
+    instead). The defect being pinned is in this prepend, not in `/compact` —
+    asserting only `/compact` would let the same displacement ship for the
+    next raw command routed through here, which is how this class of bug has
+    already recurred twice."""
+    client, _container, sock = _fake_client_and_container()
+
+    warm_pool.dispatch_turn(
+        client=client, name="aw-warm-claude-session", run_id="clear-run",
+        prompt="/clear", cli="claude", notion_task_id="task-1",
+        source_device="telegram", raw_prompt=True,
+    )
+
+    assert _sent_content(sock) == "/clear"
+
+
+def test_an_ordinary_turn_is_unaffected_by_the_raw_flag_defaulting_off():
+    """The flag is absent on an older agents-platform's job body, and absent
+    must keep meaning "ordinary turn, add the header" — the header is still
+    the only way a warm claude turn learns its own NOTION_TASK_ID."""
+    client, _container, sock = _fake_client_and_container()
+
+    warm_pool.dispatch_turn(
+        client=client, name="aw-warm-claude-session", run_id="turn-9",
+        prompt="do the thing", cli="claude",
+        notion_task_id="task-9", source_device="telegram",
+    )
+
+    content = _sent_content(sock)
+    assert content.startswith("[SYSTEM]\nExecution context for this turn: ")
+    assert "NOTION_TASK_ID=task-9" in content
+    assert content.endswith("do the thing")

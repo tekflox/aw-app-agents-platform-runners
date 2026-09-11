@@ -506,6 +506,17 @@ def _with_claude_turn_context(prompt: str, run_id: str, notion_task_id: str | No
     BASH_ENV at all. Its shipped fix, reused verbatim here: put the current turn's
     values directly in the prompt text the model reads, independent of whichever
     shell a later `echo $NOTION_TASK_ID` runs under.
+
+    NOT applied to a RAW turn (``dispatch_turn(raw_prompt=True)``). A raw turn is
+    a CLI slash command — agents-platform sends ``/compact`` that way — and the
+    claude CLI only recognises one at position 0 of the prompt. This header put
+    it at ~position 230, so the model answered ``/compact`` as a chat message and
+    no compaction happened: nine such runs on session 4d86e8e6 between
+    2026-09-10 and 2026-09-11 wrote no ``compact_boundary`` at all, each billed
+    against a ~542k-token context. It is the 2026-07-05 framing bug
+    (``ap-auto-compact-not-compacting`` root cause #1) reproduced here. A raw
+    turn also has nothing to lose by skipping this: it runs no tools, so nothing
+    in it ever reads $NOTION_TASK_ID/$AW_RUN_ID.
     """
     parts = []
     if notion_task_id:
@@ -526,7 +537,8 @@ def _with_claude_turn_context(prompt: str, run_id: str, notion_task_id: str | No
 
 def dispatch_turn(*, client, name: str, run_id: str, prompt: str, cli: str = "claude",
                   notion_task_id: str | None = None,
-                  source_device: str | None = None) -> None:
+                  source_device: str | None = None,
+                  raw_prompt: bool = False) -> None:
     """Feed one turn's prompt into the warm container's FIFO.
 
     Writes current_run_id + turn_env FIRST (so the relay tags the very next
@@ -573,7 +585,8 @@ def dispatch_turn(*, client, name: str, run_id: str, prompt: str, cli: str = "cl
         # request/response correlation has to live there instead of here).
         payload = (json.dumps({"prompt": prompt}) + "\n").encode("utf-8")
     else:
-        content = _with_claude_turn_context(prompt, run_id, notion_task_id, source_device)
+        content = prompt if raw_prompt else _with_claude_turn_context(
+            prompt, run_id, notion_task_id, source_device)
         payload = (json.dumps({"type": "user", "message": {"role": "user", "content": content}}) + "\n").encode("utf-8")
     exec_id = client.api.exec_create(
         c.id, ["sh", "-c", "cat > /home/ubuntu/.aw-warm/fifo_in"], stdin=True,
