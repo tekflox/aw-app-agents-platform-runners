@@ -97,6 +97,77 @@ WORKSPACE_HOME_HOST_DIR = os.environ.get("AW_WORKSPACE_HOME_HOST_DIR", "")
 # This process's real $HOME as IT sees it (container-side path) — where the
 # live credentials the workspace's own login writes actually resolve.
 REAL_HOME = os.environ.get("HOME") or "/home/ubuntu"
+
+#: How long a finished run's isolated scratch dir is kept.
+#:
+#: These dirs are created one per run and were never removed by anything.
+#: Measured on a live host (2026-09-12): 127 of them, 12 GB, spanning Aug 14
+#: to Sep 9. Each is ~100 MB — not the mcp.json this dir nominally exists for,
+#: but a full clone of the plugins repo the CLI drops in `creds/.tmp/plugins`
+#: (a 23 MB git pack plus assets, 5,491 files), re-cloned every single run.
+#:
+#: Age is the right discriminator and the margin is what makes it safe: a run
+#: that is still executing has a dir minutes old, and nothing here runs for
+#: days. Two days is far beyond any run's life and still bounds the total at
+#: roughly two days of traffic.
+ISOLATED_KEEP_SECONDS = int(os.environ.get("AW_RUNNER_ISOLATED_KEEP_SECONDS") or 2 * 86400)
+
+
+def _reap_isolated_dirs(parent: "Path") -> None:
+    """Remove isolated run dirs older than ISOLATED_KEEP_SECONDS.
+
+    Swept HERE, at the moment the next one is created, rather than by a cron
+    or a background task: this runs exactly as often as dirs appear, needs no
+    scheduler to be alive, and cannot drift out of sync with the thing it
+    cleans up. The cost is one listdir plus a stat per entry.
+
+    Deliberately total-failure-tolerant. A dispatch must never fail because
+    housekeeping could not delete something — a run that does not start is a
+    worse outcome than a directory that survives one more round, and the next
+    dispatch will try again.
+    """
+    try:
+        entries = list(parent.iterdir())
+    except (FileNotFoundError, NotADirectoryError, PermissionError):
+        return  # first run on this host, or not ours to read
+
+    cutoff = time.time() - ISOLATED_KEEP_SECONDS
+    for entry in entries:
+        try:
+            if not entry.is_dir():
+                continue
+            if _recent_activity(entry) >= cutoff:
+                continue
+            shutil.rmtree(entry, ignore_errors=True)
+            log.info("execute: reaped stale isolated run dir %s", entry)
+        except Exception:  # noqa: BLE001 — housekeeping never fails a dispatch
+            log.warning("execute: could not reap %s", entry, exc_info=True)
+
+
+def _recent_activity(entry: "Path") -> float:
+    """Newest mtime of ``entry`` or anything directly inside it.
+
+    The directory's OWN mtime is not enough, and assuming it was is a mistake
+    a test caught before this shipped: a directory's mtime moves when an entry
+    is added or removed, NOT when a file inside it is written. A run that
+    spends an hour appending to state_5.sqlite leaves its run dir looking
+    exactly as old as the moment it was created.
+
+    One level down is where the evidence is (creds/ gains and loses files
+    throughout a run) and is one listdir, not a walk of 5,491 files. Combined
+    with a window measured in days it means an active run is never a
+    candidate — which is the property this whole function has to have.
+    """
+    newest = entry.stat().st_mtime
+    try:
+        for child in entry.iterdir():
+            try:
+                newest = max(newest, child.stat().st_mtime)
+            except OSError:
+                continue
+    except OSError:
+        pass
+    return newest
 CONTAINER_SOCKET = os.environ.get("AW_CONTAINER_SOCKET")
 
 
@@ -1139,6 +1210,7 @@ def _build_container_kwargs(job: dict) -> tuple[str, list[str], dict, str | None
     isolated_rel = f"{spec['creds_dir']}/isolated/{run_id}"
     isolated_base = _real_home if direct_home_mount else Path(WORKSPACE_CONTAINER_DIR)
     isolated_host_dir = isolated_base / isolated_rel
+    _reap_isolated_dirs(isolated_host_dir.parent)
     isolated_host_dir.mkdir(parents=True, exist_ok=True)
     isolated_container_path = f"/home/ubuntu/{isolated_rel}"
 
