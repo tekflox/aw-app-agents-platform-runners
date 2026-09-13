@@ -112,6 +112,27 @@ REAL_HOME = os.environ.get("HOME") or "/home/ubuntu"
 #: roughly two days of traffic.
 ISOLATED_KEEP_SECONDS = int(os.environ.get("AW_RUNNER_ISOLATED_KEEP_SECONDS") or 2 * 86400)
 
+#: What the per-run creds copy leaves behind.
+#:
+#: Each run gets its OWN copy of the CLI's creds dir, deliberately: codex has
+#: to read auth.json and write session state, and handing it the live
+#: directory made concurrent runs fight over one SQLite. The copy is the
+#: right call. Copying 100 MB to make it was not.
+#:
+#: Measured on a live host (2026-09-13): ~/.codex is 12.2 GB, of which 12.1 GB
+#: is accumulated isolated copies — the SOURCE is about 150 MB. Of each ~100 MB
+#: copy, 97 MB is `.tmp/plugins`: a git checkout (24 MB of .git, 73 MB of
+#: working tree) duplicated on every single run.
+#:
+#: `.tmp` is staging — it holds that checkout plus git scratch dirs like
+#: `git-Cjf0Tk`. The plugins the CLI actually loads live in `plugins/`, which
+#: is NOT excluded and keeps being copied. So this drops the duplicate, not the
+#: feature: each copy goes from ~100 MB to ~3 MB.
+#:
+#: The other three were already here: `isolated` (copying the copies),
+#: `sessions` and `cache`.
+CREDS_COPY_IGNORE = ("isolated", "sessions", "cache", ".tmp")
+
 
 def _reap_isolated_dirs(parent: "Path") -> None:
     """Remove isolated run dirs older than ISOLATED_KEEP_SECONDS.
@@ -1323,7 +1344,7 @@ def _build_container_kwargs(job: dict) -> tuple[str, list[str], dict, str | None
             if creds_copy.exists():
                 shutil.rmtree(creds_copy, ignore_errors=True)
             shutil.copytree(_real_home / creds_dir, creds_copy,
-                            ignore=shutil.ignore_patterns("isolated", "sessions", "cache"))
+                            ignore=shutil.ignore_patterns(*CREDS_COPY_IGNORE))
             if cli == "codex" and (creds_copy / "config.toml").is_file():
                 # So a brand-new shared $CODEX_HOME inherits the warm-token
                 # header patch the first time it's ever populated from this
