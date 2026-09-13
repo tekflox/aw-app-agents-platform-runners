@@ -112,3 +112,64 @@ def test_several_at_once(tmp_path):
     _reap_isolated_dirs(tmp_path)
     assert not any(p.exists() for p in olds)
     assert all(p.exists() for p in news)
+
+
+# --- the trigger that actually fires on a warm host -------------------------
+#
+# The reaper first lived only in _build_kwargs, on the reasoning that sweeping
+# where dirs appear makes it run exactly as often as they do. That was wrong in
+# the one way that mattered: a host running WARM containers takes
+# dispatch_turn(), which never builds an isolated dir, so the sweep essentially
+# never ran there.
+#
+# Measured (2026-09-13): after the reaper shipped and the app was updated, a
+# real agent run completed and the backlog did not move — 128 dirs, 12.1 GB,
+# and `isolated/`'s own mtime unchanged from the day before, proving nothing
+# was added or removed.
+
+def test_the_all_sweep_covers_every_cli(tmp_path, monkeypatch):
+    """One CLI's backlog is not the only backlog. A sweep that only knew about
+    codex would leave .claude/.copilot/.cursor growing untouched."""
+    import agents_platform_runners_app.execute as mod
+
+    monkeypatch.setattr(mod, "REAL_HOME", str(tmp_path))
+    old = {}
+    for spec in mod.CLI_SPECS.values():
+        d = tmp_path / spec["creds_dir"] / "isolated"
+        old[spec["creds_dir"]] = _aged(d / "stale", ISOLATED_KEEP_SECONDS + 60)
+
+    mod._reap_isolated_dirs_all()
+
+    for creds_dir, path in old.items():
+        assert not path.exists(), f"{creds_dir} was not swept"
+
+
+def test_the_all_sweep_keeps_fresh_dirs(tmp_path, monkeypatch):
+    import agents_platform_runners_app.execute as mod
+
+    monkeypatch.setattr(mod, "REAL_HOME", str(tmp_path))
+    fresh = _aged(tmp_path / ".codex" / "isolated" / "live", 5)
+    mod._reap_isolated_dirs_all()
+    assert fresh.exists()
+
+
+def test_the_all_sweep_survives_a_home_with_nothing_in_it(tmp_path, monkeypatch):
+    """A fresh workspace has none of these directories. Activation must not
+    fail because there was nothing to clean."""
+    import agents_platform_runners_app.execute as mod
+
+    monkeypatch.setattr(mod, "REAL_HOME", str(tmp_path))
+    mod._reap_isolated_dirs_all()  # must not raise
+
+
+def test_the_all_sweep_only_looks_where_this_code_writes(tmp_path, monkeypatch):
+    """It walks CLI_SPECS rather than globbing ~/.*/isolated. A glob would
+    eventually find an `isolated` directory belonging to something else and
+    delete inside it."""
+    import agents_platform_runners_app.execute as mod
+
+    monkeypatch.setattr(mod, "REAL_HOME", str(tmp_path))
+    stranger = _aged(tmp_path / ".someone-else" / "isolated" / "theirs",
+                     ISOLATED_KEEP_SECONDS + 999)
+    mod._reap_isolated_dirs_all()
+    assert stranger.exists(), "swept a directory that is not ours"

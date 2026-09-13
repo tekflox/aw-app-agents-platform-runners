@@ -199,6 +199,28 @@ class AgentsPlatformRunnersAppPlugin:
         self._register_skills_watchdog(ctx, self._live_config)
         self._register_kanban_sweep_watchdog(ctx, self._live_config)
 
+        # Sweep stale isolated run dirs at ACTIVATION, not only where they are
+        # created.
+        #
+        # The reaper first went into _build_kwargs, on the reasoning that
+        # sweeping where dirs appear makes it run exactly as often as they do.
+        # That reasoning was wrong in the one way that mattered: a host running
+        # WARM containers takes dispatch_turn(), which never builds a new
+        # isolated dir — so on a warm host the sweep essentially never ran.
+        #
+        # Measured, not guessed (2026-09-13): after shipping the reaper and
+        # updating this app, a real agent run completed and the backlog did not
+        # move — 128 dirs, 12.1 GB, and `isolated/`'s own mtime unchanged from
+        # the day before, proving nothing was added or removed.
+        #
+        # Activation is the complement: it happens on every app update and
+        # every workspace restart, independent of how runs are dispatched. The
+        # two together cover both shapes of host.
+        try:
+            execute_mod._reap_isolated_dirs_all()
+        except Exception:  # noqa: BLE001 — housekeeping never blocks activation
+            log.warning("could not sweep isolated run dirs", exc_info=True)
+
         # Resolve warm mode from persisted config BEFORE anything asks
         # warm_pool.enabled() — config is the source of truth since 0.32.0
         # (default ON), with the RUNNER_WARM_CONTAINER env var left as a

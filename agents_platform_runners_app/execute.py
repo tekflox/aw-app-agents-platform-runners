@@ -165,6 +165,30 @@ def _reap_isolated_dirs(parent: "Path") -> None:
             log.warning("execute: could not reap %s", entry, exc_info=True)
 
 
+def _reap_isolated_dirs_all() -> None:
+    """Sweep the isolated dir of EVERY CLI, without needing a dispatch.
+
+    _reap_isolated_dirs runs where a run dir is created. That covers a host
+    dispatching cold runs and misses one dispatching WARM ones entirely —
+    dispatch_turn never builds a new isolated dir, so on a warm host the sweep
+    never fires. Measured on 2026-09-13: after the reaper shipped, a real run
+    completed and the backlog did not move at all.
+
+    This is the other trigger: called from plugin activation, which happens on
+    every app update and every workspace restart regardless of dispatch mode.
+
+    Walks the SPECS rather than globbing ~/.*/isolated, so it only ever looks
+    where this code puts things — a glob would eventually find a directory
+    named "isolated" belonging to something else and delete inside it.
+    """
+    home = Path(REAL_HOME)
+    for spec in CLI_SPECS.values():
+        creds_dir = spec.get("creds_dir")
+        if not creds_dir:
+            continue
+        _reap_isolated_dirs(home / creds_dir / "isolated")
+
+
 def _recent_activity(entry: "Path") -> float:
     """Newest mtime of ``entry`` or anything directly inside it.
 
