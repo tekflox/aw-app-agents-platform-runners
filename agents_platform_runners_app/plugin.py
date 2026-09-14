@@ -39,6 +39,7 @@ from . import kanban_dispatch as kanban_dispatch_mod
 from . import notion_token_sync as notion_token_sync_mod
 from . import platform_settings as platform_settings_mod
 from . import routes as routes_mod
+from . import runner_registration as runner_registration_mod
 from . import shared_redis as shared_redis_mod
 from . import skills_sync as skills_sync_mod
 from . import warm_pool as warm_pool_mod
@@ -213,6 +214,23 @@ class AgentsPlatformRunnersAppPlugin:
         except Exception:  # noqa: BLE001 — activation must never be blocked by this
             log.warning("identity_token: refresh failed at activation", exc_info=True)
 
+        # Auto-register this workspace's runners with agents-platform-
+        # multitenant right after the token above is confirmed fresh (Kanban
+        # feature:ap-runners-auto-register-on-activation — Frederico's
+        # original ask, "ele pode automaticamente registrar os runners na
+        # instalação tb, dai ele já sobe os runners da workspace"). Same
+        # non-fatal shape as the refresh above: the manual POST /register
+        # route (routes.py) remains as a retry surface if this fails (token
+        # still missing, agents-platform-multitenant unreachable, etc).
+        try:
+            result = runner_registration_mod.register_with_platform(self._live_config)
+            if result.get("error"):
+                log.warning("runner registration failed at activation: %s", result["error"])
+            else:
+                log.info("runner registration: %s", result.get("registered"))
+        except Exception:  # noqa: BLE001 — activation must never be blocked by this
+            log.warning("runner registration failed at activation", exc_info=True)
+
         mcp_doc = write_mcp_json(ctx.package_dir, self._live_config)
 
         ctx.routes.register(routes_mod.build_routes(self._live_config))
@@ -220,6 +238,7 @@ class AgentsPlatformRunnersAppPlugin:
         self._register_skills_watchdog(ctx, self._live_config)
         self._register_kanban_sweep_watchdog(ctx, self._live_config)
         self._register_identity_token_watchdog(ctx, self._live_config)
+        self._register_runner_registration_watchdog(ctx, self._live_config)
 
         # Sweep stale isolated run dirs at ACTIVATION, not only where they are
         # created.
@@ -425,6 +444,43 @@ class AgentsPlatformRunnersAppPlugin:
         ctx.watchdog.register("identity-token-refresh", _refresh, IDENTITY_TOKEN_INTERVAL_S,
                               run_immediately=False)
         log.info("identity_token: watchdog registered (every %.0fs)", IDENTITY_TOKEN_INTERVAL_S)
+
+    def _register_runner_registration_watchdog(self, ctx, config: dict) -> None:
+        """Register the periodic runner-registration reassert watchdog
+        (Kanban feature:ap-runners-auto-register-on-activation). Same cadence
+        as the identity-token refresh watchdog above — registration is
+        upserted server-side by (workspace, cli) (see
+        runner_registration.register_with_platform), so reasserting it on
+        this schedule costs a network round-trip and nothing else.
+
+        Not gated on a token already being configured, same reasoning as
+        :meth:`_register_identity_token_watchdog`: a token minted moments
+        earlier in the SAME activate() pass may still be absent (e.g.
+        aw-backend was briefly unreachable), and a later config change could
+        clear it again — register_with_platform reports that as a
+        non-fatal error rather than this watchdog refusing to start.
+        """
+        if not ctx.has("watchdog:tasks"):
+            log.warning("runner_registration: 'watchdog:tasks' capability not granted — "
+                        "reassert watchdog not started")
+            return
+
+        async def _reassert() -> None:
+            try:
+                result = await asyncio.to_thread(
+                    runner_registration_mod.register_with_platform, self._live_config)
+            except Exception:  # noqa: BLE001 — a watchdog tick must never raise
+                log.warning("runner_registration: reassert watchdog tick failed", exc_info=True)
+                return
+            if result.get("error"):
+                log.warning("runner_registration: reassert failed: %s", result["error"])
+            else:
+                log.info("runner_registration: reasserted (%s)", result.get("registered"))
+
+        ctx.watchdog.register("runner-registration-reassert", _reassert,
+                              IDENTITY_TOKEN_INTERVAL_S, run_immediately=False)
+        log.info("runner_registration: watchdog registered (every %.0fs)",
+                 IDENTITY_TOKEN_INTERVAL_S)
 
     def register_contributed_agents(self, app_id: str, spec: dict) -> dict:
         """Seed one ``contributes.agents`` declaration into Agents Platform.

@@ -15,41 +15,23 @@ that the dependency actually did its job, not just that it's declared.
 from __future__ import annotations
 
 import os
-import shutil
-import subprocess
 import uuid
 
-import httpx
 from fastapi import Body, FastAPI, HTTPException, Request
 
 from . import execute as execute_mod
 from . import execution_index as execution_index_mod
 from . import notion_token_sync as notion_token_sync_mod
 from . import observability_push as observability_push_mod
+from . import runner_registration as runner_registration_mod
 from . import shared_redis
 from . import warm_pool
 
-RUNNERS = ["claude", "codex", "copilot", "cursor-agent"]
-
-
-def _runner_status(name: str) -> dict:
-    path = shutil.which(name)
-    if not path:
-        return {"installed": False, "path": None, "version": None}
-    # cursor-agent writes a fresh debug-session log under
-    # /tmp/cursor-agent-logs-<uid> on every invocation, even a bare
-    # --version — this route can be polled repeatedly, so suppress it via
-    # the CLI's own documented env var rather than accumulating logs.
-    env = {**os.environ, "CURSOR_AGENT_DISABLE_DEBUG_LOG": "1"} if name == "cursor-agent" else None
-    try:
-        out = subprocess.run(
-            [path, "--version"], capture_output=True, text=True, timeout=10, check=False,
-            env=env,
-        )
-        version = (out.stdout or out.stderr).strip().splitlines()[0] if (out.stdout or out.stderr) else None
-    except Exception as exc:  # noqa: BLE001 — surfaced as-is, not a route failure
-        version = f"error: {exc}"
-    return {"installed": True, "path": path, "version": version}
+# Re-exported for callers/tests that import RUNNERS from this module —
+# runner_registration.py is the single source of truth (also used by
+# activate()'s automatic registration and its watchdog).
+RUNNERS = runner_registration_mod.RUNNERS
+_runner_status = runner_registration_mod.runner_status
 
 
 def build_routes(config: dict | None = None) -> FastAPI:
@@ -106,50 +88,14 @@ def build_routes(config: dict | None = None) -> FastAPI:
         agents-platform-multitenant (POST /api/runners/register), so the
         platform's Runners registry reflects what's actually installed here.
         Upsert is server-side (workspace, cli) — safe to click repeatedly,
-        never creates duplicates."""
-        token = cfg.get("agents_platform_token")
-        if not token:
-            return {
-                "error": "agents_platform_token is not configured — set it in this app's "
-                "Settings before registering (see aw-app.json config_schema for how to mint one).",
-            }
-        base = cfg.get("agents_platform_base", "http://127.0.0.1:10014")
-        workspace = os.environ.get("AW_WORKSPACE", "aw")
-        # This app's OWN reachable base URL (the "Runner" execute endpoint) —
-        # the public BYOD tunnel edge (see execute.py's module docstring for
-        # why this is the only proven-reachable path from
-        # agents-platform-multitenant, a sibling docker container that
-        # cannot reach this workspace's nested-podman container directly).
-        # Uses the per-app subdomain shape (bare host, no /api/apps/<slug>
-        # prefix — RunnerLLM appends /execute itself) rather than the
-        # workspace-wide api.<ws> + path-prefixed shape; both hit the same
-        # guarded ASGI sub-app (see aw-app-template/external-client/
-        # app-api-client.js's header comment for the generic two-hostname
-        # pattern every app on this platform gets). Override via config if a
-        # workspace's public domain differs.
-        own_base_url = cfg.get("own_base_url") or (
-            f"https://agents-platform-runners.app.{workspace}.workspace.aw.tekflox.com"
-        )
-        payload = {
-            "workspace": workspace,
-            "base_url": own_base_url,
-            "runners": [
-                {"cli": name, "name": name, **_runner_status(name)}
-                for name in RUNNERS
-            ],
-        }
-        url = f"{base.rstrip('/')}/api/runners/register"
-        try:
-            async with httpx.AsyncClient(timeout=20) as client:
-                resp = await client.post(
-                    url, json=payload, headers={"Authorization": f"Bearer {token}"},
-                )
-            resp.raise_for_status()
-            return {"registered": resp.json()}
-        except httpx.HTTPStatusError as exc:
-            return {"error": f"agents-platform responded {exc.response.status_code}: {exc.response.text[:500]}"}
-        except Exception as exc:  # noqa: BLE001 — surfaced as-is to the caller
-            return {"error": f"could not reach {url}: {exc}"}
+        never creates duplicates.
+
+        Same logic activate() and its periodic watchdog call automatically
+        (Kanban feature:ap-runners-auto-register-on-activation) — this route
+        stays as a manual trigger/retry surface. See
+        runner_registration.register_with_platform for the shared logic."""
+        import asyncio
+        return await asyncio.to_thread(runner_registration_mod.register_with_platform, cfg)
 
     @app.post("/register-observability")
     async def register_observability() -> dict:
