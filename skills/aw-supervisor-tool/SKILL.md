@@ -66,6 +66,50 @@ returns the existing supervision instead of arming a duplicate.
 Rejected if `session_id` doesn't exist, or if it's your own session
 (guaranteed self-trigger loop).
 
+### Idempotent by CHAIN, not just by session
+
+Arming on a second hop of a chain you are already watching does not create
+a second watcher. Before inserting, `supervise`/`supervise_card` expand the
+supervision you are ASKING for through the same
+`_batch_discover`/`_expand_chain` machinery the ticker uses, and compare it
+against every `active` supervision **your own session** already armed. Any
+overlap — a shared session, a shared run, or a shared Kanban card — and you
+get that supervision back instead:
+
+```json
+{"ok": true, "supervision_id": "<the existing one>", "existing": true,
+ "joined_existing_chain": true, "matched_on": "session|run|notion_task_id",
+ "matched_value": "<the id that matched>", "watching_session_id": "<its target>",
+ "note": "... already covered ... no new supervision was armed."}
+```
+
+`ok:true`, HTTP 200 — **informational, never a failure**. You are still
+watched; the requested hop is folded into that supervision's `discovered`
+on the spot. `joined_existing_chain:false` on the plain same-session reuse
+keeps the two distinguishable.
+
+Why it exists (2026-09-14): one Telegram session armed 3 `forever`
+supervisions over one card's delivery chain, seeded at the Architect
+(twice) and Product Owner hops. Nothing linked them by `parent_run_id` —
+only the shared card. All 3 discovered identical membership and all 3 fired
+within 20s of each other: three ~$11 wakeups for one event.
+
+Three things it deliberately will NOT do:
+
+- **Absorb across callers.** A wakeup is delivered to the CALLER's session,
+  so folding agent B's `supervise` into agent A's watcher would mean B is
+  never woken at all. Only your own supervisions are candidates.
+- **Absorb into a `waiting_retrigger` row.** That one has stopped watching
+  the target chain and only observes your session to decide
+  retrigger-vs-give-up — you would get a watcher that is not watching.
+- **Downgrade your guarantee.** A `forever=true` request is never absorbed
+  into a one-shot watcher (and the existing one is never silently upgraded).
+
+Known open edge: the card frontier is transitive, so a long-lived `forever`
+watcher that has accumulated many cards can absorb a genuinely new
+`supervise` call into a much larger chain, whose "idle" is later and rarer
+than you wanted. `stop_supervisor` + re-arm if that bites.
+
 ## What "the chain" means
 
 Not just the target session — every descendant session/run it spawns
