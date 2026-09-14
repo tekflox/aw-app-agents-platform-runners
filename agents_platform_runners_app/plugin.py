@@ -34,6 +34,7 @@ from pathlib import Path
 from . import agent_provisioner as agent_provisioner_mod
 from . import execute as execute_mod
 from . import execution_index as execution_index_mod
+from . import identity_token as identity_token_mod
 from . import kanban_dispatch as kanban_dispatch_mod
 from . import notion_token_sync as notion_token_sync_mod
 from . import platform_settings as platform_settings_mod
@@ -57,6 +58,11 @@ RECONCILE_INTERVAL_S = 360.0
 # own code cites up to ~3min worst case — so a 0-60s sweep is at worst the same
 # and usually better, for none of the public-endpoint surface a webhook needs.
 KANBAN_SWEEP_INTERVAL_S = 60.0
+
+# identity_token refresh cadence (Kanban feature:ap-runners-auto-mint-identity-
+# token). 6h is plenty against a 24h-default, half-life refresh policy — see
+# identity_token.py's module docstring for the mint+persist design.
+IDENTITY_TOKEN_INTERVAL_S = 6.0 * 3600.0
 
 # agents-platform-multitenant now runs as its own docker-compose stack
 # (repos/agents-platform-multitenant/docker-compose.yml), attached to the
@@ -192,12 +198,28 @@ class AgentsPlatformRunnersAppPlugin:
             json.load(f)  # validated at install time — just confirms the file is readable here
 
         config = self._refresh_derived_config(ctx)
+
+        # Attempt one mint+refresh BEFORE mcp.json is written, so a freshly
+        # minted token lands in it on this same pass rather than waiting for
+        # the watchdog's next tick. Non-fatal: on failure this logs and
+        # activation continues on whatever token is already configured — an
+        # app that refuses to activate is worse than one running on an old
+        # token. See identity_token.py for why this can't just mutate
+        # self._live_config and stop there.
+        try:
+            refreshed = identity_token_mod.refresh(self._live_config)
+            if refreshed:
+                self._live_config["agents_platform_token"] = refreshed
+        except Exception:  # noqa: BLE001 — activation must never be blocked by this
+            log.warning("identity_token: refresh failed at activation", exc_info=True)
+
         mcp_doc = write_mcp_json(ctx.package_dir, self._live_config)
 
         ctx.routes.register(routes_mod.build_routes(self._live_config))
 
         self._register_skills_watchdog(ctx, self._live_config)
         self._register_kanban_sweep_watchdog(ctx, self._live_config)
+        self._register_identity_token_watchdog(ctx, self._live_config)
 
         # Sweep stale isolated run dirs at ACTIVATION, not only where they are
         # created.
@@ -371,6 +393,38 @@ class AgentsPlatformRunnersAppPlugin:
         log.info("kanban sweep: watchdog registered (enabled=%s, every %.0fs, "
                  "board=%s, platform=%s)",
                  bool(config.get("kanban_sweep_enabled")), _interval(), board_url, base)
+
+    def _register_identity_token_watchdog(self, ctx, config: dict) -> None:
+        """Register the half-life ``agents_platform_token`` refresh watchdog
+        (Kanban ``feature:ap-runners-auto-mint-identity-token``). See
+        identity_token.py for the mint+persist design and refresh policy.
+
+        Not gated on a token already being configured — unlike the skills
+        and kanban-sweep watchdogs, this one's whole job is to obtain that
+        token in the first place when it's missing. Only the capability
+        check can skip it: the watchdog facade is lease-leader gated
+        (``src/apps/watchdog.py``), so exactly one worker runs it — a bare
+        ``threading.Thread`` would run on all ``AW_WORKSPACE_WORKERS``
+        workers and race each other writing the config.
+        """
+        if not ctx.has("watchdog:tasks"):
+            log.warning("identity_token: 'watchdog:tasks' capability not granted — "
+                        "refresh watchdog not started")
+            return
+
+        async def _refresh() -> None:
+            try:
+                refreshed = await asyncio.to_thread(identity_token_mod.refresh, self._live_config)
+            except Exception:  # noqa: BLE001 — a watchdog tick must never raise
+                log.warning("identity_token: refresh watchdog tick failed", exc_info=True)
+                return
+            if refreshed:
+                self._live_config["agents_platform_token"] = refreshed
+                log.info("identity_token: refreshed agents_platform_token")
+
+        ctx.watchdog.register("identity-token-refresh", _refresh, IDENTITY_TOKEN_INTERVAL_S,
+                              run_immediately=False)
+        log.info("identity_token: watchdog registered (every %.0fs)", IDENTITY_TOKEN_INTERVAL_S)
 
     def register_contributed_agents(self, app_id: str, spec: dict) -> dict:
         """Seed one ``contributes.agents`` declaration into Agents Platform.

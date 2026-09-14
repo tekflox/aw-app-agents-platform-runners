@@ -17,6 +17,10 @@ Use this app when an AW Workspace should be able to receive agent jobs from Agen
 
 Install the app in the workspace, open its settings, and connect it to the Agents Platform instance that should dispatch work here. Once configured, the platform can launch runs through this workspace and agents can use the contributed tools from their normal sessions.
 
+### Identity token (`agents_platform_token`)
+
+The credential this app sends as `Authorization: Bearer` on every call to `agents_platform_base` is obtained automatically — no manual minting. On activation, and again on a ~6h half-life schedule, the app calls aw-backend's `POST /api/workspaces/{slug}/identity-token` (using this workspace's own host credential) and persists the result through its own config-save path, so the refreshed token also lands in the `mcp.json` a stdio MCP child reads. A short-lived token plus that refresh loop is deliberate: the field stays writable in Settings as a manual override, but leaving it alone is the supported path. See `agents_platform_runners_app/identity_token.py` for the mint+persist design and refresh policy.
+
 ### OpenAI models
 
 The app contributes the current OpenAI catalogue as `openai-*` models, and its settings panel holds the **OpenAI API key** they run on. Saving the panel pushes that key onto Agents Platform's own `Settings.openai_api_key` row, so the models and the credential they need are configured in one place instead of two. A blank field never clears the platform's value — clearing is done in the platform UI, deliberately.

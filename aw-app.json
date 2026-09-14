@@ -2,7 +2,7 @@
   "manifest_version": 1,
   "id": "agents-platform-runners",
   "name": "Agents Platform Runners",
-  "version": "0.140.0",
+  "version": "0.141.0",
   "description": "Depends on the code-agent-clis app (claude/codex/copilot/cursor-agent already installed at /usr/local/bin, single source of truth) so this workspace's agent-CLI runners are what agents-platform-multitenant's agent sessions use, and contributes the ported \"aw-agents\" MCP (agent_mcp.py) so agents-platform is controllable as MCP tools from this workspace.",
   "tier": "inprocess",
   "requires_ui_refresh": false,
@@ -945,7 +945,7 @@
       "agents_platform_token": {
         "type": "string",
         "x-secret": true,
-        "description": "aw-backend identity JWT sent as Authorization: Bearer on every call to agents_platform_base \u2014 required, agents-platform-multitenant's require_identity() rejects unauthenticated requests with 401. Mint one inside the aw-backend container: python -c \"from src.api.identity_auth import create_identity_jwt; print(create_identity_jwt(<user_id>, [{'workspace': 'aw', 'role': 'owner'}], expiry_seconds=<seconds>))\""
+        "description": "aw-backend identity JWT sent as Authorization: Bearer on every call to agents_platform_base \u2014 required, agents-platform-multitenant's require_identity() rejects unauthenticated requests with 401. Obtained automatically at activation from aw-backend's POST /api/workspaces/{slug}/identity-token (using this workspace's own host credential) and refreshed on a half-life schedule by a background watchdog \u2014 no manual minting needed. This field stays writable as a manual override / escape hatch (e.g. pointing at a different agents-platform-multitenant instance's own token)."
       },
       "kb_base_url": {
         "type": "string",
