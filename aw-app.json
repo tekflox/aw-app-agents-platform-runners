@@ -939,8 +939,7 @@
     "properties": {
       "agents_platform_base": {
         "type": "string",
-        "default": "http://172.18.0.1:10014",
-        "description": "Base URL of the agents-platform-multitenant instance this app's MCP tools control. 172.18.0.1 is the agentic-workspace_default bridge gateway (== the real host) \u2014 the only address reachable from aw-app-mcp-gateway's nested podman namespace; override if your workspace's network subnet differs."
+        "description": "Base URL of the agents-platform-multitenant instance this app's MCP tools control. Left blank, this is resolved automatically: agents-platform.<your workspace's own domain apex> (derived from AW_BACKEND_URL), falling back to the public https://agents-platform.aw.tekflox.com if that can't be derived. A historical bridge-gateway or loopback value (e.g. http://172.18.0.1:10014) is treated as unset and re-resolved the same way. Set this only to point at a different agents-platform-multitenant instance; use the AW_AGENTS_PLATFORM_BASE env var instead if you specifically need the local bridge address on a central, co-located host."
       },
       "agents_platform_token": {
         "type": "string",

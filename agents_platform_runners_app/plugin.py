@@ -37,6 +37,7 @@ from . import execution_index as execution_index_mod
 from . import identity_token as identity_token_mod
 from . import kanban_dispatch as kanban_dispatch_mod
 from . import notion_token_sync as notion_token_sync_mod
+from . import platform_base as platform_base_mod
 from . import platform_settings as platform_settings_mod
 from . import routes as routes_mod
 from . import runner_registration as runner_registration_mod
@@ -65,38 +66,14 @@ KANBAN_SWEEP_INTERVAL_S = 60.0
 # identity_token.py's module docstring for the mint+persist design.
 IDENTITY_TOKEN_INTERVAL_S = 6.0 * 3600.0
 
-# agents-platform-multitenant now runs as its own docker-compose stack
-# (repos/agents-platform-multitenant/docker-compose.yml), attached to the
-# `agentic-workspace_default` bridge network and publishing :10014 on the
-# real host — decoupled from ./aw (2026-08-02). This app's MCP server runs
-# inside aw-app-mcp-gateway, itself nested one level deeper (podman inside
-# the aw-remote-host container), so `127.0.0.1` / `localhost` and even
-# Docker DNS names on that bridge network (e.g. `agents-platform-multitenant`)
-# don't resolve there — only the bridge's gateway IP is reachable from that
-# deep. 172.18.0.1 is `agentic-workspace_default`'s gateway (== the real
-# host's own address on that network) — verified reachable end-to-end from
-# inside aw-app-mcp-gateway, 2026-08-02.
-DEFAULT_AGENTS_PLATFORM_BASE = "http://172.18.0.1:10014"
-
-
-def _workspace_env(name: str) -> str:
-    """A workspace-published env var, from this process or from the .env the
-    server mirrors it into (0600, written at boot). Read at mcp.json-write
-    time because the *reader* — a stdio child of the gateway's container —
-    has neither."""
-    value = os.environ.get(name)
-    if value:
-        return value
-    home = os.environ.get("AW_WORKSPACE_HOME") or os.path.join(
-        os.environ.get("AW_WORKSPACE_CONTAINER_DIR", "/opt/aw-workspace"), ".aw-workspace")
-    try:
-        with open(os.path.join(home, ".env"), "r", encoding="utf-8") as fh:
-            for line in fh:
-                if line.startswith(f"{name}="):
-                    return line.split("=", 1)[1].strip()
-    except OSError:
-        pass
-    return ""
+# agents_platform_base resolution (what address this app calls
+# agents-platform-multitenant on) lives in platform_base.py now — the old
+# fixed bridge-gateway default (http://172.18.0.1:10014) only ever worked
+# when AP-MT ran on the same physical host as the workspace, which is false
+# for every real BYOD host. See that module's docstring for the resolution
+# order and why a schema-default change alone can't fix this (the value is
+# persisted into every install's config row).
+_workspace_env = platform_base_mod.workspace_env
 
 
 def build_mcp_servers(config: dict) -> dict:
@@ -106,7 +83,7 @@ def build_mcp_servers(config: dict) -> dict:
     app-scan reads directly (same contract aw-app-mcp-tools' mcp.json
     uses)."""
     config = config or {}
-    base = config.get("agents_platform_base") or DEFAULT_AGENTS_PLATFORM_BASE
+    base = platform_base_mod.resolve(config)
     token = config.get("agents_platform_token") or ""
     return {
         "agents-platform-runners": {
@@ -296,7 +273,7 @@ class AgentsPlatformRunnersAppPlugin:
         2026-08-06). Skipped (with a log) when the app isn't configured to
         reach agents-platform-multitenant, or when the ``watchdog:tasks``
         capability wasn't granted — the app's other jobs still work."""
-        base = config.get("agents_platform_base") or DEFAULT_AGENTS_PLATFORM_BASE
+        base = platform_base_mod.resolve(config)
         token = config.get("agents_platform_token")
         if not token:
             log.info("skills_sync: agents_platform_token not configured — "
@@ -374,7 +351,7 @@ class AgentsPlatformRunnersAppPlugin:
             log.warning("kanban sweep: 'watchdog:tasks' capability not granted — "
                         "Ready-card watchdog not started")
             return
-        base = config.get("agents_platform_base") or DEFAULT_AGENTS_PLATFORM_BASE
+        base = platform_base_mod.resolve(config)
         token = config.get("agents_platform_token")
         if not token:
             log.warning("kanban sweep: agents_platform_token not configured — "
@@ -512,7 +489,7 @@ class AgentsPlatformRunnersAppPlugin:
         """
         config = self._live_config or {}
         provisioner = agent_provisioner_mod.AgentProvisioner(
-            base=config.get("agents_platform_base") or DEFAULT_AGENTS_PLATFORM_BASE,
+            base=platform_base_mod.resolve(config),
             token=config.get("agents_platform_token") or "",
             # An app declares `mcp_servers: ["aw-gateway"]` and the whole
             # entry — URL included — is resolved from this workspace's own
@@ -548,7 +525,7 @@ class AgentsPlatformRunnersAppPlugin:
         """
         config = self._live_config or {}
         return agent_provisioner_mod.AgentProvisioner(
-            base=config.get("agents_platform_base") or DEFAULT_AGENTS_PLATFORM_BASE,
+            base=platform_base_mod.resolve(config),
             token=config.get("agents_platform_token") or "",
             mcp_url_overrides=(
                 {"aw-gateway": config["gateway_mcp_url"]}
@@ -614,7 +591,7 @@ class AgentsPlatformRunnersAppPlugin:
         # platform_settings.py for why the push lives on the save and not
         # on activation.
         platform_settings_mod.push_settings(
-            base=self._live_config.get("agents_platform_base") or DEFAULT_AGENTS_PLATFORM_BASE,
+            base=platform_base_mod.resolve(self._live_config),
             token=self._live_config.get("agents_platform_token") or "",
             config=self._live_config,
         )

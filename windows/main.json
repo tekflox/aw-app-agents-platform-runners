@@ -24,7 +24,7 @@
           "title": "Requirements",
           "items": [
             "agents_platform_token is obtained automatically at activation and refreshed on a half-life schedule — set it by hand in Settings only to override with a different token",
-            "agents_platform_base defaults to the agentic-workspace bridge gateway reaching agents-platform-multitenant :10014"
+            "agents_platform_base is resolved automatically (agents-platform.<your workspace domain>, or the public agents-platform.aw.tekflox.com) — set it by hand in Settings only to point at a different agents-platform-multitenant instance"
           ]
         }
       ]

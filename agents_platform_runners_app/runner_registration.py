@@ -23,6 +23,8 @@ import subprocess
 
 import httpx
 
+from . import platform_base as platform_base_mod
+
 RUNNERS = ["claude", "codex", "copilot", "cursor-agent"]
 TIMEOUT_S = 20.0
 
@@ -61,7 +63,7 @@ def register_with_platform(config: dict) -> dict:
             "error": "agents_platform_token is not configured — set it in this app's "
             "Settings before registering (see aw-app.json config_schema for how to mint one).",
         }
-    base = config.get("agents_platform_base", "http://127.0.0.1:10014")
+    base = platform_base_mod.resolve(config)
     workspace = os.environ.get("AW_WORKSPACE", "aw")
     # This app's OWN reachable base URL (the "Runner" execute endpoint) —
     # the public BYOD tunnel edge (see execute.py's module docstring for

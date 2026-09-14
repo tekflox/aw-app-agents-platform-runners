@@ -10,6 +10,8 @@ from typing import Any, Callable
 
 import httpx
 
+from . import platform_base as platform_base_mod
+
 log = logging.getLogger("aw_apps.agents_platform_runners.execution_index")
 
 EVENTS_LIMIT = 5000
@@ -148,7 +150,7 @@ def index_run(run_id: str, *, config: dict | None = None,
     mode = str(cfg.get("execution_index_mode") or "interesting")
     if mode == "off":
         return False
-    base = str(cfg.get("agents_platform_base") or "http://172.18.0.1:10014").rstrip("/")
+    base = platform_base_mod.resolve(cfg).rstrip("/")
     kb_base = str(cfg.get("kb_base_url") or "http://aw-app-kb:8000").rstrip("/")
     secret = str(cfg.get("execution_index_secret") or "")
     headers = ({"Authorization": f"Bearer {cfg['agents_platform_token']}"}

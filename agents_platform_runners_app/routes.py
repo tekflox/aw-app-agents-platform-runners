@@ -23,6 +23,7 @@ from . import execute as execute_mod
 from . import execution_index as execution_index_mod
 from . import notion_token_sync as notion_token_sync_mod
 from . import observability_push as observability_push_mod
+from . import platform_base as platform_base_mod
 from . import runner_registration as runner_registration_mod
 from . import shared_redis
 from . import warm_pool
@@ -55,7 +56,7 @@ def build_routes(config: dict | None = None) -> FastAPI:
     @app.get("/status")
     async def status() -> dict:
         return {
-            "agents_platform_base": cfg.get("agents_platform_base", "http://127.0.0.1:10014"),
+            "agents_platform_base": platform_base_mod.resolve(cfg),
             "runners": {name: _runner_status(name) for name in RUNNERS},
         }
 

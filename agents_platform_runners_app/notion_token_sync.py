@@ -34,6 +34,7 @@ import httpx
 
 from . import kanban_dispatch as kanban_dispatch_mod
 from . import observability_push as observability_push_mod
+from . import platform_base as platform_base_mod
 
 log = logging.getLogger("aw_apps.agents_platform_runners.notion_token_sync")
 
@@ -55,13 +56,10 @@ class NotionTokenNotConfigured(NotionTokenSyncError):
 
 
 def _platform(config: dict) -> tuple[str, str]:
-    from .plugin import DEFAULT_AGENTS_PLATFORM_BASE  # local import: avoids a plugin<->this-module cycle
-
     token = (config or {}).get("agents_platform_token")
     if not token:
         raise NotionTokenNotConfigured("agents_platform_token is not configured")
-    base = (config or {}).get("agents_platform_base") or DEFAULT_AGENTS_PLATFORM_BASE
-    return base.rstrip("/"), token
+    return platform_base_mod.resolve(config).rstrip("/"), token
 
 
 def _workspace() -> str:

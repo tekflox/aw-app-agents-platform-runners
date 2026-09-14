@@ -35,6 +35,7 @@ import os
 import httpx
 
 from . import kanban_dispatch as kanban_dispatch_mod
+from . import platform_base as platform_base_mod
 
 log = logging.getLogger("aw_apps.agents_platform_runners.observability_push")
 
@@ -114,8 +115,6 @@ def push_once(config: dict, *, timeout: float = 20.0) -> dict:
     function; the ``/register-observability`` route just logs whatever
     comes back, whether it was called by core on save or triggered manually.
     """
-    from .plugin import DEFAULT_AGENTS_PLATFORM_BASE  # local import: avoids a plugin<->this-module cycle
-
     token = config.get("agents_platform_token")
     if not token:
         return {"pushed": False, "reason": "agents_platform_token not configured"}
@@ -127,7 +126,7 @@ def push_once(config: dict, *, timeout: float = 20.0) -> dict:
 
     resolved = settings.get("resolved") or None
     workspace = os.environ.get("AW_WORKSPACE", "aw")
-    base = config.get("agents_platform_base") or DEFAULT_AGENTS_PLATFORM_BASE
+    base = platform_base_mod.resolve(config)
     payload = {
         "workspace": workspace,
         "endpoint": (resolved or {}).get("endpoint") or "",
