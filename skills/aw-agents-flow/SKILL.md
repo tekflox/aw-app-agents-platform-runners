@@ -109,6 +109,17 @@ keyed by `flow_run_id`) gets resumed once `mark_flow_done`/`mark_as_planned`
 fires, however many hops deep that happened — separate from, and in addition
 to, the ordinary one-hop `call_me_back` wakeup each dispatch already gets.
 
+That first registrant is normally a **Source** — a Telegram/Watch session
+dispatching INTO the flow from outside it. Until 2026-09-14 that exact case
+never armed: the waiter was keyed off the CALLER's own `flow_run_id`, and a
+Source is not a flow node, so it has none. No row was written, no error, no
+log. It looked like it worked because the one-hop callback still fired when
+the directly-dispatched agent ended its turn — the gap only showed when that
+agent handed off internally (Architect → Coder → QA) instead of concluding
+the flow itself, and the Source was then never told the flow finished,
+`need_human` verdicts included. Now keyed off the WATCHED run's flow, so a
+Source gets its flow-done wake-up like any in-flow hop.
+
 ### ③b `mark_as_planned` — declare PLANNING (not implementation) concluded
 
 ```
