@@ -804,7 +804,20 @@ async def _list_tools() -> list[Tool]:
                           "(same card, same coder run finishing again) within a short debounce "
                           "window are suppressed instead of re-firing — see supervisor_status's "
                           "wakeup_history/suppressed_count. Default window 90s; override with "
-                          "debounce_s."),
+                          "debounce_s.\n\n"
+                          "Overlap with your own call_me_back: if you dispatched a run with "
+                          "run_agent_async(call_me_back=true) AND supervise its session, both "
+                          "would report that run finishing. The supervision's 'finished' wakeup "
+                          "for a run whose callback already woke YOU is coalesced away "
+                          "(wakeup_history entry suppressed_by='call_me_back'), so you are told "
+                          "once, not twice. It is only 'finished' and only on PROVEN delivery — "
+                          "a callback that never actually landed, a wakeup redirected elsewhere "
+                          "via call_me_back_on, a waiting_human or an error still fires, so the "
+                          "supervisor stays a real backstop. If such an overlap already exists "
+                          "when you arm, the response carries an informational "
+                          "callback_overlap:{run_ids, note}; the supervision is armed regardless "
+                          "— it still watches everything those runs go on to spawn, which a "
+                          "call_me_back does not."),
              inputSchema={"type": "object",
                           "properties": {"session_id": {"type": "string",
                                                         "description": "The session_id to supervise. REQUIRED."},

@@ -110,6 +110,53 @@ watcher that has accumulated many cards can absorb a genuinely new
 `supervise` call into a much larger chain, whose "idle" is later and rarer
 than you wanted. `stop_supervisor` + re-arm if that bites.
 
+### Coalesced against your own `call_me_back`
+
+The chain dedupe above only sees other `Supervision` rows. The other way you
+get told twice is not a supervision at all: `run_agent_async(call_me_back=
+true)` **plus** `supervise` on the same session. Both report that run
+finishing, and the duplicate lives as columns on the dispatched `Run`
+(`call_me_back` / `callback_run_id` / `callback_origin_run_id` /
+`callback_target_session_id`), which no chain comparison can reach.
+
+Why it exists (2026-09-16): one session rolling `security-scan.yml` out to 50
+repos called both, per repo. Nine `forever` supervisions armed between 06:16
+and 08:00, ten wakeups delivered onto a session whose wakeup runs cost $2–8
+each.
+
+The coalescing happens at **delivery** time, in `_process_one`: when the run
+that tipped the chain into all-terminal (`_last_ended` — the same run
+`_reason_key` keys `finished` on) already woke THIS caller through its own
+callback, the supervision's wakeup is suppressed. `suppressed_count` goes up
+and the `wakeup_history` entry carries `"suppressed_by": "call_me_back"`,
+distinguishing it from `"debounce"`.
+
+Four things it deliberately will NOT suppress — each one a case where nobody
+actually told you:
+
+- **Anything but `finished`.** A callback fires on terminal, so a chain
+  blocked on `ask_human` has produced none at all; `waiting_human` would be
+  the most actionable reason you could lose. `error`/`idle_timeout` are rare,
+  and being told twice about a failure is the cheap direction to be wrong in.
+- **A callback that never landed.** The pivot is `Run.callback_run_id` (the
+  run the callback actually created), never `callback_done` — that one flips
+  *before* delivery, and every dead-end branch in `_watch_and_callback` marks
+  it done and returns without waking anyone. Suppressing on it would strip
+  the backstop from exactly the already-broken cases.
+- **A callback redirected elsewhere.** `call_me_back_on` sends the wake-up to
+  a third session; you were told nothing.
+- **A run further down the chain.** Only the run you armed the callback on is
+  covered. Everything it fans out to is still watched — which is the thing a
+  `call_me_back` can't do, and why arming both is reasonable rather than a
+  mistake.
+
+Arm time is informational only. If a matching outstanding callback exists,
+`supervise` adds `"callback_overlap": {"run_ids": [...], "note": "..."}` to
+its response — and arms the supervision anyway. Refusing there would break
+`_join_existing_chain`'s own rule against handing back a weaker guarantee: at
+arm time the chain is one just-dispatched run, and whether it fans out or
+self-continues is not knowable yet. In the trace above it did both.
+
 ## What "the chain" means
 
 Not just the target session — every descendant session/run it spawns
@@ -151,9 +198,21 @@ mode that run would otherwise look like fresh "activity" in the watched
 chain, re-arming the edge and firing again the moment it too goes idle —
 infinite loop. Two invariants prevent it, both enforced in
 `core/supervisor.py`, never opt-out:
-1. Runs with `initiator_kind="wakeup"` never count as chain activity.
+1. A run with `initiator_kind="wakeup"` **on the caller's own session** never
+   counts as chain activity.
 2. The caller's own session is never added to the watched set while
    `forever=true` (only observed in one-shot's post-wakeup retrigger check).
+
+Invariant 1 used to read "any run with `initiator_kind='wakeup'`", full stop.
+That over-matched: a coder that dispatches sub-work with `call_me_back` runs
+its own continuations on its own — *watched* — session, also with
+`initiator_kind="wakeup"`. The supervisor discarded them and read a working
+coder as idle, delivering `finished` while a run in the chain was still
+`running` and re-firing on each new "idle" plateau (three wakeups for one
+coder, 2026-09-16). A supervisor wakeup landing on a watched session belongs
+to some OTHER supervision and is genuine work; only your own delivery to your
+own session is self-trigger. The same narrowing applies to `_last_ended`,
+which decides the chain's reported outcome.
 
 ## Implementation (agents-platform's own backend, not this workspace's)
 
@@ -190,24 +249,40 @@ if you're debugging or extending the mechanism, not for using it day to day:
   `GET /api/supervisions`, `GET /all`, `GET /{id}`). The two fixed paths
   (`/stop`, `/all`) MUST stay declared before their `/{supervision_id}`
   siblings or FastAPI matches the literal as an id.
-- `mcp_server/agent_mcp.py` — the 4 `Tool()` definitions + dispatch, same
-  shape as `register_callback`. **This file is not what runs**: the gateway
-  spawns a vendored copy at
-  `repos/aw-app-agents-platform-runners/agents_platform_runners_app/mcp_server.py`.
-  Edit both, byte-identical, or the schema you ship is not the schema
-  agents see.
+- `repos/aw-app-agents-platform-runners/agents_platform_runners_app/mcp_server.py`
+  — the `Tool()` definitions + dispatch, same shape as `register_callback`
+  (`supervise` is at ~line 770). This is the ONLY copy: the `mcp_server/
+  agent_mcp.py` this file used to point at, in agents-platform-multitenant,
+  no longer exists. That app repo is also where this skill itself lives —
+  `/opt/aw-workspace/skills/aw-supervisor-tool/` is a generated mirror, never
+  edit it, and a change here needs an app reinstall to reach agents.
 - `backend/tests/test_supervisor.py` — activity/reason rules, cycle
   discovery, atomic claim under a race, one-shot give-up/retrigger,
-  forever re-arm, and a schema-pin test for the 3 tools (imports
-  `mcp_server.agent_mcp` directly — that package lives at the repo root,
-  not under `backend/`).
+  forever re-arm, and the `call_me_back` coalescing (delivery-time
+  suppression plus each case that must still fire). The schema-pin test for
+  the tools went with `mcp_server/agent_mcp.py`.
+  `backend/tests/test_callback_run_id_recorded.py` pins the other half:
+  `_watch_and_callback` records `callback_run_id` on a delivered callback and
+  leaves it NULL on a failed one.
 
 ## Sibling primitive, not a replacement
 
 `register_agent_callback` (`core.wakeups`) is a **level-trigger** on ONE
 run's own completion — this is an **edge-trigger** on a whole chain's
-idleness. They share only the atomic-claim and boot-rearm *patterns*, not
-any code path. Don't reach for one to build the other.
+idleness. Don't reach for one to build the other: a callback cannot tell you
+about the sub-work that run dispatches, and a supervision cannot tell you
+about a run that never goes quiet.
+
+They are no longer merely pattern-siblings, though. Since 2026-09-16 the
+supervisor READS the callback's own columns on the dispatched `Run` and
+coalesces its `finished` wakeup against a delivered callback (see "Coalesced
+against your own `call_me_back`" above), and `_watch_and_callback` writes
+`Run.callback_run_id` specifically so the supervisor can distinguish a
+delivered callback from an attempted one. The delivery paths are still
+separate — `_deliver_wakeup` reuses `wakeups._rerun_and_deliver`, and
+nothing else crosses — but a change to when a callback fires, or to what
+`callback_done`/`callback_run_id` mean, now changes when supervisions stay
+silent. Read both before touching either.
 
 A third sibling, `run_monitor_async` (`core.monitor_run`, see the `aw-agents`
 skill), is level-trigger like `register_agent_callback` but for a RAW SHELL
