@@ -565,6 +565,67 @@ output tail; pull the full log with
 tail before reporting back to the user. Same tool a Coder you dispatched
 uses to watch its own push's CI run — see the `aw-agent-coder` skill.
 
+### 7. Doing the same thing across N repos/items — `run_agents_parallel`
+
+Steps 3 and 6 above are "arm one wakeup, don't poll" for a single command or
+a single dispatched chain. This is the same idiom for **N** items you
+already know up front — "roll this fix out to these 20 repos", "apply the
+same change everywhere it appears". Dispatch it as `run_agents_parallel`
+batches, never a loop of sequential `run_agent_async` calls.
+
+The cost of getting this wrong is real: a 50-repo rollout done as a serial
+`run_agent_async` loop — one completion waking the coordinator to decide
+"next repo" and dispatch again — once ran ~2h, 38 wakeups, **$139.43**, with
+turn context growing from ~400K to 6M+ tokens, because every wakeup
+re-sends the whole accumulated transcript. Cost there is quadratic in the
+number of hops, almost none of it the actual work. The same 50 repos in
+batches of ≤20 is 3 wakeups, not ~50–100.
+
+**Always pass `node_id` on every item in the batch.** It defaults to the
+agent slug — without it, 20 repos all show up as `coder-sonnet` in both the
+wakeup summary and `run_tree`, and there is no way to tell which one
+failed. Set `node_id` to whatever makes the item unique (the repo name, the
+file path). This is the single highest-value habit in this section.
+
+**The parent run's status is not the batch verdict.** It flips to `error`
+if *any* child errors — 49/50 succeeding still reports `error` on the
+parent. Never read the parent's own status as "the rollout failed"; read
+the children.
+
+**The wakeup text truncates — it's a preview, not a report.** It's capped
+at 400 chars per child and 4000 chars total, so a batch of 20 always
+truncates (roughly the first 10–13 children show, the rest collapse into
+"+N more not shown"). To actually consolidate a batch:
+
+1. Call `run_tree(parent_run_id)` — untruncated, every child, with
+   `node_id`, `status`, `cost_usd`, `model_slug`, plus the batch's total
+   cost in `totals.cost_usd`.
+2. For each child whose status isn't `success` — only those — call
+   `peek_run_output(run_id=...)` for the real failure reason. Cost scales
+   with the number of failures, not with N.
+3. Report one headline count ("47/50 applied"), the failures named by
+   `node_id` with their reason, then total cost. Successes are a count, not
+   a list — 50 names in a chat bubble is unreadable.
+4. Retrying is just the next batch: re-dispatch the failed subset through
+   `run_agents_parallel` again.
+
+**Above 20 items, batch sequentially — don't fire every batch at once.**
+`run_agents_parallel` caps at 20 children per dispatch. Dispatch ≤20, get
+woken, consolidate, dispatch the next ≤20. Don't fire multiple batches
+concurrently: each parent arms its own independent callback, so you'd get
+several wakeups in no reliable order with no way to tell which is last.
+Sequential also catches a systematic failure (bad credential, wrong branch
+name) after 20 items instead of after 50.
+
+**Each item must be one scoped run, not a nested multi-hop flow.** The
+parent's own watcher gives up after 3600s and marks itself `error` on
+timeout — while the children keep running, uncancelled. If a batch item is
+a whole Dev Team flow (PO → Architect → Coder → QA) rather than a single
+scoped agent call, 20 of them can blow past that ceiling.
+
+See also the `aw-agents` skill's tool table, which points here for the same
+rule when you're fanning out as a conductor rather than as this Source.
+
 ## Quick reference
 
 | What you want | How |

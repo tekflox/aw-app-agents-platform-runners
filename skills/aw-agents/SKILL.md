@@ -548,6 +548,13 @@ state. Anything that mutates the user's work belongs to an agent.
 | Present | `mcp__aw-gateway__aw_presentation__create_presentation`, `update_presentation`, if installed |
 | Coordinate | `TaskCreate`, `TaskUpdate`, `AskUserQuestion` |
 
+**Fanning out the same task across many known items** (N repos, N files) —
+don't loop `run_agent_async` one at a time. See the `aw-agent-telegram`
+skill's "Doing the same thing across N repos/items" section for the
+`run_agents_parallel` batching pattern (≤20 per dispatch, `node_id` per
+item so failures are attributable, batch verdict lives in the children via
+`run_tree`, not in the parent's own status).
+
 ## Watching a long-running shell command — don't use the harness `Monitor` tool
 
 The harness's own built-in `Monitor` tool doesn't reliably wake a docker
