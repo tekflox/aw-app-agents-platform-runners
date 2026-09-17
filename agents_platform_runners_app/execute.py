@@ -657,6 +657,16 @@ def _run_cold_agent_with_retry(client, image, kwargs: dict, container, run_id: s
     returncode = 1
     for attempt in range(1, max_attempts + 1):
         if attempt > 1:
+            # An abort that landed while attempt N-1 was being killed must not
+            # be undone by respawning attempt N. The flag is set BEFORE the
+            # kill (see mark_aborted) precisely so it is already visible here,
+            # and it is read through Redis because the abort arrives on
+            # whichever of the ten workers the tunnel picked, not necessarily
+            # this one.
+            if is_aborted(r, run_id):
+                log.info("execute: run=%s was aborted — not respawning after the "
+                         "codex rollout-contention hit", run_id)
+                break
             # The previous attempt's container already exited (self-removes,
             # remove=True for a non-raw_command job).
             backoff = _CODEX_ROLLOUT_RETRY_BACKOFF_S[
@@ -2110,7 +2120,7 @@ def _log_recycle(job: dict, *, container: str) -> None:
                     job.get("run_id"), exc_info=True)
 
 
-def _dispatch_warm_turn(client, job: dict, redis_url: str) -> None:
+def _dispatch_warm_turn(client, job: dict, redis_url: str, r=None) -> None:
     """RUNNER_WARM_CONTAINER=1 path: get-or-create this session's persistent
     container (spawning + pulling only on a cold/stale session) and feed the
     turn into its FIFO. Does NOT stream or wait for output — aw-warm-relay.py
@@ -2149,6 +2159,11 @@ def _dispatch_warm_turn(client, job: dict, redis_url: str) -> None:
     )
     if recycle:
         _log_recycle(job, container=name)
+    # The warm container's name is only knowable HERE — it is keyed on
+    # (agent_id, session_id), not on the run id — so this is the one moment an
+    # abort for this run can be taught what to kill. See remember_container on
+    # why this entry lives out its TTL instead of being cleared on return.
+    remember_container(r, run_id, name)
     prompt = job.get("prompt") or ""
     # codex has no --append-system-prompt equivalent — same reason the cold
     # path prepends it into the prompt text (_build_container_kwargs's own
@@ -2225,6 +2240,302 @@ def reap_dead_warm_containers() -> int:
     except Exception:
         log.warning("execute: boot-time warm reap failed", exc_info=True)
         return 0
+
+
+# ---------------------------------------------------------------------------
+# run_id -> container registry, and the abort verb that reads it.
+#
+# Deliberately the same shape as agents-platform-multitenant's own pair
+# (``cli.py``'s ``_RUN_CONTAINER_NAMES`` dict + ``redis_streams.persist_
+# container_name``), not a new pattern: a local dict on the process that
+# spawned the container, mirrored into the shared Redis for everyone else.
+#
+# The mirror is not optional here. This app's routes are served by TEN uvicorn
+# workers (aw-workspace's Dockerfile:94), while a job's ``container`` object
+# lives only in the ONE worker whose thread spawned it — so an abort POST has
+# about a 1-in-10 chance of landing on that worker. A local-dict-only registry
+# passes every single-process test and then silently fails ~90% of the time in
+# production, which is the same bug AP-MT's Etapa 4 fixed on its own side.
+#
+# Keys are namespaced ``runner:run:{id}:…`` rather than reusing AP-MT's
+# ``run:{id}:container``: both sides share this Redis db, and a name written
+# here names a container on THIS host — AP-MT reading it as one of its own
+# would `docker kill` a name its daemon has never heard of.
+# ---------------------------------------------------------------------------
+
+#: How long the Redis mirror of a run's container name (and its abort flag)
+#: survives without being cleared. Both are cleared explicitly on the cold
+#: path's own `finally`; the TTL is the safety net for a worker that dies
+#: without running it — and, for the warm path, the ONLY bound (see
+#: remember_container's note on why the warm entry cannot be cleared here).
+ABORT_REGISTRY_TTL_S = 1800
+
+_RUN_CONTAINER_NAMES: "OrderedDict[str, str]" = OrderedDict()
+_RUN_CONTAINER_NAMES_LOCK = threading.Lock()
+_RUN_CONTAINER_NAMES_MAX = 2048
+
+_ABORTED_RUN_IDS: "OrderedDict[str, None]" = OrderedDict()
+_ABORTED_RUN_IDS_LOCK = threading.Lock()
+_ABORTED_RUN_IDS_MAX = 2048
+
+
+class _AbortedBeforeSpawn(Exception):
+    """This run was aborted while it was still being prepared — see the check
+    in ``_run_job_blocking`` just before ``containers.run``."""
+
+
+def _container_reg_key(run_id: str) -> str:
+    return f"runner:run:{run_id}:container"
+
+
+def _abort_flag_key(run_id: str) -> str:
+    return f"runner:run:{run_id}:aborted"
+
+
+def _bounded_put(store: "OrderedDict", lock, maximum: int, key: str, value) -> None:
+    with lock:
+        store[key] = value
+        while len(store) > maximum:
+            store.popitem(last=False)
+
+
+def remember_container(r, run_id: str, name: str) -> None:
+    """Record which container is running ``run_id``, locally and in Redis.
+
+    Called right after the container exists and its name is known — after
+    ``containers.run`` on the cold path, after ``get_or_create`` resolved the
+    warm container's name on the warm one.
+
+    The warm entry deliberately is NOT cleared when the warm branch returns:
+    that branch returns as soon as the turn has been FED into the container's
+    FIFO, seconds after dispatch, while the turn itself runs on for minutes
+    and is published by the relay inside the container. Clearing there would
+    leave every warm abort resolving nothing at all. It expires by TTL
+    instead, which is also what bounds the (pre-existing, same on AP-MT's own
+    warm path) risk of an abort for a finished turn reaching the container's
+    NEXT turn.
+    """
+    _bounded_put(_RUN_CONTAINER_NAMES, _RUN_CONTAINER_NAMES_LOCK,
+                 _RUN_CONTAINER_NAMES_MAX, run_id, name)
+    if r is None:
+        return
+    try:
+        r.set(_container_reg_key(run_id), name, ex=ABORT_REGISTRY_TTL_S)
+    except Exception:
+        log.warning("execute: could not mirror container name for run=%s to Redis "
+                    "(abort landing on another worker will fall back to the "
+                    "deterministic name)", run_id, exc_info=True)
+
+
+def lookup_container(r, run_id: str) -> str | None:
+    """The container running ``run_id``: this process's own record first, the
+    cross-worker Redis mirror second."""
+    name = _RUN_CONTAINER_NAMES.get(run_id)
+    if name:
+        return name
+    if r is None:
+        return None
+    try:
+        return r.get(_container_reg_key(run_id)) or None
+    except Exception:
+        log.warning("execute: Redis lookup of the container for run=%s failed",
+                    run_id, exc_info=True)
+        return None
+
+
+def forget_container(r, run_id: str) -> None:
+    """Drop ``run_id``'s registry entry once its container is gone."""
+    with _RUN_CONTAINER_NAMES_LOCK:
+        _RUN_CONTAINER_NAMES.pop(run_id, None)
+    if r is None:
+        return
+    try:
+        r.delete(_container_reg_key(run_id))
+    except Exception:
+        log.warning("execute: could not clear the Redis container mirror for run=%s",
+                    run_id, exc_info=True)
+
+
+def mark_aborted(r, run_id: str) -> None:
+    """Flag ``run_id`` as aborted BEFORE anything is killed.
+
+    Read by ``_run_cold_agent_with_retry`` between attempts: a codex
+    rollout-contention retry respawns a fresh container from the same
+    image/kwargs, so an abort landing in that window would kill a container
+    that is already gone and the loop would cheerfully start a new one. Set it
+    after the kill instead and that window is exactly where the flag isn't
+    there yet.
+
+    Mirrored to Redis for the same reason the container name is: the retry
+    loop runs in the worker that owns the job, the abort arrives on whichever
+    worker the tunnel picked.
+    """
+    _bounded_put(_ABORTED_RUN_IDS, _ABORTED_RUN_IDS_LOCK,
+                 _ABORTED_RUN_IDS_MAX, run_id, None)
+    if r is None:
+        return
+    try:
+        r.set(_abort_flag_key(run_id), "1", ex=ABORT_REGISTRY_TTL_S)
+    except Exception:
+        log.warning("execute: could not mirror the abort flag for run=%s to Redis "
+                    "(a codex retry on another worker may respawn it)",
+                    run_id, exc_info=True)
+
+
+def is_aborted(r, run_id: str) -> bool:
+    if run_id in _ABORTED_RUN_IDS:
+        return True
+    if r is None:
+        return False
+    try:
+        return bool(r.get(_abort_flag_key(run_id)))
+    except Exception:
+        log.warning("execute: Redis lookup of the abort flag for run=%s failed",
+                    run_id, exc_info=True)
+        return False
+
+
+def clear_abort(r, run_id: str) -> None:
+    with _ABORTED_RUN_IDS_LOCK:
+        _ABORTED_RUN_IDS.pop(run_id, None)
+    if r is None:
+        return
+    try:
+        r.delete(_abort_flag_key(run_id))
+    except Exception:
+        log.warning("execute: could not clear the Redis abort flag for run=%s",
+                    run_id, exc_info=True)
+
+
+def _forget_run(r, run_id: str) -> None:
+    """Drop everything the abort path knows about a run whose container is
+    gone — its name and its abort flag. Called from the cold path's own
+    cleanup, where the container's life really has ended in this process."""
+    forget_container(r, run_id)
+    clear_abort(r, run_id)
+
+
+def abort_candidates(r, run_id: str, agent_id: str | None = None,
+                     session_id: str | None = None) -> list[tuple[str, str]]:
+    """(container_name, how_it_was_resolved) pairs to try, best first.
+
+    The registry answers are ground truth; the two deterministic names are the
+    fallback for a run this process never recorded (registry lost to a worker
+    restart, Redis unreachable) — cold agent containers are named
+    ``aw-runner-run-{run_id}`` (_build_container_kwargs) and monitor runs
+    ``aw-runner-monitor-{run_id[:12]}`` (_build_raw_kwargs). A warm container's
+    name is NOT derivable from a run id at all (``aw-warm-{agent_id}-{session_
+    id}``), so it is only a candidate when the caller supplied both halves.
+    """
+    out: list[tuple[str, str]] = []
+
+    def _add(name: str | None, source: str) -> None:
+        if name and not any(name == existing for existing, _ in out):
+            out.append((name, source))
+
+    _add(_RUN_CONTAINER_NAMES.get(run_id), "local registry")
+    _add(lookup_container(r, run_id), "Redis registry")
+    _add(f"aw-runner-run-{run_id}", "deterministic cold name")
+    _add(f"aw-runner-monitor-{run_id[:12]}", "deterministic monitor name")
+    if agent_id and session_id:
+        _add(warm_pool.warm_container_name(agent_id, session_id), "warm name")
+    return out
+
+
+def abort_job(run_id: str, redis_url: str | None = None, *,
+              agent_id: str | None = None, session_id: str | None = None) -> dict:
+    """Kill whatever container is running ``run_id`` on this workspace.
+
+    The counterpart to ``POST /execute``: agents-platform-multitenant's
+    ``kill_run`` can only ``docker kill`` on ITS own host, which for a
+    Runner-backed run holds no container at all — so an /abort there marked
+    the Run row cancelled and the agent kept running here to completion.
+
+    Never raises for "there was nothing to kill": an abort racing a run that
+    has just finished is the normal case (it is the race that produced this
+    fix's own bug report), and the caller retries HTTP 404 as a transient
+    tunnel/app-reload failure — so that answer has to be a 200 saying
+    ``not_found``, not a 404.
+
+    Returns ``{"status": "killed"|"not_found", ...}``.
+    """
+    r = None
+    if redis_url:
+        try:
+            r = _redis_client(redis_url)
+        except Exception:
+            log.warning("execute: abort run=%s could not reach Redis — falling back "
+                        "to this worker's own registry and the deterministic names",
+                        run_id, exc_info=True)
+
+    try:
+        # BEFORE the kill, always — even if nothing below finds a container.
+        # A container being spawned right now by another thread (or respawned
+        # by the codex retry loop) must find this flag already set.
+        mark_aborted(r, run_id)
+
+        if not CONTAINER_SOCKET:
+            log.warning("execute: abort run=%s — no AW_CONTAINER_SOCKET, nothing "
+                        "to kill on this workspace", run_id)
+            return {"run_id": run_id, "status": "not_found",
+                    "detail": "no container engine available on this workspace"}
+
+        import docker as docker_sdk
+        try:
+            client = docker_sdk.DockerClient(base_url="unix://" + CONTAINER_SOCKET)
+        except Exception as exc:
+            log.exception("execute: abort run=%s could not talk to the container engine", run_id)
+            return {"run_id": run_id, "status": "not_found", "detail": f"container engine unreachable: {exc}"}
+
+        tried: list[str] = []
+        for name, source in abort_candidates(r, run_id, agent_id, session_id):
+            tried.append(name)
+            try:
+                container = client.containers.get(name)
+            except Exception:
+                continue
+            log.info("execute: abort run=%s — killing container %s (%s)", run_id, name, source)
+            try:
+                container.kill()
+            except Exception:
+                # Already exited between the lookup and the signal; the
+                # force-remove below is still worth doing.
+                log.info("execute: abort run=%s — %s did not take a kill signal "
+                         "(already exiting?)", run_id, name, exc_info=True)
+            # A warm container is the ONLY case where this process owes the
+            # stream its terminal sentinel: the relay inside it publishes
+            # `done` for every turn and we just killed the relay, so nothing
+            # else ever will and AP-MT's consumer would block on the run's
+            # 900s timeout holding that session's lock (the 12-minute stall
+            # documented at AP-MT cli.py:404-415). The cold path must NOT do
+            # this — `_run_job_blocking`'s own `finally` already publishes
+            # one, and a second `done` is noise on the stream.
+            if name.startswith("aw-warm-") and r is not None:
+                try:
+                    _publish_done(r, run_id, -9)
+                except Exception:
+                    log.exception("execute: abort run=%s — failed to publish the done "
+                                  "sentinel after killing warm container %s", run_id, name)
+            try:
+                container.remove(force=True)
+            except Exception:
+                # `docker rm -f` right after the kill instead of waiting for
+                # the engine's async `--rm` cleanup: that lag is what left a
+                # stale name behind and broke the session's next turn with a
+                # name conflict (AP-MT, 2026-07-21).
+                log.info("execute: abort run=%s — remove of %s failed (likely already "
+                         "auto-removed)", run_id, name, exc_info=True)
+            forget_container(r, run_id)
+            return {"run_id": run_id, "status": "killed", "container": name, "resolved_by": source}
+
+        log.info("execute: abort run=%s — no live container matched %s", run_id, tried)
+        return {"run_id": run_id, "status": "not_found", "tried": tried}
+    finally:
+        if r is not None:
+            try:
+                r.close()
+            except Exception:
+                pass
 
 
 def _run_job_blocking(job: dict, redis_url: str) -> None:
@@ -2305,7 +2616,7 @@ def _run_job_blocking(job: dict, redis_url: str) -> None:
             and job.get("agent_id") and job.get("session_id")):
         try:
             client = docker_sdk.DockerClient(base_url="unix://" + CONTAINER_SOCKET)
-            _dispatch_warm_turn(client, job, redis_url)
+            _dispatch_warm_turn(client, job, redis_url, r)
             execution_index.start_after_stream_done(run_id, redis_url)
         except Exception as e:
             log.exception("execute: warm dispatch failed run=%s", run_id)
@@ -2339,7 +2650,33 @@ def _run_job_blocking(job: dict, redis_url: str) -> None:
             client.images.get(image)  # raises ImageNotFound if truly absent — surfaces as spawn_error below
 
         log.info("execute: spawning run=%s image=%s argv=%s", run_id, image, argv)
+        if is_aborted(r, run_id):
+            # The abort landed while this run was still being PREPARED — a
+            # cold start spends most of its wall-clock in the image pull just
+            # above — so it found no container, answered "not_found", and
+            # would have been followed by this spawn. Starting the agent
+            # anyway is the exact silent "the abort did nothing" this endpoint
+            # exists to remove.
+            raise _AbortedBeforeSpawn()
         container = client.containers.run(image, **kwargs)
+        # Record it before a single line is streamed: an abort arriving on any
+        # worker resolves the container through this, and the run is killable
+        # from the moment it exists.
+        remember_container(r, run_id, kwargs.get("name") or container.name)
+    except _AbortedBeforeSpawn:
+        log.info("execute: run=%s aborted before its container was spawned", run_id)
+        _publish_line(r, run_id, json.dumps({
+            "type": "result", "subtype": "aborted", "is_error": True,
+            "result": "aborted before the container started",
+        }))
+        _publish_done(r, run_id, -9)
+        execution_index.start(run_id)
+        _forget_run(r, run_id)
+        try:
+            r.close()
+        except Exception:
+            pass
+        return
     except Exception as e:
         log.exception("execute: container spawn failed run=%s", run_id)
         _publish_line(r, run_id, json.dumps({
@@ -2416,6 +2753,7 @@ def _run_job_blocking(job: dict, redis_url: str) -> None:
             container.remove(force=True)
         except Exception:
             pass  # already gone (e.g. killed by the timeout timer) — nothing left to clean up
+        _forget_run(r, run_id)
         try:
             r.close()
         except Exception:
@@ -2458,6 +2796,7 @@ def _run_job_blocking(job: dict, redis_url: str) -> None:
             kill_timer.cancel()
         _publish_done(r, run_id, returncode)
         execution_index.start(run_id)
+        _forget_run(r, run_id)
         try:
             r.close()
         except Exception:

@@ -14,10 +14,11 @@ that the dependency actually did its job, not just that it's declared.
 """
 from __future__ import annotations
 
+import logging
 import os
 import uuid
 
-from fastapi import Body, FastAPI, HTTPException, Request
+from fastapi import Body, Depends, FastAPI, HTTPException, Request
 
 from . import execute as execute_mod
 from . import execution_index as execution_index_mod
@@ -33,6 +34,8 @@ from . import warm_pool
 # activate()'s automatic registration and its watchdog).
 RUNNERS = runner_registration_mod.RUNNERS
 _runner_status = runner_registration_mod.runner_status
+
+log = logging.getLogger("aw_apps.agents_platform_runners.routes")
 
 
 def build_routes(config: dict | None = None) -> FastAPI:
@@ -52,6 +55,29 @@ def build_routes(config: dict | None = None) -> FastAPI:
     app = FastAPI(title="agents-platform-runners")
     cfg = config if config is not None else {}
     execution_index_mod.configure(cfg)
+
+    def require_execute_secret(request: Request) -> None:
+        """The shared-secret half of this app's two-layer auth, shared by every
+        route agents-platform-multitenant calls (/execute, /abort).
+
+        See execute_job's docstring for the full picture: aw-workspace's own
+        per-app IdentityGuard already demands a validly-signed identity JWT in
+        Authorization: Bearer, and this adds the X-Runner-Secret both sides
+        configure. Both gates must pass; neither alone is sufficient. As a
+        DEPENDENCY it runs before the handler body, so an unauthenticated
+        caller still learns nothing about what bodies the route would accept —
+        an ordering test_execute_payload_validation.py asserts.
+
+        Deliberately not gated on the app-level public/auth_required flag:
+        that is all-or-nothing per app, so /abort inherits /execute's
+        IdentityGuard treatment for free and must not change it.
+        """
+        secret = cfg.get("execute_secret")
+        if not secret:
+            raise HTTPException(500, "execute_secret is not configured on this app's Settings")
+        presented = request.headers.get("x-runner-secret", "")
+        if presented != secret:
+            raise HTTPException(401, "invalid or missing X-Runner-Secret")
 
     @app.get("/status")
     async def status() -> dict:
@@ -159,7 +185,7 @@ def build_routes(config: dict | None = None) -> FastAPI:
         except notion_token_sync_mod.NotionTokenSyncError as exc:
             raise _notion_token_failure(exc) from exc
 
-    @app.post("/execute")
+    @app.post("/execute", dependencies=[Depends(require_execute_secret)])
     async def execute_job(request: Request) -> dict:
         """Spawn a container in THIS workspace's own container engine and
         stream its output back over the shared Redis Stream (see execute.py's
@@ -179,15 +205,9 @@ def build_routes(config: dict | None = None) -> FastAPI:
         per-app IdentityGuard still requires a validly-SIGNED identity JWT
         (Authorization: Bearer), and this route additionally requires the
         shared X-Runner-Secret header to match config["execute_secret"].
-        Both gates must pass; neither alone is sufficient.
+        Both gates must pass; neither alone is sufficient — enforced by the
+        shared `require_execute_secret` dependency above, which /abort uses too.
         """
-        secret = cfg.get("execute_secret")
-        if not secret:
-            raise HTTPException(500, "execute_secret is not configured on this app's Settings")
-        presented = request.headers.get("x-runner-secret", "")
-        if presented != secret:
-            raise HTTPException(401, "invalid or missing X-Runner-Secret")
-
         # Validate the job BEFORE spending a container on it. Until 2026-08-30
         # this route accepted ANY body: `{}` passed straight through to
         # start_job, which spawned a real claude container on an empty prompt
@@ -309,5 +329,44 @@ def build_routes(config: dict | None = None) -> FastAPI:
         # caller's next step is identical: attach to run:{run_id}:events.
         started = execute_mod.start_job(job, redis_url)
         return {"run_id": run_id, "status": "started" if started else "duplicate"}
+
+    @app.post("/abort", dependencies=[Depends(require_execute_secret)])
+    async def abort_run(data: dict = Body(...)) -> dict:
+        """Kill the container running ``run_id`` on this workspace.
+
+        /execute's counterpart, and the whole point of this endpoint:
+        agents-platform-multitenant's own ``kill_run`` can only reach ITS
+        host's docker daemon, which for a Runner-backed run holds no container
+        at all — so a Telegram ``/abort`` marked the Run row cancelled while
+        the agent kept running here to completion (Kanban
+        bug:abort-does-not-propagate-to-runner-backed-run).
+
+        Always answers 200 when the request itself was well-formed, with
+        ``status`` saying whether anything was killed. An abort that raced a
+        run to its finish is a clean ``not_found``, NOT a 404: the caller
+        retries 404 as a transient app-reload/tunnel failure (RunnerLLM's
+        RETRYABLE_STATUS), so answering 404 here would make it hammer an
+        abort three times over three seconds for a run that was simply done.
+
+        ``agent_id``/``session_id`` are optional and only help the warm path,
+        whose container name is keyed on that pair rather than on the run id.
+        """
+        run_id = (data.get("run_id") or "").strip()
+        if not run_id:
+            raise HTTPException(400, "run_id is required")
+
+        # Degraded but still useful without Redis: this worker's own registry
+        # and the deterministic container names still resolve. Not a 500 —
+        # abort's whole job is to stop something that is costing money.
+        redis_url = shared_redis.resolve(cfg)
+        if not redis_url:
+            log.warning("abort: run=%s — no shared Redis resolvable; falling back to "
+                        "this worker's registry and the deterministic names", run_id)
+
+        import asyncio
+        return await asyncio.to_thread(
+            execute_mod.abort_job, run_id, redis_url,
+            agent_id=data.get("agent_id"), session_id=data.get("session_id"),
+        )
 
     return app
