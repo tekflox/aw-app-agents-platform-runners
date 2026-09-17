@@ -101,6 +101,35 @@ def test_successful_register_posts_every_runner_with_bearer_token(monkeypatch):
     assert {r["cli"] for r in payload["runners"]} == set(rr.RUNNERS)
 
 
+def test_register_payload_carries_dispatch_credentials_for_ap_mt(monkeypatch):
+    """AP-MT's RunnerLLM needs a caller_token + execute_secret to call this
+    workspace's own /execute back (self-heal for the 2026-09-17 stale-
+    RUNNER_CALLER_TOKEN incident — see runner_registration.py). Both should
+    ride this same, already-authenticated registration call rather than
+    living as separately-managed static secrets."""
+    seen = []
+    _stub_client(monkeypatch, lambda url, kwargs: FakeResponse(200, {}), seen)
+
+    rr.register_with_platform({
+        "agents_platform_token": "tok123",
+        "execute_secret": "shhh",
+    })
+
+    payload = seen[0][1]["json"]
+    # Same value used for the call's own Bearer auth — no second mint.
+    assert payload["caller_token"] == "tok123"
+    assert payload["execute_secret"] == "shhh"
+
+
+def test_register_payload_omits_execute_secret_when_not_configured(monkeypatch):
+    seen = []
+    _stub_client(monkeypatch, lambda url, kwargs: FakeResponse(200, {}), seen)
+
+    rr.register_with_platform({"agents_platform_token": "tok123"})
+
+    assert seen[0][1]["json"]["execute_secret"] is None
+
+
 def test_register_uses_own_base_url_override_when_configured(monkeypatch):
     seen = []
     _stub_client(monkeypatch, lambda url, kwargs: FakeResponse(200, {}), seen)

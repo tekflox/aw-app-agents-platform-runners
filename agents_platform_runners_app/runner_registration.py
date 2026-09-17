@@ -17,6 +17,7 @@ else, never a correctness risk.
 """
 from __future__ import annotations
 
+import logging
 import os
 import shutil
 import subprocess
@@ -24,6 +25,8 @@ import subprocess
 import httpx
 
 from . import platform_base as platform_base_mod
+
+log = logging.getLogger("aw_apps.agents_platform_runners.runner_registration")
 
 RUNNERS = ["claude", "codex", "copilot", "cursor-agent"]
 TIMEOUT_S = 20.0
@@ -59,6 +62,8 @@ def register_with_platform(config: dict) -> dict:
     """
     token = (config or {}).get("agents_platform_token")
     if not token:
+        log.warning("register_with_platform: agents_platform_token is not configured — "
+                    "skipping registration")
         return {
             "error": "agents_platform_token is not configured — set it in this app's "
             "Settings before registering (see aw-app.json config_schema for how to mint one).",
@@ -84,6 +89,22 @@ def register_with_platform(config: dict) -> dict:
             {"cli": name, "name": name, **runner_status(name)}
             for name in RUNNERS
         ],
+        # The two credentials AP-MT's RunnerLLM needs to call US back at
+        # /execute (routes.py's IdentityGuard + X-Runner-Secret gates) —
+        # re-sent on every registration so they ride this call's own
+        # cadence instead of being separately-managed static secrets (Kanban
+        # self-heal for feature:ap-runners-auto-mint-identity-token's
+        # mirror-image gap, 2026-09-17).
+        #
+        # `token` here is the SAME agents_platform_token this function just
+        # used to authenticate the /register call itself — any validly
+        # signed aw-backend identity JWT satisfies aw-workspace's own
+        # IdentityGuard on /execute too (decode_identity_jwt only checks
+        # signature + expiry, not what the token was minted for), so no
+        # second mint is needed. It's already kept fresh by identity_token.py
+        # (half-life refresh) before this function is ever called.
+        "caller_token": token,
+        "execute_secret": config.get("execute_secret") or None,
     }
     url = f"{base.rstrip('/')}/api/runners/register"
     try:
@@ -92,8 +113,13 @@ def register_with_platform(config: dict) -> dict:
                 url, json=payload, headers={"Authorization": f"Bearer {token}"},
             )
         resp.raise_for_status()
-        return {"registered": resp.json()}
+        result = {"registered": resp.json()}
+        log.info("register_with_platform: registered %d runner(s) at %s", len(RUNNERS), url)
+        return result
     except httpx.HTTPStatusError as exc:
+        log.warning("register_with_platform: %s responded %s: %s",
+                    url, exc.response.status_code, exc.response.text[:500])
         return {"error": f"agents-platform responded {exc.response.status_code}: {exc.response.text[:500]}"}
-    except Exception as exc:  # noqa: BLE001 — surfaced as-is to the caller
+    except Exception as exc:  # noqa: BLE001 — logged here, then surfaced as-is to the caller
+        log.warning("register_with_platform: could not reach %s: %s", url, exc, exc_info=True)
         return {"error": f"could not reach {url}: {exc}"}
