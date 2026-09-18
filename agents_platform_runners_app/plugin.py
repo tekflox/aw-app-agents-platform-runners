@@ -84,6 +84,22 @@ IDENTITY_TOKEN_INTERVAL_S = 6.0 * 3600.0
 # whatever that misses.
 RUNNER_REGISTRATION_REASSERT_INTERVAL_S = 120.0
 
+# execute_secret.ensure_configured() retry cadence — closes a gap the
+# 2026-09-18 incident fixes above did NOT cover: ensure_configured() itself
+# is only ever called once, from activate(), before this constant existed.
+# On a BRAND NEW (or freshly recreated) workspace, activate() can run before
+# AW_WORKSPACE_API_KEY/AW_WORKSPACE_API_URL are actually readable yet (both
+# are minted by aw-workspace core's OWN boot lifespan, in the same process,
+# but ordering relative to every installed app's activate() is not something
+# this app controls or can assume never races) — ensure_configured() logs a
+# warning and gives up silently in that case, and until this watchdog
+# existed nothing ever asked again until the NEXT full app restart/upgrade,
+# which could be arbitrarily far away for a long-lived workspace. Reasserted
+# on the same short cadence as runner registration for the same reason: a
+# missing execute_secret is a hard failure (500) on every single /execute
+# call, not something to leave to chance.
+EXECUTE_SECRET_ENSURE_INTERVAL_S = 120.0
+
 # agents_platform_base resolution (what address this app calls
 # agents-platform-multitenant on) lives in platform_base.py now — the old
 # fixed bridge-gateway default (http://172.18.0.1:10014) only ever worked
@@ -250,6 +266,7 @@ class AgentsPlatformRunnersAppPlugin:
         self._register_kanban_sweep_watchdog(ctx, self._live_config)
         self._register_identity_token_watchdog(ctx, self._live_config)
         self._register_runner_registration_watchdog(ctx, self._live_config)
+        self._register_execute_secret_watchdog(ctx, self._live_config)
 
         # Sweep stale isolated run dirs at ACTIVATION, not only where they are
         # created.
@@ -492,6 +509,56 @@ class AgentsPlatformRunnersAppPlugin:
                               RUNNER_REGISTRATION_REASSERT_INTERVAL_S, run_immediately=False)
         log.info("runner_registration: watchdog registered (every %.0fs)",
                  RUNNER_REGISTRATION_REASSERT_INTERVAL_S)
+
+    def _register_execute_secret_watchdog(self, ctx, config: dict) -> None:
+        """Keep retrying execute_secret.ensure_configured() until it succeeds
+        — activate() only ever tries this ONCE (see EXECUTE_SECRET_ENSURE_
+        INTERVAL_S's docstring for why a single attempt at activation time
+        is not enough on a brand new workspace). A tick is a no-op the
+        moment execute_secret is already configured (ensure_configured's own
+        early return), so this costs nothing once it has succeeded once —
+        same "cheap to keep asking" shape as the runner-registration
+        reassert watchdog right above.
+
+        Not gated on anything being configured yet, same reasoning as the
+        other watchdogs here: the whole point is to keep trying BEFORE
+        anything is configured."""
+        if not ctx.has("watchdog:tasks"):
+            log.warning("execute_secret: 'watchdog:tasks' capability not granted — "
+                        "ensure-configured watchdog not started")
+            return
+
+        async def _ensure() -> None:
+            try:
+                generated_secret = await asyncio.to_thread(
+                    execute_secret_mod.ensure_configured, self._live_config)
+            except Exception:  # noqa: BLE001 — a watchdog tick must never raise
+                log.warning("execute_secret: ensure-configured watchdog tick failed", exc_info=True)
+                return
+            if not generated_secret:
+                return
+            self._live_config["execute_secret"] = generated_secret
+            log.info("execute_secret: generated and persisted execute_secret on a retry tick")
+            # Don't wait for the separate runner-registration watchdog's own
+            # next tick (up to RUNNER_REGISTRATION_REASSERT_INTERVAL_S away)
+            # to tell agents-platform-multitenant about it — same "reassert
+            # immediately on change" reasoning as on_config_saved.
+            try:
+                result = await asyncio.to_thread(
+                    runner_registration_mod.register_with_platform, self._live_config)
+            except Exception:  # noqa: BLE001 — non-fatal, the reassert watchdog still covers this
+                log.warning("runner_registration: reassert-after-ensure failed", exc_info=True)
+                return
+            if result.get("error"):
+                log.warning("runner_registration: reassert-after-ensure failed: %s", result["error"])
+            else:
+                log.info("runner_registration: reassert-after-ensure succeeded (%s)",
+                         result.get("registered"))
+
+        ctx.watchdog.register("execute-secret-ensure-configured", _ensure,
+                              EXECUTE_SECRET_ENSURE_INTERVAL_S, run_immediately=False)
+        log.info("execute_secret: ensure-configured watchdog registered (every %.0fs)",
+                 EXECUTE_SECRET_ENSURE_INTERVAL_S)
 
     def register_contributed_agents(self, app_id: str, spec: dict) -> dict:
         """Seed one ``contributes.agents`` declaration into Agents Platform.
