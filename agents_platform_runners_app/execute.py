@@ -517,6 +517,106 @@ STREAM_TTL_S = 86400
 # needed a mechanism claude's --mcp-config regeneration doesn't.
 CODEX_WARM_TOKEN_ENV_VAR = "AW_MCP_WARM_TOKEN"
 
+# Env var name codex's config.toml is told to read for the aw-gateway
+# Authorization bearer itself (codex's native `bearer_token_env_var` field —
+# NOT the generic `http_headers` a static value would otherwise ride in as).
+# Same shape as CODEX_WARM_TOKEN_ENV_VAR just above, for the same reason: a
+# warm container's config.toml is written once and never rewritten on later
+# turns (see _render_codex_config_toml's own docstring), so a value baked in
+# statically freezes for that container's whole life. The gateway's OWN
+# bearer token is not supposed to rotate mid-life the way a stale AgentConfig
+# seed can make it *appear* to (see _current_local_gateway_auth below) —  but
+# since the env-var indirection is already the established pattern for
+# exactly this class of problem, reusing it here costs nothing and closes
+# the gap completely instead of only at spawn time.
+CODEX_GATEWAY_TOKEN_ENV_VAR = "AW_GATEWAY_BEARER_TOKEN"
+
+def _local_mcp_config_path() -> str:
+    """This workspace's own canonical MCP config path — the file
+    `AgentProvisioner` (agent_provisioner.py) reads once, at seed time, to
+    resolve an agent config's declared `mcp_servers: ["aw-gateway"]` into a
+    URL+token. Computed from the module-level ``WORKSPACE_CONTAINER_DIR``
+    on every call (not a constant baked at import time) so it follows the
+    SAME test monkeypatch convention every other workspace-relative path in
+    this module already uses (see e.g. test_warm_mcp_context_headers_
+    stripped.py's ``monkeypatch.setattr(execute_mod, "WORKSPACE_CONTAINER_DIR", ...)``).
+    """
+    return os.path.join(WORKSPACE_CONTAINER_DIR, ".mcp.json")
+
+
+def _current_local_gateway_auth(*, config_path: str | None = None) -> tuple[str, dict] | None:
+    """``(url, headers)`` for THIS workspace's own live ``aw-gateway`` entry
+    in ``.mcp.json`` — read fresh on every call, never cached.
+
+    Exists because a job's ``mcp_servers`` is agents-platform-multitenant's
+    own resolution of the agent's SEEDED AgentConfig (see
+    ``agent_provisioner.py``'s ``resolve_mcp_servers``, the seed-time half of
+    this), and that seed is only as fresh as the last time this app itself
+    was (re)activated — there is no periodic reassert for it, unlike
+    ``runner_registration``'s execute_secret/token (see ``plugin.py``'s
+    ``RUNNER_REGISTRATION_REASSERT_INTERVAL_S``). If the gateway's token is
+    ever regenerated without a reactivation in between, EVERY dispatch after
+    that — cold, or a brand-new warm container, not just an old one —
+    bakes in the stale token forever, because nothing re-derives it from a
+    live source in between. Confirmed live 2026-09-18
+    (bug:codex-telegram-gateway-401-stale-seed): a freshly dispatched,
+    freshly created warm container for ``telegram-gpt-5-6-sol`` still got a
+    dead ``Authorization`` header, while this exact file's ``aw-gateway``
+    entry, read at the same moment, answered 200.
+
+    Returns ``None`` on any read/parse failure or a missing/urlless entry —
+    callers keep whatever job-provided value they already have rather than
+    erroring the run over a workspace-local file glitch.
+    """
+    path = config_path or _local_mcp_config_path()
+    try:
+        with open(path, encoding="utf-8") as fh:
+            servers = (json.load(fh) or {}).get("mcpServers") or {}
+    except (OSError, ValueError) as exc:
+        log.warning("execute: could not read %s (%s) — job-provided gateway "
+                    "auth will be used as-is, stale or not", path, exc)
+        return None
+    entry = servers.get("aw-gateway")
+    if not isinstance(entry, dict) or not entry.get("url"):
+        return None
+    return entry["url"], dict(entry.get("headers") or {})
+
+
+def _refresh_stale_gateway_auth(mcp_servers: dict) -> dict:
+    """``mcp_servers`` with any entry pointing at THIS workspace's own
+    ``aw-gateway`` (matched by URL PREFIX, so a scoped profile like
+    ``http://aw-app-mcp-gateway:9200/mcp/crispal-full`` still matches the
+    base ``.../mcp`` entry) given the CURRENT headers from ``.mcp.json``
+    instead of whatever the job carried. See ``_current_local_gateway_auth``
+    for why the job-provided value can't be trusted to be current.
+
+    A server pointed at a genuinely different gateway (a federated one, a
+    per-deployment override) never matches the prefix and passes through
+    untouched. Returns ``mcp_servers`` itself, unmodified, when there is
+    nothing local to refresh from — never raises, never drops a server.
+    """
+    current = _current_local_gateway_auth()
+    if current is None or not mcp_servers:
+        return mcp_servers
+    base_url, fresh_headers = current
+    if not fresh_headers:
+        return mcp_servers
+    out: dict = {}
+    refreshed: list[str] = []
+    for name, cfg in mcp_servers.items():
+        url = (cfg or {}).get("url") or "" if isinstance(cfg, dict) else ""
+        if isinstance(cfg, dict) and url.startswith(base_url):
+            out[name] = {**cfg, "headers": {**(cfg.get("headers") or {}), **fresh_headers}}
+            refreshed.append(name)
+        else:
+            out[name] = cfg
+    if refreshed:
+        log.info("execute: refreshed gateway auth headers for %s from local "
+                 "%s (job-provided value may have been stale)",
+                 refreshed, _local_mcp_config_path())
+    return out
+
+
 # codex's own "thread/resume failed: no rollout found for thread id ...
 # (code -32600)" — confirmed (2026-09-04, card 3d15bf3b) to fire even when
 # the rollout .jsonl and its state_5.sqlite `threads` row are both fully
@@ -1066,8 +1166,17 @@ def _render_codex_config_toml(base_text: str, mcp_servers: dict) -> str:
     exactly this shape — must end up with NO gateway server, and a merge would
     leave the unscoped one standing.
 
-    Headers: static ones (``Authorization``) are written as ``http_headers``;
-    ``X-Aw-Warm-Token`` keeps riding in through ``env_http_headers`` +
+    Headers: any OTHER static header is written as ``http_headers`` as
+    before; ``Authorization`` specifically is pulled out and written as
+    codex's native ``bearer_token_env_var`` instead (see
+    ``CODEX_GATEWAY_TOKEN_ENV_VAR``) — a static value here can only ever be
+    as fresh as THIS render, and a warm container's file is never rewritten
+    on a later turn (this function's own module-level callers), so a token
+    that goes stale after that moment 401s for the container's entire
+    remaining life. The env-var indirection is re-resolved from the
+    process environment on every turn instead, same mechanism
+    ``X-Aw-Warm-Token`` already uses below for the same reason.
+    ``X-Aw-Warm-Token`` itself keeps riding in through ``env_http_headers`` +
     ``CODEX_WARM_TOKEN_ENV_VAR``, unchanged from _patch_codex_warm_token_headers
     (see _strip_stale_identity_headers for why the per-turn ones are dropped).
     """
@@ -1095,7 +1204,12 @@ def _render_codex_config_toml(base_text: str, mcp_servers: dict) -> str:
         # env_http_headers, unlike the per-turn names this shares with claude.
         headers = {k: v for k, v in _strip_stale_identity_headers(cfg.get("headers")).items()
                    if k != "X-Aw-Warm-Token"}
+        # Authorization rides in via bearer_token_env_var, not a static
+        # value — see this function's own docstring.
+        auth = headers.pop("Authorization", None)
         out += f"\n\n[mcp_servers.{key}]\nurl = {json.dumps(url)}\n"
+        if auth:
+            out += f"bearer_token_env_var = {json.dumps(CODEX_GATEWAY_TOKEN_ENV_VAR)}\n"
         if headers:
             out += f"\n[mcp_servers.{key}.http_headers]\n"
             out += "".join(f"{json.dumps(k)} = {json.dumps(str(v))}\n"
@@ -1293,7 +1407,10 @@ def _build_container_kwargs(job: dict) -> tuple[str, list[str], dict, str | None
     # own docstring), so it resolves to the same value the stripped header
     # would have carried anyway.
     mcp_config_container_path: str | None = None
-    mcp_servers = job.get("mcp_servers") or {}
+    # Correct any stale gateway credential BEFORE it's baked into this
+    # container's config — see _refresh_stale_gateway_auth's own docstring.
+    # A no-op when the job-provided value already matches the live one.
+    mcp_servers = _refresh_stale_gateway_auth(job.get("mcp_servers") or {})
     if mcp_servers and spec.get("mcp_config_flag"):
         claude_mcp = {
             "mcpServers": {
@@ -1699,6 +1816,19 @@ def _build_container_kwargs(job: dict) -> tuple[str, list[str], dict, str | None
              if h.get("X-Aw-Warm-Token")), None)
         if _warm_token:
             env[CODEX_WARM_TOKEN_ENV_VAR] = _warm_token
+        # Same per-spawn indirection as X-Aw-Warm-Token just above, for the
+        # gateway's own Authorization bearer — see CODEX_GATEWAY_TOKEN_ENV_VAR
+        # and _render_codex_config_toml's docstring. mcp_servers was already
+        # passed through _refresh_stale_gateway_auth() by our caller, so this
+        # is the current value as of THIS spawn — still frozen for a warm
+        # container's life at this point; dispatch_turn's own turn_env
+        # refreshes it again on every later turn (see warm_pool.dispatch_turn).
+        _bearer = next(
+            (h.get("Authorization") for h in
+             (cfg.get("headers") or {} for cfg in mcp_servers.values())
+             if h.get("Authorization")), None)
+        if _bearer:
+            env[CODEX_GATEWAY_TOKEN_ENV_VAR] = _bearer.removeprefix("Bearer ").strip()
     # Must match the credential mount targets below (/home/ubuntu/...) so the
     # spawned CLI's own $HOME-relative lookups (~/.claude, ~/.config/gh, etc.)
     # resolve to them. podman DOES synthesize a passwd entry for the "user"
@@ -2173,6 +2303,16 @@ def _dispatch_warm_turn(client, job: dict, redis_url: str, r=None) -> None:
     sys_prompt = job.get("append_system_prompt")
     if sys_prompt and cli == "codex":
         prompt = f"{sys_prompt}\n\n---\n\n{prompt}" if prompt else sys_prompt
+    # Resolved fresh at THIS dispatch, not reused from container-creation
+    # time — a long-lived warm container is exactly the case a token baked
+    # in once can't cover. See dispatch_turn's own docstring and
+    # _current_local_gateway_auth's for why this can't just trust
+    # job["mcp_servers"] either.
+    gateway_bearer_token = None
+    if cli == "codex":
+        _current = _current_local_gateway_auth()
+        if _current is not None:
+            gateway_bearer_token = (_current[1].get("Authorization") or "").removeprefix("Bearer ").strip() or None
     log.info("execute: dispatching run=%s to warm container %s", run_id, name)
     warm_pool.dispatch_turn(
         client=client, name=name, run_id=run_id, prompt=prompt, cli=cli,
@@ -2181,6 +2321,7 @@ def _dispatch_warm_turn(client, job: dict, redis_url: str, r=None) -> None:
         # position 0 — see _with_claude_turn_context. Absent on an older
         # caller's job, which reads as False and keeps the old behaviour.
         raw_prompt=bool(job.get("raw_prompt")),
+        gateway_bearer_token=gateway_bearer_token,
     )
     # Dead warm containers are only ever produced BY this path (drain, TTL
     # expiry), so this is where it costs least to notice them. Throttled and

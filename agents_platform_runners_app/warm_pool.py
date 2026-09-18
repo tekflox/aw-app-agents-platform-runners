@@ -538,7 +538,8 @@ def _with_claude_turn_context(prompt: str, run_id: str, notion_task_id: str | No
 def dispatch_turn(*, client, name: str, run_id: str, prompt: str, cli: str = "claude",
                   notion_task_id: str | None = None,
                   source_device: str | None = None,
-                  raw_prompt: bool = False) -> None:
+                  raw_prompt: bool = False,
+                  gateway_bearer_token: str | None = None) -> None:
     """Feed one turn's prompt into the warm container's FIFO.
 
     Writes current_run_id + turn_env FIRST (so the relay tags the very next
@@ -560,6 +561,21 @@ def dispatch_turn(*, client, name: str, run_id: str, prompt: str, cli: str = "cl
     with nothing able to refresh it, unlike codex's (see that function's
     docstring for the full story).
 
+    ``gateway_bearer_token``, when given, is exported into this SAME
+    ``turn_env`` file as ``AW_GATEWAY_BEARER_TOKEN`` — must match
+    ``execute.py``'s ``CODEX_GATEWAY_TOKEN_ENV_VAR`` exactly, duplicated
+    here rather than imported for the same reason ``GENERATION_KEY`` above
+    is duplicated rather than shared. Codex's config.toml points its
+    ``bearer_token_env_var`` at this name once, at container creation
+    (see execute.py's ``_render_codex_config_toml``); re-exporting the
+    CURRENT value here on every turn is what keeps a long-lived warm
+    container from serving a gateway credential that went stale sometime
+    after it was created — the whole reason this parameter exists instead
+    of leaving the token baked in statically like it used to be. Only ever
+    passed for ``cli == "codex"``; harmless if a caller passes it for
+    claude too, since claude's own turn payload never reads this file's
+    generic exports for auth.
+
     Uses the docker-py exec API's raw socket mode for the FIFO write (the
     original's subprocess `docker exec -i ... | cat > fifo_in` translated to
     this app's SDK-based docker access).
@@ -567,6 +583,10 @@ def dispatch_turn(*, client, name: str, run_id: str, prompt: str, cli: str = "cl
     c = client.containers.get(name)
 
     turn_env = f"export AW_RUN_ID={_sh(run_id)}\nexport NOTION_TASK_ID={_sh(notion_task_id)}\nexport AW_SOURCE_DEVICE={_sh(source_device)}\n"
+    if gateway_bearer_token:
+        # Must match execute.py's CODEX_GATEWAY_TOKEN_ENV_VAR — see this
+        # function's own docstring on why it rides in here, per turn.
+        turn_env += f"export AW_GATEWAY_BEARER_TOKEN={_sh(gateway_bearer_token)}\n"
     setup_cmd = (
         f"printf '%s' {_sh(run_id)} > /home/ubuntu/.aw-warm/current_run_id && "
         f"printf '%s' {_sh(turn_env)} > /home/ubuntu/.aw-warm/turn_env"

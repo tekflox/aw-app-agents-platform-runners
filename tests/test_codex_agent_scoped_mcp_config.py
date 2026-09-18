@@ -157,18 +157,23 @@ def test_static_headers_are_baked_but_per_turn_identity_headers_are_not():
     """X-Aw-Warm-Token keeps arriving through env_http_headers (its VALUE is
     per-spawn); X-Aw-Caller-Run-Id is per-TURN and a warm container holding
     one config.toml for its whole life would freeze a stale one — the exact
-    bug the warm-token mechanism exists to avoid."""
+    bug the warm-token mechanism exists to avoid.
+
+    Authorization rides in via bearer_token_env_var (not a static baked
+    value) for the SAME reason — see _render_codex_config_toml's own
+    docstring and CODEX_GATEWAY_TOKEN_ENV_VAR."""
     cfg = tomllib.loads(
         execute_mod._render_codex_config_toml(SHARED_CONFIG_TOML, CRISPAL_SERVERS))
     server = cfg["mcp_servers"]["crispal"]
 
-    assert server["http_headers"]["Authorization"] == "Bearer live-gateway-token"
-    assert "X-Aw-Caller-Run-Id" not in server["http_headers"]
-    assert "X-Aw-Warm-Token" not in server["http_headers"]
+    assert server["bearer_token_env_var"] == execute_mod.CODEX_GATEWAY_TOKEN_ENV_VAR
+    assert "X-Aw-Caller-Run-Id" not in server.get("http_headers", {})
+    assert "X-Aw-Warm-Token" not in server.get("http_headers", {})
     assert server["env_http_headers"]["X-Aw-Warm-Token"] == execute_mod.CODEX_WARM_TOKEN_ENV_VAR
-    # And the token VALUE never lands in the file.
-    assert "warm-token-abc123" not in execute_mod._render_codex_config_toml(
-        SHARED_CONFIG_TOML, CRISPAL_SERVERS)
+    # And neither token VALUE ever lands in the file.
+    rendered = execute_mod._render_codex_config_toml(SHARED_CONFIG_TOML, CRISPAL_SERVERS)
+    assert "warm-token-abc123" not in rendered
+    assert "live-gateway-token" not in rendered
 
 
 def test_server_names_that_are_not_bare_toml_keys_still_parse():

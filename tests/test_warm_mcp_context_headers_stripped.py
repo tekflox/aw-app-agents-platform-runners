@@ -101,10 +101,14 @@ def test_codex_config_toml_also_drops_context_headers():
         execute_mod._render_codex_config_toml(SHARED_CODEX_CONFIG_TOML, SERVERS_WITH_CONTEXT))
     server = cfg["mcp_servers"]["aw-gateway"]
 
-    assert server["http_headers"]["Authorization"] == "Bearer live-gateway-token"
-    assert "X-Aw-Caller-Run-Id" not in server["http_headers"]
-    assert "X-Aw-Warm-Token" not in server["http_headers"]
-    assert "X-Aw-Context-Notion-Task-Id" not in server["http_headers"]
+    # Authorization rides in via bearer_token_env_var, not a static
+    # http_headers value — see _render_codex_config_toml's own docstring
+    # and CODEX_GATEWAY_TOKEN_ENV_VAR.
+    assert server["bearer_token_env_var"] == execute_mod.CODEX_GATEWAY_TOKEN_ENV_VAR
+    assert "http_headers" not in server or "Authorization" not in server["http_headers"]
+    assert "X-Aw-Caller-Run-Id" not in server.get("http_headers", {})
+    assert "X-Aw-Warm-Token" not in server.get("http_headers", {})
+    assert "X-Aw-Context-Notion-Task-Id" not in server.get("http_headers", {})
     assert "task-from-turn-1" not in execute_mod._render_codex_config_toml(
         SHARED_CODEX_CONFIG_TOML, SERVERS_WITH_CONTEXT)
 
