@@ -71,6 +71,14 @@ def _stub_runner_status(monkeypatch):
     })
 
 
+@pytest.fixture(autouse=True)
+def _no_real_sleep(monkeypatch):
+    # register_with_platform's retry loop (REGISTER_MAX_ATTEMPTS) sleeps
+    # between attempts — every test below exercises at most a handful of
+    # attempts, so keep the suite fast without weakening what's asserted.
+    monkeypatch.setattr(rr.time, "sleep", lambda seconds: None)
+
+
 def test_no_token_configured_is_a_non_fatal_error_no_network(monkeypatch):
     seen = []
     _stub_client(monkeypatch, lambda url, kwargs: FakeResponse(200, {}), seen)
@@ -152,9 +160,55 @@ def test_register_returns_error_on_http_error_status_no_raise(monkeypatch):
 
 
 def test_register_returns_error_on_connection_failure_no_raise(monkeypatch):
-    _stub_client(monkeypatch, lambda url, kwargs: httpx.ConnectError("connection refused"))
+    seen = []
+    _stub_client(monkeypatch, lambda url, kwargs: httpx.ConnectError("connection refused"), seen)
 
     result = rr.register_with_platform({"agents_platform_token": "tok"})
 
     assert "error" in result
     assert "could not reach" in result["error"]
+    # Transient (connection-level) failures are retried, not given up on
+    # after a single attempt — see REGISTER_MAX_ATTEMPTS's docstring for the
+    # 2026-09-18 incident this closes.
+    assert len(seen) == rr.REGISTER_MAX_ATTEMPTS
+
+
+def test_register_retries_transient_5xx_and_succeeds(monkeypatch):
+    """A 502/503/504 is the tunnel edge or agents-platform-multitenant
+    briefly hiccuping, not a real misconfiguration — retry it, same as
+    RunnerLLM._dispatch's RETRYABLE_STATUS on the other side of this call."""
+    seen = []
+    responses = iter([
+        FakeResponse(503, None, "starting up"),
+        FakeResponse(200, {"ok": True}),
+    ])
+    _stub_client(monkeypatch, lambda url, kwargs: next(responses), seen)
+
+    result = rr.register_with_platform({"agents_platform_token": "tok"})
+
+    assert result == {"registered": {"ok": True}}
+    assert len(seen) == 2
+
+
+def test_register_does_not_retry_deterministic_4xx(monkeypatch):
+    """A 401 (bad/expired agents_platform_token) is not going to succeed on
+    a second attempt — retrying just delays the error an operator needs to
+    see, same reasoning RunnerLLM._dispatch already applies to /execute."""
+    seen = []
+    _stub_client(monkeypatch, lambda url, kwargs: FakeResponse(401, None, "expired"), seen)
+
+    result = rr.register_with_platform({"agents_platform_token": "tok"})
+
+    assert "error" in result
+    assert len(seen) == 1
+
+
+def test_register_gives_up_after_max_attempts_on_persistent_5xx(monkeypatch):
+    seen = []
+    _stub_client(monkeypatch, lambda url, kwargs: FakeResponse(503, None, "down"), seen)
+
+    result = rr.register_with_platform({"agents_platform_token": "tok"})
+
+    assert "error" in result
+    assert "503" in result["error"]
+    assert len(seen) == rr.REGISTER_MAX_ATTEMPTS

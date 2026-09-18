@@ -21,6 +21,7 @@ import logging
 import os
 import shutil
 import subprocess
+import time
 
 import httpx
 
@@ -30,6 +31,19 @@ log = logging.getLogger("aw_apps.agents_platform_runners.runner_registration")
 
 RUNNERS = ["claude", "codex", "copilot", "cursor-agent"]
 TIMEOUT_S = 20.0
+
+# A single non-fatal attempt was the actual gap behind the 2026-09-18
+# aw-claude 401 incident: activate() generated a fresh execute_secret,
+# immediately tried to hand it to agents-platform-multitenant, that one POST
+# hit a transient failure, and the only remaining chance to resync was the
+# 6-hour reassert watchdog (plugin.py) — every run through this workspace's
+# runner 401'd for over an hour before a human intervened. 3 attempts with a
+# short backoff mirrors execute.py's `_CODEX_ROLLOUT_MAX_ATTEMPTS` pattern in
+# this same repo. Retried only for transient failures (connection errors,
+# timeouts, 5xx) — a 401/403/404 is a deterministic misconfiguration
+# (wrong/expired agents_platform_token) that retrying cannot fix.
+REGISTER_MAX_ATTEMPTS = 3
+REGISTER_RETRY_BACKOFF_S = (1.0, 2.0)
 
 
 def runner_status(name: str) -> dict:
@@ -107,19 +121,33 @@ def register_with_platform(config: dict) -> dict:
         "execute_secret": config.get("execute_secret") or None,
     }
     url = f"{base.rstrip('/')}/api/runners/register"
-    try:
-        with httpx.Client(timeout=TIMEOUT_S) as client:
-            resp = client.post(
-                url, json=payload, headers={"Authorization": f"Bearer {token}"},
-            )
-        resp.raise_for_status()
-        result = {"registered": resp.json()}
-        log.info("register_with_platform: registered %d runner(s) at %s", len(RUNNERS), url)
-        return result
-    except httpx.HTTPStatusError as exc:
-        log.warning("register_with_platform: %s responded %s: %s",
-                    url, exc.response.status_code, exc.response.text[:500])
-        return {"error": f"agents-platform responded {exc.response.status_code}: {exc.response.text[:500]}"}
-    except Exception as exc:  # noqa: BLE001 — logged here, then surfaced as-is to the caller
-        log.warning("register_with_platform: could not reach %s: %s", url, exc, exc_info=True)
-        return {"error": f"could not reach {url}: {exc}"}
+    last_error: dict | None = None
+    for attempt in range(1, REGISTER_MAX_ATTEMPTS + 1):
+        is_last = attempt == REGISTER_MAX_ATTEMPTS
+        try:
+            with httpx.Client(timeout=TIMEOUT_S) as client:
+                resp = client.post(
+                    url, json=payload, headers={"Authorization": f"Bearer {token}"},
+                )
+            resp.raise_for_status()
+            result = {"registered": resp.json()}
+            log.info("register_with_platform: registered %d runner(s) at %s%s",
+                      len(RUNNERS), url, "" if attempt == 1 else f" (attempt {attempt})")
+            return result
+        except httpx.HTTPStatusError as exc:
+            status = exc.response.status_code
+            last_error = {"error": f"agents-platform responded {status}: {exc.response.text[:500]}"}
+            if status not in (502, 503, 504) or is_last:
+                log.warning("register_with_platform: %s responded %s: %s",
+                            url, status, exc.response.text[:500])
+                return last_error
+        except Exception as exc:  # noqa: BLE001 — logged here, then surfaced as-is to the caller
+            last_error = {"error": f"could not reach {url}: {exc}"}
+            if is_last:
+                log.warning("register_with_platform: could not reach %s: %s", url, exc, exc_info=True)
+                return last_error
+        backoff = REGISTER_RETRY_BACKOFF_S[min(attempt - 1, len(REGISTER_RETRY_BACKOFF_S) - 1)]
+        log.warning("register_with_platform: attempt %d/%d for %s failed (transient) — "
+                    "retrying in %.0fs", attempt, REGISTER_MAX_ATTEMPTS, url, backoff)
+        time.sleep(backoff)
+    return last_error  # pragma: no cover — loop always returns/continues above

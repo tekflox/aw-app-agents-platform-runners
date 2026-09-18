@@ -67,6 +67,23 @@ KANBAN_SWEEP_INTERVAL_S = 60.0
 # identity_token.py's module docstring for the mint+persist design.
 IDENTITY_TOKEN_INTERVAL_S = 6.0 * 3600.0
 
+# runner-registration reassert cadence — deliberately its OWN constant, not a
+# reuse of IDENTITY_TOKEN_INTERVAL_S (the pre-2026-09-18 shape). The 2026-
+# 09-18 aw-claude 401 incident: activate() generated+persisted a fresh
+# execute_secret and register_with_platform()'s very next call to hand it to
+# agents-platform-multitenant hit a transient failure (now retried on its own
+# — see runner_registration.REGISTER_MAX_ATTEMPTS) with nothing to resync the
+# two sides for the full 6h this watchdog inherited from the token-refresh
+# cadence — every run through this workspace's runner 401'd for over an hour
+# before a human force-registered by hand. Unlike identity_token (a 24h JWT
+# with plenty of runway), a wrong execute_secret/caller_token here is a hard
+# failure on every single dispatch the moment it drifts, so this watchdog's
+# OWN interval must be short enough that any future drift (whatever the
+# cause) self-heals in minutes, not hours. on_config_saved's immediate
+# reassert-on-change (below) is the primary defense; this is the backstop for
+# whatever that misses.
+RUNNER_REGISTRATION_REASSERT_INTERVAL_S = 120.0
+
 # agents_platform_base resolution (what address this app calls
 # agents-platform-multitenant on) lives in platform_base.py now — the old
 # fixed bridge-gateway default (http://172.18.0.1:10014) only ever worked
@@ -472,9 +489,9 @@ class AgentsPlatformRunnersAppPlugin:
                 log.info("runner_registration: reasserted (%s)", result.get("registered"))
 
         ctx.watchdog.register("runner-registration-reassert", _reassert,
-                              IDENTITY_TOKEN_INTERVAL_S, run_immediately=False)
+                              RUNNER_REGISTRATION_REASSERT_INTERVAL_S, run_immediately=False)
         log.info("runner_registration: watchdog registered (every %.0fs)",
-                 IDENTITY_TOKEN_INTERVAL_S)
+                 RUNNER_REGISTRATION_REASSERT_INTERVAL_S)
 
     def register_contributed_agents(self, app_id: str, spec: dict) -> dict:
         """Seed one ``contributes.agents`` declaration into Agents Platform.
@@ -599,9 +616,49 @@ class AgentsPlatformRunnersAppPlugin:
         runs — the refresh call below is therefore redundant on that path,
         but stays so this method still works standalone (e.g. a test that
         calls it directly, or a duck-typed caller predating the split)."""
+        prev_secret = self._live_config.get("execute_secret")
+        prev_token = self._live_config.get("agents_platform_token")
+
         config = self._refresh_derived_config(ctx)
         mcp_doc = write_mcp_json(ctx.package_dir, self._live_config)
         log.info("aw-app-agents-platform-runners config saved: mcp.json servers=%s", list(mcp_doc["mcpServers"]))
+
+        # Reassert registration IMMEDIATELY when either dispatch credential
+        # actually changed — the direct fix for the 2026-09-18 aw-claude 401
+        # incident, where a credential change (auto-generated execute_secret,
+        # or a hand-typed rotation) took effect on THIS app's own /execute
+        # check the moment it saved (the in-place _live_config mutation this
+        # method's docstring describes above), but agents-platform-
+        # multitenant's copy was left to whatever the periodic reassert
+        # watchdog's cadence happened to be — 6h at the time of that
+        # incident. A config save is exactly the moment a human or
+        # execute_secret.ensure_configured() changes one of these two values,
+        # so reasserting right here closes the gap at its source instead of
+        # relying only on the watchdog backstop (see
+        # RUNNER_REGISTRATION_REASSERT_INTERVAL_S). Backgrounded (register_
+        # with_platform is a blocking httpx call) and non-fatal — a slow or
+        # unreachable agents-platform-multitenant must not hold up or fail
+        # the config save itself; the watchdog still covers this attempt.
+        new_secret = self._live_config.get("execute_secret")
+        new_token = self._live_config.get("agents_platform_token")
+        if new_secret != prev_secret or new_token != prev_token:
+            log.info("runner_registration: execute_secret/agents_platform_token changed on "
+                     "config save — reasserting registration immediately")
+
+            async def _reassert_now() -> None:
+                try:
+                    result = await asyncio.to_thread(
+                        runner_registration_mod.register_with_platform, self._live_config)
+                except Exception:  # noqa: BLE001 — a background reassert must never raise
+                    log.warning("runner_registration: reassert-on-save failed", exc_info=True)
+                    return
+                if result.get("error"):
+                    log.warning("runner_registration: reassert-on-save failed: %s", result["error"])
+                else:
+                    log.info("runner_registration: reassert-on-save succeeded (%s)",
+                             result.get("registered"))
+
+            asyncio.create_task(_reassert_now())
 
         # Settings this panel owns but the platform stores — today the
         # OpenAI key the contributed `openai-*` models need. See

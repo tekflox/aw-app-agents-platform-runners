@@ -140,7 +140,12 @@ def test_watchdog_not_registered_without_capability():
     assert ctx.watchdog.registered == []
 
 
-def test_watchdog_registered_with_same_cadence_as_token_refresh():
+def test_watchdog_registered_with_its_own_short_cadence():
+    """Deliberately NOT the identity-token cadence (6h) — see
+    RUNNER_REGISTRATION_REASSERT_INTERVAL_S's docstring for the 2026-09-18
+    incident this separation closes: a wrong execute_secret/caller_token
+    401s every single dispatch immediately, so this backstop needs to be
+    short (minutes), unlike a 24h JWT with plenty of runway."""
     plugin = AgentsPlatformRunnersAppPlugin()
     ctx = _StubCtx({})
 
@@ -149,7 +154,8 @@ def test_watchdog_registered_with_same_cadence_as_token_refresh():
     assert len(ctx.watchdog.registered) == 1
     name, _fn, interval, run_immediately = ctx.watchdog.registered[0]
     assert name == "runner-registration-reassert"
-    assert interval == plugin_mod.IDENTITY_TOKEN_INTERVAL_S
+    assert interval == plugin_mod.RUNNER_REGISTRATION_REASSERT_INTERVAL_S
+    assert interval < plugin_mod.IDENTITY_TOKEN_INTERVAL_S
     assert run_immediately is False
 
 
