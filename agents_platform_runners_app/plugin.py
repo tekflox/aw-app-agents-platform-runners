@@ -33,6 +33,7 @@ from pathlib import Path
 
 from . import agent_provisioner as agent_provisioner_mod
 from . import execute as execute_mod
+from . import execute_secret as execute_secret_mod
 from . import execution_index as execution_index_mod
 from . import identity_token as identity_token_mod
 from . import kanban_dispatch as kanban_dispatch_mod
@@ -190,6 +191,22 @@ class AgentsPlatformRunnersAppPlugin:
                 self._live_config["agents_platform_token"] = refreshed
         except Exception:  # noqa: BLE001 — activation must never be blocked by this
             log.warning("identity_token: refresh failed at activation", exc_info=True)
+
+        # Auto-generate execute_secret if none is configured (Kanban
+        # "execute_secret nunca é auto-gerado — runner falha com 500 numa
+        # workspace nova") — same "content is seeded once" rule as
+        # identity_token.py above, so the register_with_platform() call right
+        # below already carries a working shared secret on a brand new
+        # workspace instead of sending None and leaving /execute permanently
+        # 500ing until a human types one into Settings. Non-fatal: on failure
+        # this logs and activation continues with whatever execute_secret (or
+        # lack of one) is already configured.
+        try:
+            generated_secret = execute_secret_mod.ensure_configured(self._live_config)
+            if generated_secret:
+                self._live_config["execute_secret"] = generated_secret
+        except Exception:  # noqa: BLE001 — activation must never be blocked by this
+            log.warning("execute_secret: auto-generate failed at activation", exc_info=True)
 
         # Auto-register this workspace's runners with agents-platform-
         # multitenant right after the token above is confirmed fresh (Kanban
