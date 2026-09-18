@@ -53,6 +53,31 @@ def test_help_lists_both_groups(capsys):
     assert "agents" in out
 
 
+def test_json_flag_parses_leading_and_trailing_for_every_group():
+    """Regression for the ``--json`` placement bug: argparse only accepts a
+    root-level flag before the subcommand by default, but every existing
+    command in this workspace takes it trailing
+    (``aw-workspace-cli apps --json``, ``remote-hosts firewall list
+    --json``). One verb per group is enough to catch a future group that
+    forgets to make both positions work — the mechanism is shared, not
+    per-group.
+    """
+    from agents_platform_runners_app.cli.main import _build_parser
+
+    cases = [
+        (["--json", "telegram-bot", "list"], ["telegram-bot", "list", "--json"]),
+        (["--json", "agents", "list"], ["agents", "list", "--json"]),
+    ]
+    for leading_argv, trailing_argv in cases:
+        leading = _build_parser("agents-platform").parse_args(leading_argv)
+        trailing = _build_parser("agents-platform").parse_args(trailing_argv)
+        assert leading.as_json is True, leading_argv
+        assert trailing.as_json is True, trailing_argv
+
+    neither = _build_parser("agents-platform").parse_args(["agents", "list"])
+    assert neither.as_json is False
+
+
 def test_shim_module_has_the_required_contract():
     import importlib.util
     import os
