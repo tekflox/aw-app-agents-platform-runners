@@ -129,6 +129,58 @@
           }
         },
         {
+          "slug": "claude-runner-sonnet",
+          "provider": "runner",
+          "model_id": "claude-runner-sonnet",
+          "display_name": "Claude (aw Runner, Sonnet)",
+          "params": {
+            "runner": "aw-claude",
+            "cli": "claude",
+            "model": "sonnet",
+            "dangerous_skip_permissions": true,
+            "timeout_s": 900
+          }
+        },
+        {
+          "slug": "claude-runner-opus",
+          "provider": "runner",
+          "model_id": "claude-runner-opus",
+          "display_name": "Claude (aw Runner, Opus)",
+          "params": {
+            "runner": "aw-claude",
+            "cli": "claude",
+            "model": "opus",
+            "dangerous_skip_permissions": true,
+            "timeout_s": 1800
+          }
+        },
+        {
+          "slug": "claude-runner-haiku",
+          "provider": "runner",
+          "model_id": "claude-runner-haiku",
+          "display_name": "Claude (aw Runner, Haiku)",
+          "params": {
+            "runner": "aw-claude",
+            "cli": "claude",
+            "model": "haiku",
+            "dangerous_skip_permissions": true,
+            "timeout_s": 600
+          }
+        },
+        {
+          "slug": "claude-runner-fable",
+          "provider": "runner",
+          "model_id": "claude-runner-fable",
+          "display_name": "Claude (aw Runner, Fable)",
+          "params": {
+            "runner": "aw-claude",
+            "cli": "claude",
+            "model": "fable",
+            "dangerous_skip_permissions": true,
+            "timeout_s": 900
+          }
+        },
+        {
           "slug": "openai-gpt-5-6-sol",
           "provider": "openai",
           "model_id": "gpt-5.6-sol",
