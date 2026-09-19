@@ -78,6 +78,18 @@ def test_delete_and_state_pass_the_workspace_as_a_query_param(monkeypatch):
     assert all(c[2]["params"] == {"workspace": "ws-a"} for c in seen)
 
 
+def test_workspace_falls_back_to_the_env_file_not_just_process_env(monkeypatch, tmp_path):
+    """runner-dynamic-workspace-slug (Perna C): a raw ``os.environ.get`` here
+    reports "aw" whenever ``AW_WORKSPACE`` lives only in
+    ``.aw-workspace/.env`` — misattributing the token push to the wrong
+    workspace's row."""
+    monkeypatch.delenv("AW_WORKSPACE", raising=False)
+    monkeypatch.setenv("AW_WORKSPACE_HOME", str(tmp_path))
+    (tmp_path / ".env").write_text("AW_WORKSPACE=crispal\n")
+
+    assert nts._workspace() == "crispal"
+
+
 def test_no_platform_token_is_not_configured_not_a_failure():
     with pytest.raises(nts.NotionTokenNotConfigured):
         nts.push({}, "ntn_abc")

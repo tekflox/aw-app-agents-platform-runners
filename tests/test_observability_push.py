@@ -59,6 +59,32 @@ def test_resolved_target_is_forwarded_verbatim(monkeypatch):
                       "configured": True}
 
 
+def test_workspace_is_read_from_the_env_file_not_just_process_env(monkeypatch, tmp_path):
+    """runner-dynamic-workspace-slug (Perna C): same risk as
+    test_runner_registration.py's equivalent test — a raw ``os.environ.get``
+    here reports this workspace as "aw" whenever ``AW_WORKSPACE`` lives only
+    in ``.aw-workspace/.env``, misattributing whichever workspace's OTLP
+    target actually gets pushed."""
+    monkeypatch.delenv("AW_WORKSPACE", raising=False)
+    monkeypatch.setenv("AW_WORKSPACE_HOME", str(tmp_path))
+    (tmp_path / ".env").write_text("AW_WORKSPACE=crispal\n")
+
+    monkeypatch.setattr(op, "_read_local_observability", lambda *, timeout: {
+        "mode": "custom",
+        "resolved": {"endpoint": "https://tenant-a.example", "api_key": "k-a", "source": "custom"},
+    })
+    seen = {}
+
+    def _capture(base, token, payload, *, timeout):
+        seen["payload"] = payload
+        return {"configured": True}
+    monkeypatch.setattr(op, "_push_to_platform", _capture)
+
+    op.push_once({"agents_platform_token": "tok-a"})
+
+    assert seen["payload"]["workspace"] == "crispal"
+
+
 def test_unresolved_local_settings_pushes_empty_endpoint_to_clear(monkeypatch):
     """mode 'off' (or 'local' with the app since uninstalled) resolves to
     `resolved: null` — this must still push, with an empty endpoint, so

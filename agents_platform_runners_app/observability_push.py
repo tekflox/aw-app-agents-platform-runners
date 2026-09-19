@@ -125,7 +125,7 @@ def push_once(config: dict, *, timeout: float = 20.0) -> dict:
         return {"pushed": False, "reason": str(exc)}
 
     resolved = settings.get("resolved") or None
-    workspace = os.environ.get("AW_WORKSPACE", "aw")
+    workspace = platform_base_mod.workspace_env("AW_WORKSPACE") or "aw"
     base = platform_base_mod.resolve(config)
     payload = {
         "workspace": workspace,

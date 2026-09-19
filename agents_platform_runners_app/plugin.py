@@ -335,7 +335,7 @@ class AgentsPlatformRunnersAppPlugin:
                         "skills index watchdog not started")
             return
 
-        workspace = os.environ.get("AW_WORKSPACE", "aw")
+        workspace = _workspace_env("AW_WORKSPACE") or "aw"
         client = skills_sync_mod.SkillsSyncClient(base=base, token=token, workspace=workspace)
 
         async def _delta() -> None:

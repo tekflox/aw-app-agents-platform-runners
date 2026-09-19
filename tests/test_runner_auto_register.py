@@ -190,3 +190,25 @@ def test_watchdog_tick_survives_registration_raising(monkeypatch):
     _name, tick, _interval, _run_immediately = ctx.watchdog.registered[0]
 
     asyncio.run(tick())  # must not raise
+
+
+def test_skills_watchdog_reads_workspace_from_the_env_file_not_just_process_env(
+        monkeypatch, tmp_path):
+    """runner-dynamic-workspace-slug (Perna C): a raw ``os.environ.get`` here
+    tags this workspace's skills-index sync as "aw" whenever ``AW_WORKSPACE``
+    lives only in ``.aw-workspace/.env`` — the skills registry keys on
+    (workspace, cli), so that silently misfiles this workspace's own skill
+    index under another workspace's row."""
+    monkeypatch.delenv("AW_WORKSPACE", raising=False)
+    monkeypatch.setenv("AW_WORKSPACE_HOME", str(tmp_path))
+    (tmp_path / ".env").write_text("AW_WORKSPACE=crispal\n")
+
+    seen = {}
+    monkeypatch.setattr(plugin_mod.skills_sync_mod, "SkillsSyncClient",
+                        lambda base, token, workspace: seen.setdefault("workspace", workspace))
+
+    plugin = AgentsPlatformRunnersAppPlugin()
+    ctx = _StubCtx({"agents_platform_token": "tok"})
+    plugin._register_skills_watchdog(ctx, {"agents_platform_token": "tok"})
+
+    assert seen["workspace"] == "crispal"

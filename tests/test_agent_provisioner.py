@@ -184,6 +184,19 @@ def test_disable_harness_tools_survives_the_create_post():
     assert body["disable_harness_tools"] is True
 
 
+def test_workspace_survives_the_create_post():
+    # Same allowlist risk as disable_harness_tools above: ENDPOINTS["agents"]
+    # is the only thing standing between an agent's `workspace` binding
+    # (runner-dynamic-workspace-slug — feeds executor._apply_workspace_override
+    # as the agent's per-run default) and it being silently dropped before
+    # the POST, no 422, no log.
+    platform = FakePlatform()
+    _seed(platform, {"agents": [{"slug": "telegram-gpt-5-6-sol", "name": "T",
+                                 "workspace": "aw"}]})
+    _, body = platform.posts[0]
+    assert body["workspace"] == "aw"
+
+
 def test_reconcile_keeps_disable_harness_tools():
     platform = RecordingPlatform(existing={"/api/agents": ["sec-reviewer"]})
     provisioner = AgentProvisioner(base="http://ap.test", token="tok",
@@ -393,3 +406,24 @@ def test_other_kinds_never_attempt_a_restore_on_409():
     platform = FakePlatform(post_status=409)
     assert _seed(platform, SPEC) == {}
     assert platform.restores == []
+
+
+def test_write_state_reads_workspace_from_the_env_file_not_just_process_env(
+        monkeypatch, tmp_path):
+    """runner-dynamic-workspace-slug (Perna C): a raw ``os.environ.get`` here
+    silently reports this workspace's seeded-state baseline as "aw" whenever
+    ``AW_WORKSPACE`` lives only in ``.aw-workspace/.env`` — the app_version
+    arbitration in write_state's own docstring then attributes this
+    workspace's write to the wrong workspace entirely."""
+    monkeypatch.delenv("AW_WORKSPACE", raising=False)
+    monkeypatch.setenv("AW_WORKSPACE_HOME", str(tmp_path))
+    (tmp_path / ".env").write_text("AW_WORKSPACE=crispal\n")
+
+    platform = FakePlatform()
+    provisioner = AgentProvisioner(base="http://ap.test", token="tok",
+                                   transport=platform.transport())
+
+    provisioner.write_state("some-app", "agents", "sec-reviewer", "1.0.0", {})
+
+    _, body = platform.posts[0]
+    assert body["workspace_ref"] == "crispal"

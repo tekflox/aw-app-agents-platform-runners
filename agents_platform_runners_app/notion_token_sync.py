@@ -28,7 +28,6 @@ cadence of its own, and does nothing but poke aw-app-notion's
 from __future__ import annotations
 
 import logging
-import os
 
 import httpx
 
@@ -63,7 +62,7 @@ def _platform(config: dict) -> tuple[str, str]:
 
 
 def _workspace() -> str:
-    return os.environ.get("AW_WORKSPACE", "aw")
+    return platform_base_mod.workspace_env("AW_WORKSPACE") or "aw"
 
 
 def _request(config: dict, method: str, **kwargs) -> dict:

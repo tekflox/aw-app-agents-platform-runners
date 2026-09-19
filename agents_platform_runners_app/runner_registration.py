@@ -83,7 +83,7 @@ def register_with_platform(config: dict) -> dict:
             "Settings before registering (see aw-app.json config_schema for how to mint one).",
         }
     base = platform_base_mod.resolve(config)
-    workspace = os.environ.get("AW_WORKSPACE", "aw")
+    workspace = platform_base_mod.workspace_env("AW_WORKSPACE") or "aw"
     # This app's OWN reachable base URL (the "Runner" execute endpoint) —
     # the public BYOD tunnel edge (see execute.py's module docstring for
     # why this is the only proven-reachable path from

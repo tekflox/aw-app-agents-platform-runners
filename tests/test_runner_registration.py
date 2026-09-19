@@ -109,6 +109,28 @@ def test_successful_register_posts_every_runner_with_bearer_token(monkeypatch):
     assert {r["cli"] for r in payload["runners"]} == set(rr.RUNNERS)
 
 
+def test_register_reads_workspace_from_the_env_file_not_just_process_env(monkeypatch, tmp_path):
+    """runner-dynamic-workspace-slug (Perna C): a raw ``os.environ.get`` here
+    silently registers this workspace as "aw" — the shared default — the
+    moment ``AW_WORKSPACE`` lives only in ``.aw-workspace/.env`` and not in
+    the process's own env, overwriting whatever this workspace already
+    registered under its real name (dedup key is (tenant_id, workspace, cli)).
+    """
+    monkeypatch.delenv("AW_WORKSPACE", raising=False)
+    monkeypatch.setenv("AW_WORKSPACE_HOME", str(tmp_path))
+    (tmp_path / ".env").write_text("AW_WORKSPACE=crispal\n")
+
+    seen = []
+    _stub_client(monkeypatch, lambda url, kwargs: FakeResponse(200, {"ok": True}), seen)
+
+    rr.register_with_platform({
+        "agents_platform_token": "tok123",
+        "agents_platform_base": "http://ap-mt.example",
+    })
+
+    assert seen[0][1]["json"]["workspace"] == "crispal"
+
+
 def test_register_payload_carries_dispatch_credentials_for_ap_mt(monkeypatch):
     """AP-MT's RunnerLLM needs a caller_token + execute_secret to call this
     workspace's own /execute back (self-heal for the 2026-09-17 stale-

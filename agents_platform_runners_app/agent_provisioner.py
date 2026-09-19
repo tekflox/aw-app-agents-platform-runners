@@ -69,6 +69,8 @@ from typing import Any
 
 import httpx
 
+from . import platform_base as platform_base_mod
+
 log = logging.getLogger("aw_apps.agents_platform_runners.agent_provisioner")
 
 DEFAULT_TIMEOUT = 20.0
@@ -99,7 +101,7 @@ ENDPOINTS: dict[str, tuple[str, frozenset[str]]] = {
         "agent_config_slug", "group_slug", "kanban_target_status",
         "capabilities", "hidden_from_flow", "disable_harness_tools", "use_cases", "model_slug",
         "tool_specs", "skill_slugs", "params", "mcp_config", "extra_volumes",
-        "permissions", "icon", "color",
+        "permissions", "icon", "color", "workspace",
     })),
     "workflows": ("/api/workflows", frozenset({
         "slug", "name", "description", "use_cases", "kind", "graph",
@@ -300,7 +302,7 @@ class AgentProvisioner:
         """
         if not self.base or not self.token:
             return None
-        workspace_ref = os.environ.get("AW_WORKSPACE", "aw")
+        workspace_ref = platform_base_mod.workspace_env("AW_WORKSPACE") or "aw"
         headers = {"Authorization": f"Bearer {self.token}"}
         body = {"app_id": app_id, "workspace_ref": workspace_ref,
                 "app_version": app_version, "fingerprints": fingerprints}
