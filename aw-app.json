@@ -121,7 +121,7 @@
           "model_id": "codex-runner-gpt-5-6-sol",
           "display_name": "Codex (aw Runner, GPT-5.6 Sol)",
           "params": {
-            "runner": "aw-codex",
+            "runner": "crispal-codex",
             "cli": "codex",
             "model": "gpt-5.6-sol",
             "dangerous_skip_permissions": true,
@@ -134,7 +134,7 @@
           "model_id": "claude-runner-sonnet",
           "display_name": "Claude (aw Runner, Sonnet)",
           "params": {
-            "runner": "aw-claude",
+            "runner": "crispal-claude",
             "cli": "claude",
             "model": "sonnet",
             "dangerous_skip_permissions": true,
@@ -147,7 +147,7 @@
           "model_id": "claude-runner-opus",
           "display_name": "Claude (aw Runner, Opus)",
           "params": {
-            "runner": "aw-claude",
+            "runner": "crispal-claude",
             "cli": "claude",
             "model": "opus",
             "dangerous_skip_permissions": true,
@@ -160,7 +160,7 @@
           "model_id": "claude-runner-haiku",
           "display_name": "Claude (aw Runner, Haiku)",
           "params": {
-            "runner": "aw-claude",
+            "runner": "crispal-claude",
             "cli": "claude",
             "model": "haiku",
             "dangerous_skip_permissions": true,
@@ -173,7 +173,7 @@
           "model_id": "claude-runner-fable",
           "display_name": "Claude (aw Runner, Fable)",
           "params": {
-            "runner": "aw-claude",
+            "runner": "crispal-claude",
             "cli": "claude",
             "model": "fable",
             "dangerous_skip_permissions": true,

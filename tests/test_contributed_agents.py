@@ -61,8 +61,17 @@ def test_declares_gpt_5_6_sol_for_the_codex_runner(spec):
     models = {model["slug"]: model for model in spec["models"]}
     model = models["codex-runner-gpt-5-6-sol"]
     assert model["provider"] == "runner"
+    # "runner" must match a Runner row's actual registered slug
+    # (`{workspace}-{cli}` — see GET /api/runners), not a workspace-agnostic
+    # placeholder: "aw-codex" 404'd against this workspace's registry
+    # ("crispal-codex" is what's actually registered) even though this app's
+    # own manifest had shipped "aw-codex" since this model was added — the
+    # live row was manually corrected at some point and the manifest never
+    # caught up. bug:codex-telegram-gateway-401-stale-seed's sibling: same
+    # class of "content is seeded once and never rewritten" drift, one
+    # layer up (the model definition itself, not its seeded copy).
     assert model["params"] == {
-        "runner": "aw-codex",
+        "runner": "crispal-codex",
         "cli": "codex",
         "model": "gpt-5.6-sol",
         "dangerous_skip_permissions": True,
