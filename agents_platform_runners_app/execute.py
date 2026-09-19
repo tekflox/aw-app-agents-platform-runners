@@ -1101,40 +1101,56 @@ def _patch_codex_warm_token_headers(config_toml: Path) -> bool:
     return changed
 
 
-# Headers agents-platform-multitenant sends per-TURN (X-Aw-Caller-Run-Id,
-# and any X-Aw-Context-* — e.g. X-Aw-Context-Notion-Task-Id) that must NOT be
-# frozen into a WARM container's config — codex's config.toml (no per-run
-# --mcp-config equivalent, so this file IS the warm config) or claude's
-# mcp.json alike (has --mcp-config, but only the cold path and
-# warm-container-creation ever (re)write it — see _build_container_kwargs's
-# call site below; dispatch_turn() never regenerates it on later turns).
-# Stripping both from a warm container's frozen config is what makes it fall
-# through to aw-backend's gateway.py::_resolve_warm_context — the
-# stable-token -> Redis lookup that agents-platform-multitenant's
-# executor.py::_build_runner_extra_headers keeps current on EVERY turn via
-# set_warm_token_run, independent of whatever this container's own config
-# was frozen with at creation. Leaving even ONE of these in place defeats
-# that: gateway.py only consults the Redis fallback when the header-derived
-# value is ABSENT (`if not caller_run_id`, `if ... not in context`) — a
-# stale header is worse than no header, because it silently wins over the
-# fresh one.
+# X-Aw-Caller-Run-Id used to be dropped here too, alongside X-Aw-Context-*
+# (see below) — reasoning corrected 2026-09-19, card
+# fix-schedule-wakeup-caller-run-id. That stripping was modeled on
+# "aw-backend's gateway.py::_resolve_warm_context" (the AW sandbox's own,
+# unrelated legacy MCP gateway — see aw-mcp-gateway's own
+# back/gateway/caller_context.py module docstring, which explicitly calls it
+# out as a different codebase it "ports the same logic" from, not the same
+# file): that gateway only consults its Redis warm-token fallback when the
+# header-derived value is ABSENT, so a stale frozen header there silently
+# wins over a fresh Redis resolution forever — stripping is the only way to
+# get a warm container correctly re-resolved through it.
 #
-# X-Aw-Warm-Token itself is deliberately NOT in this set — it is the STABLE
+# THIS deployment's actual gateway — apps/mcp-gateway/back/gateway/
+# caller_context.py::capture() — was written with the opposite, safer
+# precedence: it ALWAYS prefers a resolved X-Aw-Warm-Token over the raw
+# header (`picked["x-aw-caller-run-id"] = resolved_run_id` unconditionally
+# overwrites), and only ever falls back to the (possibly stale) header when
+# resolution fails — no Redis configured, token unmapped, or Redis
+# unreachable. Under that precedence, stripping the header never helps (a
+# successful resolution overwrites it either way) and is actively harmful
+# whenever Redis isn't configured: with the header present, a warm
+# container's caller identity degrades to turn-1's value for its whole
+# life; with it stripped, there is no identity at all and every
+# identity-gated tool (schedule_wakeup, ask_human, mark_flow_done, ...)
+# hard-400s "Could not identify this run" — confirmed live 2026-09-19 on a
+# workspace with no warm_redis_url configured on the mcp-gateway app. So
+# X-Aw-Caller-Run-Id is deliberately NOT stripped here anymore; only the
+# X-Aw-Context-* family is (below), since aw-mcp-gateway never forwards
+# those to any upstream regardless (not in caller_context.FORWARDED) and
+# nothing in this codebase resolves them from Redis, so there is no
+# fallback value to protect.
+#
+# X-Aw-Warm-Token itself has never been in this set — it is the STABLE
 # key the Redis fallback above is resolved BY, so dropping it would leave
-# nothing for gateway.py to key off at all. Its value changes only per
+# nothing for the gateway to key off at all. Its value changes only per
 # container spawn, not per turn, so a warm container holding one frozen copy
 # for its whole life is exactly correct. Codex additionally drops it from
 # `http_headers` for an unrelated reason (its VALUE has to ride in through
 # `env_http_headers` instead — see `_render_codex_config_toml`); claude has
 # no such indirection and keeps it as a plain static header.
-_STALE_PER_TURN_HEADER_NAMES = ("X-Aw-Caller-Run-Id",)
+_STALE_PER_TURN_HEADER_NAMES = ()
 
 
 def _strip_stale_identity_headers(headers: dict | None) -> dict:
-    """``headers`` with every per-turn-changing identity entry removed — see
-    _STALE_PER_TURN_HEADER_NAMES's docstring. X-Aw-Context-* is matched by
-    prefix (its suffix is the context key, e.g. ``X-Aw-Context-Notion-Task-Id``),
-    case-insensitively since HTTP header names are case-insensitive."""
+    """``headers`` with every per-turn header this gateway can never use
+    removed — see _STALE_PER_TURN_HEADER_NAMES's docstring for which ones
+    that is (X-Aw-Caller-Run-Id is deliberately NOT among them anymore).
+    X-Aw-Context-* is matched by prefix (its suffix is the context key, e.g.
+    ``X-Aw-Context-Notion-Task-Id``), case-insensitively since HTTP header
+    names are case-insensitive."""
     return {k: v for k, v in (headers or {}).items()
             if k not in _STALE_PER_TURN_HEADER_NAMES
             and not k.lower().startswith("x-aw-context-")}
@@ -1178,7 +1194,8 @@ def _render_codex_config_toml(base_text: str, mcp_servers: dict) -> str:
     ``X-Aw-Warm-Token`` already uses below for the same reason.
     ``X-Aw-Warm-Token`` itself keeps riding in through ``env_http_headers`` +
     ``CODEX_WARM_TOKEN_ENV_VAR``, unchanged from _patch_codex_warm_token_headers
-    (see _strip_stale_identity_headers for why the per-turn ones are dropped).
+    (see _strip_stale_identity_headers for which per-turn headers are still
+    dropped from the static table, and why X-Aw-Caller-Run-Id no longer is).
     """
     kept: list[str] = []
     in_mcp_table = False
@@ -1391,21 +1408,21 @@ def _build_container_kwargs(job: dict) -> tuple[str, list[str], dict, str | None
     # instead of a path to it. Written straight into the isolated run dir
     # (already mounted rw below), no separate mount needed.
     #
-    # Headers are stripped of the same per-turn-changing set codex's
-    # _render_codex_config_toml already drops (_strip_stale_identity_headers)
-    # — this file is written once per container (cold run, or warm-container
-    # creation; dispatch_turn() never rewrites it on later turns), so an
-    # X-Aw-Caller-Run-Id/X-Aw-Context-* baked in here would freeze turn 1's
-    # values for that container's whole life. Dropping them lets a warm
-    # container fall through to gateway.py's `_resolve_warm_context` —
-    # resolved from the STILL-PRESENT, stable X-Aw-Warm-Token header (kept,
-    # unlike codex, which sources it from an env var instead — claude has no
-    # such indirection) via the Redis mapping agents-platform-multitenant's
-    # own executor.py::_build_runner_extra_headers keeps current on every
-    # turn. Harmless on the cold (non-warm) path too: that Redis mapping is
-    # written unconditionally, "session or no session" (see that function's
-    # own docstring), so it resolves to the same value the stripped header
-    # would have carried anyway.
+    # Headers pass through _strip_stale_identity_headers (see its docstring
+    # and _STALE_PER_TURN_HEADER_NAMES) — this file is written once per
+    # container (cold run, or warm-container creation; dispatch_turn() never
+    # rewrites it on later turns), so an X-Aw-Context-* baked in here would
+    # freeze turn 1's values for that container's whole life. It is dropped
+    # for exactly that reason. X-Aw-Caller-Run-Id is frozen the same way but
+    # is kept anyway: the STILL-PRESENT, stable X-Aw-Warm-Token header lets
+    # aw-mcp-gateway's caller_context.py resolve the CURRENT turn's run id
+    # via Redis and overwrite the frozen header's value when that resolution
+    # succeeds, so keeping the header costs nothing on that path — and when
+    # Redis resolution fails (unconfigured, unreachable, unmapped), the
+    # frozen header is the only identity this warm container has left, so
+    # dropping it turns a degraded-but-working container into one that
+    # 400s "Could not identify this run" on every identity-gated tool call
+    # for its entire remaining life.
     mcp_config_container_path: str | None = None
     # Correct any stale gateway credential BEFORE it's baked into this
     # container's config — see _refresh_stale_gateway_auth's own docstring.
