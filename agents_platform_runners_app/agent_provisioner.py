@@ -47,14 +47,15 @@ its own create route still 409s on the tombstoned slug — so the generic
 soft-deleted, app-seeded object invisible forever, with nothing anywhere
 saying why (this is exactly what happened to ``agent_flows`` in production;
 see the ``soft-delete-permanently-blocks-app-seeding`` lesson). ``targets``
-is the first kind that gets a real answer instead of that trap:
-``RESTORE_ENDPOINTS`` names a kind's restore route, and a 409 on a kind
-listed there is followed up with a GET (``include_deleted=true``) to tell
-"exists" apart from "exists but soft-deleted", restoring only the latter.
-A Target carries no field a user tunes the way they tune a system prompt —
-restoring it changes nothing but ``deleted_at`` — so auto-restoring the app's
-own seeded infrastructure loses no one's edits. Deleting one for good still
-works exactly as before: ``?hard=true``, which this provider never calls.
+and ``agents`` get a real answer instead of that trap: ``RESTORE_ENDPOINTS``
+names a kind's restore route, and a 409 on a kind listed there is followed
+up with a GET (``include_deleted=true``) to tell "exists" apart from
+"exists but soft-deleted", restoring only the latter. Restoring changes
+nothing but ``deleted_at`` — for a Target that loses no one's edits outright;
+for an Agent, it is still strictly better than the alternative (permanently
+invisible), since ``seed()`` never rewrites content on an existing row
+either way. Deleting one for good still works exactly as before:
+``?hard=true``, which this provider never calls.
 
 A failure here is logged and skipped, never raised — aw-workspace calls this
 inside app activation, and an app whose features work but whose seeded agent
@@ -137,14 +138,12 @@ DEFAULTS: dict[str, dict[str, str]] = {
 #: kind -> restore endpoint template, for kinds whose soft-delete would
 #: otherwise 409-block a reseed forever (see the module docstring's
 #: "Soft-deleted rows do not stay 409-and-forgotten forever" section).
-#: ``targets`` and ``workflows`` have a restore route; every other kind
-#: still uses the plain "409 == already there" rule below. ``agents`` is
-#: conspicuously absent despite also soft-deleting — see the
-#: soft-delete-permanently-blocks-app-seeding lesson this docstring already
-#: cites; it hasn't been fixed there yet, this just doesn't make it worse.
+#: ``targets``, ``workflows`` and ``agents`` have a restore route; every
+#: other kind still uses the plain "409 == already there" rule below.
 RESTORE_ENDPOINTS: dict[str, str] = {
     "targets": "/api/targets/{slug}/restore",
     "workflows": "/api/workflows/{slug}/restore",
+    "agents": "/api/agents/{slug}/restore",
 }
 
 

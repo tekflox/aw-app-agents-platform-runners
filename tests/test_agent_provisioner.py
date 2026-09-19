@@ -400,12 +400,27 @@ def test_an_unreadable_soft_delete_check_is_logged_but_never_raises():
 
 
 def test_other_kinds_never_attempt_a_restore_on_409():
-    # RESTORE_ENDPOINTS is deliberately narrow — only targets have no
-    # user-tuned content, so a 409 on an agent/group/etc. must stay the
-    # ordinary "already there" no-op with no restore call at all.
+    # RESTORE_ENDPOINTS covers targets and agents; a 409 on a kind NOT
+    # listed there (group/agent_config/agent_flow/model) must stay the
+    # ordinary "already there" no-op with no restore call at all. None of
+    # SPEC's entries are actually soft-deleted here, so even the "agents"
+    # 409 in this spec resolves to a no-op (see
+    # test_a_soft_deleted_agent_is_restored_on_reseed for the positive case).
     platform = FakePlatform(post_status=409)
     assert _seed(platform, SPEC) == {}
     assert platform.restores == []
+
+
+def test_a_soft_deleted_agent_is_restored_on_reseed():
+    # Same trap as the target case above, closed for "agents" (W7):
+    # a soft-deleted agent's slug is absent from the LIST this provider
+    # pre-checks, so the create route's 409 on the tombstoned slug used to
+    # be indistinguishable from "someone else already created it" — leaving
+    # the agent permanently un-reseedable.
+    platform = FakePlatform(post_status=409,
+                            deleted={"/api/agents": {"sec-reviewer"}})
+    assert _seed(platform, SPEC) == {}
+    assert platform.restores == ["/api/agents/sec-reviewer/restore"]
 
 
 def test_write_state_reads_workspace_from_the_env_file_not_just_process_env(
