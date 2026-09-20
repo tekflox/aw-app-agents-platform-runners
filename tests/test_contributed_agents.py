@@ -174,3 +174,31 @@ def test_no_declaration_ships_a_credential(spec):
                             "password", "authorization"), key_path
         if isinstance(value, str):
             assert not value.lower().startswith("bearer "), key_path
+
+
+def test_no_declaration_ships_a_key_nothing_reads(spec):
+    """`workspace_qualified: true` sat on all five of these agents from
+    206b95b until it was removed. Nothing in either repo ever read it.
+
+    That commit's message claimed activation "derives a per-workspace
+    slug/name ... via `qualify_workspace_agents()`" — a function that has
+    never existed anywhere in the tree. A key that reads as implemented and
+    is not is worse than no key at all: it is a wrong answer to "is this
+    already handled?", and it was believed once already during the debugging
+    of the Telegram cross-workspace dispatch bug.
+
+    Note `workspace` itself is NOT dead — `AgentIn.workspace` landed in
+    agents-platform-multitenant c0094d6 as a per-agent DEFAULT, and the
+    provisioner's allowlist carries it on purpose (see
+    test_agent_provisioner.py::test_workspace_survives_the_create_post). It
+    is the weakest input to the override: an Agent row is seeded once per
+    TENANT, so it cannot distinguish two workspaces of one account. The
+    channel's answer (`TelegramBot.workspace` -> `Run.workspace`, inherited
+    by child runs) wins over it.
+    """
+    dead_keys = {"workspace_qualified"}
+    for key_path, _ in _walk(spec):
+        leaf = key_path.rsplit(".", 1)[-1].split("[")[0]
+        assert leaf not in dead_keys, (
+            f"{key_path}: no code anywhere reads this — either wire it up or "
+            "drop it, but do not leave it looking implemented")

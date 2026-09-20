@@ -589,7 +589,6 @@
           "description": "The default Telegram agent. Reach for this unless the conversation specifically wants a cheaper or a deeper model.",
           "system_prompt_file": "prompts/telegram.md",
           "model_slug": "claude-runner-sonnet",
-          "workspace_qualified": true,
           "agent_config_slug": "agent-config-aw-full",
           "skill_slugs": [
             "aw-agent-telegram"
@@ -611,7 +610,6 @@
           "description": "The deep one, for a conversation that is really a piece of work \u2014 an investigation, a multi-step change driven from the phone.",
           "system_prompt_file": "prompts/telegram.md",
           "model_slug": "claude-runner-opus",
-          "workspace_qualified": true,
           "agent_config_slug": "agent-config-aw-full",
           "skill_slugs": [
             "aw-agent-telegram"
@@ -633,7 +631,6 @@
           "description": "The cheap pass, for short exchanges where the answer is a fact rather than a judgement.",
           "system_prompt_file": "prompts/telegram.md",
           "model_slug": "claude-runner-haiku",
-          "workspace_qualified": true,
           "agent_config_slug": "agent-config-aw-full",
           "skill_slugs": [
             "aw-agent-telegram"
@@ -655,7 +652,6 @@
           "description": "The Fable variant, for conversations where tone and phrasing matter as much as the answer.",
           "system_prompt_file": "prompts/telegram.md",
           "model_slug": "claude-runner-fable",
-          "workspace_qualified": true,
           "agent_config_slug": "agent-config-aw-full",
           "skill_slugs": [
             "aw-agent-telegram"
@@ -677,7 +673,6 @@
           "description": "The Codex-backed Telegram variant, for coding and other agentic work that benefits from GPT-5.6 Sol while staying reachable from the phone.",
           "system_prompt_file": "prompts/telegram.md",
           "model_slug": "codex-runner-gpt-5-6-sol",
-          "workspace_qualified": true,
           "agent_config_slug": "agent-config-aw-full",
           "skill_slugs": [
             "aw-agent-telegram"

@@ -17,6 +17,7 @@ import argparse
 import secrets
 import sys
 
+from ... import platform_base
 from ..client import PlatformClient
 from ..output import emit_json, emit_table, fail, ok
 
@@ -46,6 +47,10 @@ def register(sub) -> None:
                              "the server demotes every other bot flagged sysadmin")
     p_add.add_argument("--admin-user-id", dest="admin_user_ids", action="append", default=[],
                         help="repeatable")
+    p_add.add_argument("--workspace", default=None,
+                        help="workspace whose runners execute this bot's turns "
+                             "(defaults to THIS workspace); '' registers a legacy "
+                             "bot that uses the agent's baked-in runner")
     p_add.add_argument("--no-register-webhook", action="store_true",
                         help="skip the automatic register-webhook call after create")
     p_add.add_argument("--show-secrets", action="store_true",
@@ -69,6 +74,7 @@ def _redact(bot: dict) -> dict:
 def _row(bot: dict) -> tuple:
     return (
         str(bot.get("id", "")), str(bot.get("name", "")), str(bot.get("agent_slug") or ""),
+        str(bot.get("workspace") or ""),
         str(bot.get("enabled", "")), str(bot.get("is_sysadmin", "")), str(bot.get("token", "")),
     )
 
@@ -80,9 +86,26 @@ def _list(client: PlatformClient, ns: argparse.Namespace) -> int:
     if ns.as_json:
         emit_json(bots)
     else:
-        headers = ("ID", "NAME", "AGENT", "ENABLED", "SYSADMIN", "TOKEN")
+        headers = ("ID", "NAME", "AGENT", "WORKSPACE", "ENABLED", "SYSADMIN", "TOKEN")
         emit_table([_row(b) for b in bots], headers)
     return 0
+
+
+def _resolve_workspace(ns: argparse.Namespace) -> str | None:
+    """Which workspace's runners this bot's turns execute on.
+
+    Defaults to THIS workspace, read through ``platform_base.workspace_env``
+    and NOT ``os.environ.get`` directly: an app container has the var only in
+    the 0600 ``.env`` the server mirrors it into, so a raw env read comes back
+    empty and silently registers the bot as the literal default (see
+    ``tests/test_runner_registration.py``, the same trap for the runner slug).
+
+    ``--workspace ''`` is an explicit opt-out that sends NULL — a legacy bot
+    that keeps using the agent's baked-in runner.
+    """
+    if ns.workspace is not None:
+        return ns.workspace or None
+    return platform_base.workspace_env("AW_WORKSPACE") or None
 
 
 def _add(client: PlatformClient, ns: argparse.Namespace) -> int:
@@ -96,6 +119,7 @@ def _add(client: PlatformClient, ns: argparse.Namespace) -> int:
         "is_sysadmin": ns.sysadmin,
         "agent_slug": ns.agent_slug,
         "admin_user_ids": ns.admin_user_ids,
+        "workspace": _resolve_workspace(ns),
     }
     bot = client.post("/api/telegram/bots", json_body=body)
 
