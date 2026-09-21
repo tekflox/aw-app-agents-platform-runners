@@ -404,6 +404,13 @@ def _claude_oauth_token() -> str:
     return ""
 CONTAINER_NETWORK = os.environ.get("AW_CONTAINER_NETWORK")
 
+# "aw-sandbox" is this host's fixed container name — not per-workspace
+# suffixed like the AW_WORKSPACE-derived "aw-workspace-<name>" — see this
+# repo's own docker-compose.yml, whose aw-workspace service joins that same
+# netns via `network_mode: "container:aw-sandbox"`. Overridable in case a
+# deployment doesn't match that convention.
+SANDBOX_CONTAINER_NAME = os.environ.get("AW_SANDBOX_CONTAINER_NAME", "aw-sandbox")
+
 # Same registry/prefix convention as agents-platform's own
 # core/tools/docker_agent.py — these images are the single shared source of
 # CLI agent images across every runner, not something this app builds itself.
@@ -1633,7 +1640,10 @@ def _build_container_kwargs(job: dict) -> tuple[str, list[str], dict, str | None
 
     # "docker" and "tmp_access" mirror executor.py's _perm_volumes entries of
     # the same name. They were dropped on this path entirely — a config could
-    # tick either box and nothing happened, with no log to say so.
+    # tick either box and nothing happened, with no log to say so. Same bug,
+    # same fix shape, for "share_network" below (network_mode, not a volume —
+    # resolved where `kwargs` itself is built, since there's no `volumes`
+    # dict entry for a netns join).
     if _perms.get("docker"):
         if _is_usable_socket(DOCKER_SOCKET_PATH):
             # Usability is judged on OUR path (that's where we can stat it);
@@ -2040,7 +2050,27 @@ def _build_container_kwargs(job: dict) -> tuple[str, list[str], dict, str | None
         "user": f"{os.getuid()}:{os.getgid()}",
         "group_add": [1000],
     }
-    if CONTAINER_NETWORK:
+    # Agent Config's "Share network" permission: join aw-sandbox's own
+    # network namespace instead of an isolated bridge, so the spawned
+    # container can reach 127.0.0.1 ports on the host stack (awserv, redis,
+    # postgres, agents-platform itself) — exactly what the UI's own
+    # description text for this checkbox promises. Nothing on this execution
+    # path ever read permissions.get("share_network") before this (confirmed
+    # live 2026-09-21: `curl 127.0.0.1:9030` from inside a spawned container
+    # got "Connection refused", not a timeout — the container was never on
+    # aw-sandbox's netns at all), so the box was accepted in the UI and had
+    # zero effect, same class of bug as "docker"/"tmp_access" above. Mirrors
+    # this workspace's own docker-compose.yml pattern for joining that netns:
+    # `network_mode: "container:aw-sandbox"`.
+    #
+    # Takes priority over CONTAINER_NETWORK below rather than combining with
+    # it: a "container:<name>" NetworkMode makes this container reuse
+    # aw-sandbox's entire network stack, and the engine rejects also
+    # attaching it to a separate user-defined network on top of that — there
+    # is no independent networking left to attach.
+    if _perms.get("share_network"):
+        kwargs["network_mode"] = f"container:{SANDBOX_CONTAINER_NAME}"
+    elif CONTAINER_NETWORK:
         kwargs["network"] = CONTAINER_NETWORK
     # Returned separately (not embedded in `argv`/`kwargs`) so warm mode's
     # own command-building (see _build_warm_kwargs) can wire the SAME
