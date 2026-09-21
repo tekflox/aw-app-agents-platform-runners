@@ -228,7 +228,7 @@ def test_run_job_blocking_still_publishes_done_when_the_retry_helper_raises(monk
     monkeypatch.setattr(execute_mod, "CONTAINER_SOCKET", "/fake.sock")
     monkeypatch.setattr(execute_mod.warm_pool, "enabled", lambda: False)
     monkeypatch.setattr(execute_mod, "_build_container_kwargs",
-                        lambda job: ("img", ["argv"], {}, None))
+                        lambda job, *_a, **_k: ("img", ["argv"], {}, None))
     monkeypatch.setattr(execute_mod, "_redis_client", lambda url: _FakeRedis())
 
     def _boom_sleep(_seconds):

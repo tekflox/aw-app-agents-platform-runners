@@ -439,7 +439,7 @@ def test_a_cold_run_is_killable_from_the_moment_it_spawns_and_forgotten_after(
     monkeypatch.setattr(execute_mod, "_redis_client", lambda _url: r)
     monkeypatch.setattr(execute_mod, "CONTAINER_SOCKET", "/fake.sock")
     monkeypatch.setattr(execute_mod, "_build_container_kwargs",
-                        lambda _job: ("img", ["argv"], {"name": "aw-runner-run-run-16"}, None))
+                        lambda _job, *_a, **_k: ("img", ["argv"], {"name": "aw-runner-run-run-16"}, None))
     monkeypatch.setattr(execute_mod.execution_index, "start", lambda _rid: None)
     monkeypatch.setattr(execute_mod, "_publish_line", lambda *_a, **_k: None)
 
@@ -531,7 +531,7 @@ def test_a_run_aborted_during_its_image_pull_is_never_spawned(monkeypatch, tmp_p
     monkeypatch.setattr(execute_mod, "_redis_client", lambda _url: r)
     monkeypatch.setattr(execute_mod, "CONTAINER_SOCKET", "/fake.sock")
     monkeypatch.setattr(execute_mod, "_build_container_kwargs",
-                        lambda _job: ("img", ["argv"], {"name": "aw-runner-run-run-15"}, None))
+                        lambda _job, *_a, **_k: ("img", ["argv"], {"name": "aw-runner-run-run-15"}, None))
     monkeypatch.setattr(execute_mod.execution_index, "start", lambda _rid: None)
 
     spawned: list = []

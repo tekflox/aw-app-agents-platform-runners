@@ -334,6 +334,31 @@ def _self_container(client):
     return None
 
 
+def _share_network_target(client) -> str:
+    """Container name to netns-share with for the "Share network" Agent
+    Config permission — this runner's OWN container (``_self_container``),
+    instance-aware in whatever topology this process runs under, rather
+    than a name that only exists on the main self-hosted workspace.
+
+    In the main workspace, this process runs inside the container that
+    already joins aw-sandbox's netns (this repo's own docker-compose.yml:
+    `network_mode: "container:aw-sandbox"`), so sharing with our own
+    container lands a spawned agent in that same netns transitively. In a
+    hosted/BYOD workspace (e.g. crispal's aw-remote-host-workspace), our own
+    container IS the host stack the permission promises to reach — there is
+    no separate "aw-sandbox" sibling to point at, and there never will be.
+
+    Falls back to the fixed SANDBOX_CONTAINER_NAME only when there is no
+    client to ask (legacy/unit-test callers that don't exercise
+    share_network) or _self_container itself can't identify us.
+    """
+    if client is not None:
+        me = _self_container(client)
+        if me is not None:
+            return me.name
+    return SANDBOX_CONTAINER_NAME
+
+
 def _docker_socket_bind_source() -> str | None:
     """Bind-mount SOURCE for the "docker" permission — a daemon-side path.
 
@@ -409,6 +434,13 @@ CONTAINER_NETWORK = os.environ.get("AW_CONTAINER_NETWORK")
 # repo's own docker-compose.yml, whose aw-workspace service joins that same
 # netns via `network_mode: "container:aw-sandbox"`. Overridable in case a
 # deployment doesn't match that convention.
+#
+# LAST-RESORT fallback only (see _share_network_target below) — this name
+# only ever resolves on the main self-hosted workspace. A hosted/BYOD
+# workspace (e.g. crispal's aw-remote-host-workspace) never has a sibling
+# container by this name, which is exactly what broke warm dispatch there
+# 2026-09-21 (bug:apr-warm-dispatch-aw-sandbox-missing) once the "Share
+# network" permission started actually being honoured below.
 SANDBOX_CONTAINER_NAME = os.environ.get("AW_SANDBOX_CONTAINER_NAME", "aw-sandbox")
 
 # Same registry/prefix convention as agents-platform's own
@@ -1332,8 +1364,15 @@ def _build_raw_kwargs(job: dict) -> tuple[str, list[str], dict]:
     return image, argv, kwargs
 
 
-def _build_container_kwargs(job: dict) -> tuple[str, list[str], dict, str | None]:
+def _build_container_kwargs(job: dict, client=None) -> tuple[str, list[str], dict, str | None]:
     """Return (image, command_argv, docker-SDK run kwargs) for this job.
+
+    ``client`` is the docker-SDK client already in scope at every real call
+    site (cold spawn, warm claude, warm codex) — optional, and used ONLY to
+    resolve the "Share network" permission's target container via
+    ``_share_network_target``/``_self_container`` (see their own docstrings).
+    Every other kwarg this function builds is client-independent, so test
+    callers that don't touch share_network can omit it unchanged.
 
     A ``raw_command`` job (monitor run — see ``_build_raw_kwargs``) branches
     off immediately: it has no CLI, no credentials, no MCP config, none of
@@ -2064,12 +2103,12 @@ def _build_container_kwargs(job: dict) -> tuple[str, list[str], dict, str | None
     # `network_mode: "container:aw-sandbox"`.
     #
     # Takes priority over CONTAINER_NETWORK below rather than combining with
-    # it: a "container:<name>" NetworkMode makes this container reuse
-    # aw-sandbox's entire network stack, and the engine rejects also
-    # attaching it to a separate user-defined network on top of that — there
-    # is no independent networking left to attach.
+    # it: a "container:<name>" NetworkMode makes this container reuse the
+    # target's entire network stack, and the engine rejects also attaching
+    # it to a separate user-defined network on top of that — there is no
+    # independent networking left to attach.
     if _perms.get("share_network"):
-        kwargs["network_mode"] = f"container:{SANDBOX_CONTAINER_NAME}"
+        kwargs["network_mode"] = f"container:{_share_network_target(client)}"
     elif CONTAINER_NETWORK:
         kwargs["network"] = CONTAINER_NETWORK
     # Returned separately (not embedded in `argv`/`kwargs`) so warm mode's
@@ -2112,17 +2151,19 @@ def _host_path_for(container_side_path: Path) -> str:
     return f"{WORKSPACE_HOST_DIR.rstrip('/')}/{rel}"
 
 
-def _build_warm_kwargs(job: dict, epoch_hash: str, redis_url: str) -> tuple[str, dict]:
+def _build_warm_kwargs(job: dict, epoch_hash: str, redis_url: str, client=None) -> tuple[str, dict]:
     """Dispatch to this job's CLI-specific warm-container builder — see
     WARM_CAPABLE_CLIS's own comment for why there's no generic
-    implementation shared across CLIs."""
+    implementation shared across CLIs. ``client`` is forwarded to
+    ``_build_container_kwargs`` for the "Share network" permission — see its
+    own docstring."""
     cli = job.get("cli") or "claude"
     if cli == "codex":
-        return _build_warm_kwargs_codex(job, epoch_hash, redis_url)
-    return _build_warm_kwargs_claude(job, epoch_hash, redis_url)
+        return _build_warm_kwargs_codex(job, epoch_hash, redis_url, client)
+    return _build_warm_kwargs_claude(job, epoch_hash, redis_url, client)
 
 
-def _build_warm_kwargs_claude(job: dict, epoch_hash: str, redis_url: str) -> tuple[str, dict]:
+def _build_warm_kwargs_claude(job: dict, epoch_hash: str, redis_url: str, client=None) -> tuple[str, dict]:
     """(image, docker-SDK run kwargs) for a FRESH warm container — the
     ``build_kwargs`` callback ``warm_pool.get_or_create()`` calls only on a
     cold/stale session. Reuses ``_build_container_kwargs()``'s mount/env/
@@ -2153,7 +2194,7 @@ def _build_warm_kwargs_claude(job: dict, epoch_hash: str, redis_url: str) -> tup
     session_id = job["session_id"]
     spec = CLI_SPECS["claude"]
 
-    image, _argv, kwargs, mcp_config_container_path = _build_container_kwargs(job)
+    image, _argv, kwargs, mcp_config_container_path = _build_container_kwargs(job, client)
     kwargs = dict(kwargs)
 
     volumes = dict(kwargs.get("volumes") or {})
@@ -2211,7 +2252,7 @@ def _build_warm_kwargs_claude(job: dict, epoch_hash: str, redis_url: str) -> tup
     return image, kwargs
 
 
-def _build_warm_kwargs_codex(job: dict, epoch_hash: str, redis_url: str) -> tuple[str, dict]:
+def _build_warm_kwargs_codex(job: dict, epoch_hash: str, redis_url: str, client=None) -> tuple[str, dict]:
     """(image, docker-SDK run kwargs) for a FRESH warm codex container.
 
     Much thinner than the claude branch: codex's app-server already reads
@@ -2231,7 +2272,7 @@ def _build_warm_kwargs_codex(job: dict, epoch_hash: str, redis_url: str) -> tupl
     agent_id = job["agent_id"]
     session_id = job["session_id"]
 
-    image, _argv, kwargs, _mcp_config_container_path = _build_container_kwargs(job)
+    image, _argv, kwargs, _mcp_config_container_path = _build_container_kwargs(job, client)
     kwargs = dict(kwargs)
 
     volumes = dict(kwargs.get("volumes") or {})
@@ -2331,7 +2372,7 @@ def _dispatch_warm_turn(client, job: dict, redis_url: str, r=None) -> None:
     recycle = job.get("warm_recycle") or None
     name = warm_pool.get_or_create(
         client=client, agent_id=agent_id, session_id=session_id, epoch_hash=epoch,
-        build_kwargs=lambda _name, _epoch: _build_warm_kwargs(job, _epoch, redis_url),
+        build_kwargs=lambda _name, _epoch: _build_warm_kwargs(job, _epoch, redis_url, client),
         recycle=recycle,
     )
     if recycle:
@@ -2822,8 +2863,8 @@ def _run_job_blocking(job: dict, redis_url: str) -> None:
         return
 
     try:
-        image, argv, kwargs, _mcp_config_container_path = _build_container_kwargs(job)
         client = docker_sdk.DockerClient(base_url="unix://" + CONTAINER_SOCKET)
+        image, argv, kwargs, _mcp_config_container_path = _build_container_kwargs(job, client)
         # Always attempt a pull, not just when the tag is missing locally —
         # a `:latest`-pinned image that already exists locally otherwise
         # never gets refreshed after an upstream rebuild, silently running a
