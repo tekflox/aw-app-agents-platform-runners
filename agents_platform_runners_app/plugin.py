@@ -37,6 +37,7 @@ from . import execute_secret as execute_secret_mod
 from . import execution_index as execution_index_mod
 from . import identity_token as identity_token_mod
 from . import kanban_dispatch as kanban_dispatch_mod
+from . import kanban_sweep_default as kanban_sweep_default_mod
 from . import notion_token_sync as notion_token_sync_mod
 from . import platform_base as platform_base_mod
 from . import platform_settings as platform_settings_mod
@@ -176,6 +177,16 @@ class AgentsPlatformRunnersAppPlugin:
         # secret wiped by an uninstall/reinstall) take effect on the very
         # next HTTP request, with no app or workspace restart needed.
         self._live_config: dict = {}
+        # Mutated in place by _register_kanban_sweep_watchdog (same "identity,
+        # never rebind" rule as _live_config above) — the CLOSURE routes.py's
+        # /status builds over this dict is created once, at activate() time,
+        # before that watchdog registration runs, so a fresh dict handed in
+        # later would never be seen. Read live rather than cached, because
+        # the reason "not registered" reads today is fixed at process start
+        # (watchdog capability + token are decided once at activate()) — it
+        # exists so a missing watchdog is visible in /status, not only as the
+        # one-time log.warning it used to be.
+        self._kanban_sweep_status: dict = {}
 
     def _refresh_derived_config(self, ctx) -> dict:
         """In-process derived state ONLY, safe to run on every worker: mutate
@@ -258,9 +269,24 @@ class AgentsPlatformRunnersAppPlugin:
         except Exception:  # noqa: BLE001 — activation must never be blocked by this
             log.warning("runner registration failed at activation", exc_info=True)
 
+        # Flip kanban_sweep_enabled on by default, exactly once per install
+        # (Kanban "auto-criar sweep de Ready cards + automatizar/verificar
+        # webhook do Notion"). Non-fatal, same shape as execute_secret above:
+        # on failure this logs and activation continues with whatever the
+        # flag is already set to. See kanban_sweep_default.py for why a
+        # schema-default change alone can never reach an install that has
+        # already persisted config, and why this deliberately never retries.
+        try:
+            applied = kanban_sweep_default_mod.ensure_default_applied(self._live_config)
+            if applied:
+                self._live_config.update(applied)
+        except Exception:  # noqa: BLE001 — activation must never be blocked by this
+            log.warning("kanban_sweep_default: default-flip failed at activation", exc_info=True)
+
         mcp_doc = write_mcp_json(ctx.package_dir, self._live_config)
 
-        ctx.routes.register(routes_mod.build_routes(self._live_config))
+        ctx.routes.register(routes_mod.build_routes(
+            self._live_config, kanban_sweep_status=self._kanban_sweep_status))
 
         self._register_skills_watchdog(ctx, self._live_config)
         self._register_kanban_sweep_watchdog(ctx, self._live_config)
@@ -398,15 +424,20 @@ class AgentsPlatformRunnersAppPlugin:
           propagate. An auth or reachability failure in a watchdog is otherwise
           a stack trace every 60s that nobody reads and no board ever shows.
         """
+        self._kanban_sweep_status.clear()
         if not ctx.has("watchdog:tasks"):
-            log.warning("kanban sweep: 'watchdog:tasks' capability not granted — "
-                        "Ready-card watchdog not started")
+            reason = ("the 'watchdog:tasks' capability is not granted to this app — "
+                      "the Ready-card watchdog never started")
+            log.warning("kanban sweep: %s", reason)
+            self._kanban_sweep_status.update({"watchdog_registered": False, "reason": reason})
             return
         base = platform_base_mod.resolve(config)
         token = config.get("agents_platform_token")
         if not token:
-            log.warning("kanban sweep: agents_platform_token not configured — "
-                        "Ready-card watchdog not started (every dispatch would 401)")
+            reason = ("agents_platform_token is not configured — the Ready-card watchdog "
+                      "never started (every dispatch would 401)")
+            log.warning("kanban sweep: %s", reason)
+            self._kanban_sweep_status.update({"watchdog_registered": False, "reason": reason})
             return
         def _interval() -> float:
             try:
@@ -440,6 +471,7 @@ class AgentsPlatformRunnersAppPlugin:
         log.info("kanban sweep: watchdog registered (enabled=%s, every %.0fs, "
                  "board=%s, platform=%s)",
                  bool(config.get("kanban_sweep_enabled")), _interval(), board_url, base)
+        self._kanban_sweep_status.update({"watchdog_registered": True, "reason": None})
 
     def _register_identity_token_watchdog(self, ctx, config: dict) -> None:
         """Register the half-life ``agents_platform_token`` refresh watchdog

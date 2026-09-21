@@ -179,6 +179,8 @@ def _silence_other_activate_side_effects(monkeypatch):
     monkeypatch.setattr(plugin_mod.execute_mod, "_reap_isolated_dirs_all", lambda: None)
     monkeypatch.setattr(plugin_mod.warm_pool_mod, "configure", lambda config: False)
     monkeypatch.setattr(plugin_mod.identity_token_mod, "refresh", lambda config: None)
+    monkeypatch.setattr(plugin_mod.kanban_sweep_default_mod, "ensure_default_applied",
+                        lambda config: None)
 
 
 def test_new_workspace_activate_generates_secret_before_first_registration(monkeypatch):

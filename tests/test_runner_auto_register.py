@@ -58,6 +58,9 @@ def _silence_side_effects(monkeypatch):
     monkeypatch.setattr(plugin_mod, "write_mcp_json", lambda package_dir, config: {"mcpServers": {}})
     monkeypatch.setattr(plugin_mod.execute_mod, "_reap_isolated_dirs_all", lambda: None)
     monkeypatch.setattr(plugin_mod.warm_pool_mod, "configure", lambda config: False)
+    monkeypatch.setattr(plugin_mod.execute_secret_mod, "ensure_configured", lambda config: None)
+    monkeypatch.setattr(plugin_mod.kanban_sweep_default_mod, "ensure_default_applied",
+                        lambda config: None)
 
 
 def _plugin_with_stubbed_watchdogs() -> AgentsPlatformRunnersAppPlugin:

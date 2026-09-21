@@ -1053,6 +1053,12 @@
         "title": "Kanban sweep interval (s)",
         "description": "Seconds between Ready-card sweeps. Latency is 0 to this, averaging half. 60s is the default because the webhook it replaces was measured at ~50s on a real card and its own code cites up to ~3min worst case \u2014 so 60s is at worst a wash. Lower costs Notion API calls against a ~3 req/s pace; 30s is safe if latency starts to matter."
       },
+      "kanban_sweep_default_applied": {
+        "type": "boolean",
+        "default": false,
+        "title": "Kanban sweep default applied (internal)",
+        "description": "Internal one-time guard \u2014 not meant to be hand-edited. Set true by kanban_sweep_default.py the first time it flips kanban_sweep_enabled on for this install; once true, that flip never happens again, so a human unticking kanban_sweep_enabled afterwards stays unticked (see that module's docstring for why a schema default alone can't do this flip and why there is no re-assert watchdog)."
+      },
       "public": {
         "type": "boolean",
         "default": true,

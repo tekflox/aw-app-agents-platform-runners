@@ -36,6 +36,18 @@ def test_status_reflects_config():
     assert resp.json()["agents_platform_base"] == "http://example.test:9999"
 
 
+def test_status_reports_kanban_sweep_and_notion_webhook_defaults_with_no_config():
+    """No config, no kanban_sweep_status handed in — the shape /status
+    reports for a fresh install, before anything ever activates it. See
+    test_kanban_sweep_default.py and test_notion_subscription.py for the
+    behaviour behind each block."""
+    client = TestClient(build_routes())
+    body = client.get("/status").json()
+    assert body["kanban_sweep"] == {
+        "enabled": False, "interval_s": 60.0, "watchdog_registered": False, "reason": None}
+    assert body["notion_webhook"]["state"] == "unknown"
+
+
 def test_warm_containers_without_a_container_socket_is_a_clear_error(monkeypatch):
     """No AW_CONTAINER_SOCKET must read as 'no engine available', never as an
     empty containers list — the same distinction /execute already makes."""

@@ -26,6 +26,25 @@
             "agents_platform_token is obtained automatically at activation and refreshed on a half-life schedule — set it by hand in Settings only to override with a different token",
             "agents_platform_base is resolved automatically (agents-platform.<your workspace domain>, or the public agents-platform.aw.tekflox.com) — set it by hand in Settings only to point at a different agents-platform-multitenant instance"
           ]
+        },
+        {
+          "type": "markdown",
+          "value": "### Notion Kanban webhook (step 4 — manual)\n\nThe Ready-card sweep above already picks up Ready cards every `kanban_sweep_interval_s` (60s by default, on by default from first install) — you do not need the webhook below for Ready cards to work. A push-based webhook can replace the sweep's polling delay with a near-instant one, but its *last* step can only be done by hand: Notion has no API to register a webhook subscription (developers.notion.com/reference/webhooks).\n\n1. Open [notion.so/profile/integrations](https://www.notion.so/profile/integrations) → the integration whose secret is saved in the **Notion** app's Settings.\n2. Go to its **Webhooks** tab → **Create a subscription**, and point it at this tenant's agents-platform-multitenant `/api/notion/webhook` endpoint.\n3. Notion sends a one-time `verification_token` delivery to that endpoint automatically — no action needed for that part.\n4. Copy the **Subscription ID** Notion's dashboard shows you (not the token) and paste it below, then click **Register mapping**. This is the automatable half: without it, agents-platform-multitenant refuses every delivery with 404 even after step 2 — it has no way to tell which Notion workspace/integration a subscription belongs to until this mapping exists. `workspace_id`/`integration_id` are looked up automatically from this workspace's own Notion connection; you only ever provide the subscription id."
+        },
+        {
+          "type": "form",
+          "id": "notion_subscription",
+          "submit": { "call": "POST /api/apps/agents-platform-runners/notion-subscription" },
+          "submit_label": "Register mapping",
+          "fields": [
+            {
+              "key": "subscription_id",
+              "label": "Notion subscription ID",
+              "input": "text",
+              "placeholder": "…",
+              "description": "From Notion's dashboard, step 4 above."
+            }
+          ]
         }
       ]
     }

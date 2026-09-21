@@ -160,6 +160,8 @@ def test_activate_registers_the_ensure_configured_watchdog(monkeypatch):
         plugin_mod.runner_registration_mod, "register_with_platform",
         lambda config: {"registered": {}})
     monkeypatch.setattr(plugin_mod.execute_secret_mod, "ensure_configured", lambda config: None)
+    monkeypatch.setattr(plugin_mod.kanban_sweep_default_mod, "ensure_default_applied",
+                        lambda config: None)
 
     class _StubRoutes:
         def register(self, app) -> None:

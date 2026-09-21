@@ -23,6 +23,7 @@ from fastapi import Body, Depends, FastAPI, File, Form, HTTPException, Request, 
 
 from . import execute as execute_mod
 from . import execution_index as execution_index_mod
+from . import notion_subscription as notion_subscription_mod
 from . import notion_token_sync as notion_token_sync_mod
 from . import observability_push as observability_push_mod
 from . import platform_base as platform_base_mod
@@ -39,7 +40,7 @@ _runner_status = runner_registration_mod.runner_status
 log = logging.getLogger("aw_apps.agents_platform_runners.routes")
 
 
-def build_routes(config: dict | None = None) -> FastAPI:
+def build_routes(config: dict | None = None, *, kanban_sweep_status: dict | None = None) -> FastAPI:
     """Mode-agnostic factory — call this fresh for each mode (plugin.py /
     __main__.py both call it exactly once).
 
@@ -55,6 +56,12 @@ def build_routes(config: dict | None = None) -> FastAPI:
     literal, a NEW dict) — use an explicit None-check instead."""
     app = FastAPI(title="agents-platform-runners")
     cfg = config if config is not None else {}
+    # Same identity rule as cfg above: plugin.py hands us its own
+    # self._kanban_sweep_status and mutates it in place from
+    # _register_kanban_sweep_watchdog — that registration runs once, at
+    # activate() time, after this factory has already built the /status
+    # closure below, so /status has to read a live reference, not a snapshot.
+    sweep_status = kanban_sweep_status if kanban_sweep_status is not None else {}
     execution_index_mod.configure(cfg)
 
     def require_execute_secret(request: Request) -> None:
@@ -85,6 +92,16 @@ def build_routes(config: dict | None = None) -> FastAPI:
         return {
             "agents_platform_base": platform_base_mod.resolve(cfg),
             "runners": {name: _runner_status(name) for name in RUNNERS},
+            "kanban_sweep": {
+                "enabled": bool(cfg.get("kanban_sweep_enabled")),
+                # Mirrors plugin.py's KANBAN_SWEEP_INTERVAL_S default — kept as
+                # a literal rather than an import to avoid a routes<->plugin
+                # cycle (plugin.py already imports this module).
+                "interval_s": cfg.get("kanban_sweep_interval_s") or 60.0,
+                "watchdog_registered": sweep_status.get("watchdog_registered", False),
+                "reason": sweep_status.get("reason"),
+            },
+            "notion_webhook": notion_subscription_mod.state(cfg),
         }
 
     @app.get("/warm-containers")
@@ -185,6 +202,28 @@ def build_routes(config: dict | None = None) -> FastAPI:
             return await asyncio.to_thread(notion_token_sync_mod.state, cfg)
         except notion_token_sync_mod.NotionTokenSyncError as exc:
             raise _notion_token_failure(exc) from exc
+
+    @app.post("/notion-subscription")
+    async def notion_subscription_register(data: dict = Body(...)) -> dict:
+        """Upsert agents-platform-multitenant's Notion-subscription mapping —
+        the automatable half of the Notion dashboard's manual step 4. See
+        notion_subscription.py's module docstring for the two-hop lookup
+        (aw-app-notion's bot identity, then AP-MT's own upsert) this wraps.
+
+        A human triggers this from this app's Settings screen after
+        completing step 4 by hand — not a watchdog tick — so a failure here
+        is surfaced as an HTTP error rather than logged and swallowed.
+        """
+        import asyncio
+
+        subscription_id = (data.get("subscription_id") or "").strip()
+        if not subscription_id:
+            raise HTTPException(400, "subscription_id is required")
+        try:
+            return await asyncio.to_thread(
+                notion_subscription_mod.register, cfg, subscription_id)
+        except notion_subscription_mod.NotionSubscriptionError as exc:
+            raise HTTPException(502, str(exc)) from exc
 
     # ------------------------------------------------------------------
     # AP-MT proxies for apps that have no AP-MT credential of their own.
