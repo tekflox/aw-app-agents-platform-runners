@@ -2,7 +2,7 @@
 repo: architecture
 path: docs/architecture/aw-app-agents-platform-runners.md
 source: generated
-edited: false
+edited: true
 checksum: sha256:5e0f72a6563d70d33424b1e2a4b74eeff730b16d432cf691c8ac6dd0122eb03d
 ---
 # Agents Platform Runners
@@ -18,9 +18,80 @@ Depends on the code-agent-clis app (claude/codex/copilot/cursor-agent already in
 - `http` → **aw-workspace** — routes mounted at /api/apps/agents-platform-runners
 - `other` → **aw-app-code-agent-clis** — This app doesn't install the CLIs itself — it depends on code-agent-clis having already put claude/codex/copilot/cursor-agent on /usr/local/bin, same path aw-workspace installs already reuse: one app owns installing each runner, this app just depends on that instead of re-implementing it
 - `other` → **aw-app-kb** — Optionally stores a bounded semantic index of completed execution dumps; runner delivery remains fail-open when KB is absent
+- `http` → **agents-platform-multitenant** — every MCP tool and the three proxy routes below call AP-MT with this app's own `agents_platform_token` (minted and rotated by `identity_token.py`); it is the only AP-MT credential in this workspace
 
 ## MCP tools
-_none exposed_
+
+`mcp_server.py` registers ~94 static tools plus one `agent_<slug>` /
+`workflow_<slug>` per active platform resource. The control-plane surface
+(agents, workflows, runs, targets, lessons, artefacts) is documented by the
+tool descriptions themselves; what follows is the one group that is **not**
+orchestration, and so is easy to lose track of.
+
+### Gallery (ported from `aw-app-crispal`, 2026-09-21)
+
+Reads the Agents Platform image gallery — the Telegram `/images` mini-app's
+uploads, plus images agents filed back — over AP-MT's identity-gated admin
+endpoints. Logic in `agents_platform_runners_app/gallery.py`, registration in
+`mcp_server.py`'s `static` list under `# ----- gallery -----`.
+
+| Tool | Does | AP-MT endpoint |
+|---|---|---|
+| `list_gallery_images` | Resolve upload blocks to image ids + fetchable URLs, filtered by `scope`/`block_id`/`tags`/`match`/`source` | `GET /api/admin/gallery/blocks` |
+| `list_gallery_tags` | The bot's tag vocabulary with per-tag image counts, derived from the same listing | `GET /api/admin/gallery/blocks` |
+| `set_gallery_tags` | Add tags to images by `image_ids` (additive, idempotent) | `POST /api/admin/gallery/token` once, then `POST /api/gallery/{token}/image/{id}/tag` |
+
+Two things about this group that are load-bearing:
+
+* **No file paths, only URLs.** The tools these replaced downloaded each image
+  and returned `file_paths` into the Crispal container's disk. This MCP runs
+  as a stdio child inside the **aw-mcp-gateway** container, which shares no
+  writable directory with the Crispal container or with an agent container —
+  a path from here would name a file nobody else can open. `images[].url` /
+  `image_urls` are per-image capability URLs, fetchable with no Authorization
+  header of their own.
+* **`set_gallery_tags` mints, it does not write directly.** AP-MT has no
+  tag-write endpoint behind `require_tenant_or_service`; the write path is
+  keyed on a `GalleryToken`. `POST /api/admin/gallery/token` exists precisely
+  to let a trusted workspace exchange its identity for one, and returns the
+  existing token while it has >7 days left, so minting is cheap and
+  idempotent. The token is cached per `bot_slug` for the life of the process
+  and re-minted on a 401.
+
+`bot_slug` is optional on all three tools, and omitting it means **every
+gallery this workspace owns**, not a hardcoded bot. The tools this ports from
+defaulted to the literal `aw-cris`; checked live on 2026-09-21, that bot does
+not exist on this deployment — all 345 blocks are under `cp-2` — so a
+no-argument call would have answered 200 with an empty list, which reads
+exactly like "you have no photos". An empty slug is not unscoped: the listing
+endpoint binds the caller's tenant, so "no bot filter" already means "this
+workspace's own galleries", and each returned block carries its own
+`bot_slug`. `set_gallery_tags` resolves each image's owning bot from the same
+listing when none is named, because a `GalleryToken` is bot-scoped.
+
+## Tier-1 routes
+
+Mounted at `/api/apps/agents-platform-runners` (see `routes.py`). Beyond
+`/status`, `/warm-containers`, `/register`, `/register-observability`,
+`/notion-token*`, `/execute` and `/abort`, three of them exist purely so
+another app can reach AP-MT **without holding an AP-MT credential of its
+own** — aw-app-crispal is the caller, over the workspace API key it already
+has. A missing `agents_platform_token` answers 503 (this side has nothing to
+present onward), an unreachable AP-MT 502, and AP-MT's own status code is
+passed through otherwise — never swallowed, because the caller of
+`/gallery/upload` is a queue worker that has to tell a refused upload from a
+successful one.
+
+| Route | Proxies to | Replaces, in aw-app-crispal |
+|---|---|---|
+| `POST /gallery/upload` (multipart: `bot_slug`, `source`, `files`) | `POST /api/admin/gallery/upload` | `gallery_http.file_images()` — the Arvin archive |
+| `GET /runs/{run_id}/initiator` | `GET /api/telegram/run-initiator/{run_id}` | `gallery_http.lookup_run_initiator()` — which chat to wake |
+| `POST /telegram/inject` (body passes through) | `POST /api/telegram/inject` | `_ap_inject_secret()` + its call site — the Arvin wake-up |
+
+The third also retires the recurring `AGENTS_TELEGRAM_INJECT_SECRET not found
+at /app/repos/agents-platform/.env` failure: `/inject` accepts the same
+`require_tenant_or_service` identity this app already holds, so no shared
+inject secret has to exist anywhere.
 
 ## Requirements
 ### O primeiro turno de uma conversa também roda quente, com sessão criada e não retomada

@@ -18,7 +18,8 @@ import logging
 import os
 import uuid
 
-from fastapi import Body, Depends, FastAPI, HTTPException, Request
+import httpx
+from fastapi import Body, Depends, FastAPI, File, Form, HTTPException, Request, UploadFile
 
 from . import execute as execute_mod
 from . import execution_index as execution_index_mod
@@ -184,6 +185,106 @@ def build_routes(config: dict | None = None) -> FastAPI:
             return await asyncio.to_thread(notion_token_sync_mod.state, cfg)
         except notion_token_sync_mod.NotionTokenSyncError as exc:
             raise _notion_token_failure(exc) from exc
+
+    # ------------------------------------------------------------------
+    # AP-MT proxies for apps that have no AP-MT credential of their own.
+    #
+    # aw-app-crispal used to hold three config fields (ap_gallery_base,
+    # ap_token, ap_inject_secret) to reach agents-platform-multitenant
+    # directly. None of them were ever declared in its config_schema, so they
+    # resolved empty and every one of those calls was dead — the Arvin
+    # archive, the Arvin wake-up, and the gallery tools alike. Rather than
+    # declare a second copy of a credential THIS app already mints and rotates
+    # (identity_token.py), the credential stays here and Crispal reaches AP-MT
+    # through these three thin proxies, over the workspace API key it already
+    # has (its `_workspace_api()`). See .tmp/gallery-migration/PLAN.md §2.
+    #
+    # Deliberately thin: no reshaping of request or response, and AP-MT's own
+    # status code is what the caller sees. A proxy that invents its own error
+    # vocabulary is a second place to debug.
+    # ------------------------------------------------------------------
+
+    def _ap_target() -> tuple[str, dict[str, str]]:
+        """(base_url, auth headers) for an AP-MT call made on this app's own
+        identity. A missing token is 503, not 401: the caller presented
+        perfectly good credentials to US — it is this app that has nothing to
+        present onward, and the fix is on this side (auto-mint hasn't run, or
+        aw-backend refused it)."""
+        token = str(cfg.get("agents_platform_token") or "").strip()
+        if not token:
+            raise HTTPException(
+                503, "this app holds no agents_platform_token — agents-platform "
+                     "cannot be called on its behalf (see identity_token.py's "
+                     "auto-mint, and this app's Settings)")
+        return platform_base_mod.resolve(cfg).rstrip("/"), {"Authorization": f"Bearer {token}"}
+
+    def _ap_answer(resp: httpx.Response, what: str) -> dict:
+        """AP-MT's body on success, AP-MT's status + body as an HTTPException
+        otherwise. Never swallows: the caller of /gallery/upload is a queue
+        worker that has to be able to tell "the gallery refused this" from
+        "the upload worked" — conflating them once already marked successful
+        Arvin jobs as crashed and replayed a 5-minute cycle."""
+        if resp.status_code >= 400:
+            raise HTTPException(resp.status_code, f"{what}: {resp.text[:500]}")
+        return resp.json()
+
+    def _ap_unreachable(what: str, exc: Exception) -> HTTPException:
+        return HTTPException(502, f"{what}: could not reach agents-platform — {exc}")
+
+    @app.post("/gallery/upload")
+    async def gallery_upload(bot_slug: str = Form(...), source: str = Form("agent"),
+                             files: list[UploadFile] = File(...)) -> dict:
+        """Proxy for AP-MT's `POST /api/admin/gallery/upload` — file generated
+        images into the gallery so the GALLERY owns the bytes, rather than a
+        row pointing at a disk only the producer can read."""
+        base, headers = _ap_target()
+        parts = [("files", (f.filename or "image", await f.read(),
+                            f.content_type or "application/octet-stream"))
+                 for f in files]
+        try:
+            async with httpx.AsyncClient(timeout=120) as client:
+                resp = await client.post(f"{base}/api/admin/gallery/upload",
+                                         data={"bot_slug": bot_slug, "source": source},
+                                         files=parts, headers=headers)
+        except httpx.HTTPError as exc:
+            raise _ap_unreachable("gallery upload", exc) from exc
+        return _ap_answer(resp, "gallery upload")
+
+    @app.get("/runs/{run_id}/initiator")
+    async def run_initiator(run_id: str) -> dict:
+        """Proxy for AP-MT's `GET /api/telegram/run-initiator/{run_id}` — the
+        (initiator_kind, initiator_id) an unattended job needs to know which
+        chat to wake when it finishes. Not `/api/runs/{id}`: that one is
+        behind a person's identity gate, which is what 401'd in silence for
+        13 finished Arvin cycles."""
+        base, headers = _ap_target()
+        try:
+            async with httpx.AsyncClient(timeout=20) as client:
+                resp = await client.get(f"{base}/api/telegram/run-initiator/{run_id}",
+                                        headers=headers)
+        except httpx.HTTPError as exc:
+            raise _ap_unreachable("run-initiator lookup", exc) from exc
+        return _ap_answer(resp, "run-initiator lookup")
+
+    @app.post("/telegram/inject")
+    async def telegram_inject(body: dict = Body(...)) -> dict:
+        """Proxy for AP-MT's `POST /api/telegram/inject` — put a synthetic
+        message into an existing (bot, chat) session, the mechanism a
+        background job uses to tell the agent that asked for it that the work
+        is done. The body passes through untouched; AP-MT owns its schema.
+
+        This also retires the recurring `AGENTS_TELEGRAM_INJECT_SECRET not
+        found at /app/repos/agents-platform/.env` failure (2026-08-13 onward):
+        /inject accepts the same `require_tenant_or_service` identity this app
+        already holds, so no shared inject secret needs to exist anywhere."""
+        base, headers = _ap_target()
+        try:
+            async with httpx.AsyncClient(timeout=30) as client:
+                resp = await client.post(f"{base}/api/telegram/inject",
+                                         json=body, headers=headers)
+        except httpx.HTTPError as exc:
+            raise _ap_unreachable("telegram inject", exc) from exc
+        return _ap_answer(resp, "telegram inject")
 
     @app.post("/execute", dependencies=[Depends(require_execute_secret)])
     async def execute_job(request: Request) -> dict:
