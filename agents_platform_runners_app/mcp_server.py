@@ -83,6 +83,30 @@ BASE = os.environ.get("AGENTS_BASE", "http://127.0.0.1:8765")
 # "no third-party imports" property.
 from . import kanban_dispatch  # noqa: E402
 
+# The Agents Platform image gallery. Same split as kanban_dispatch above and
+# for the same reason: the network logic does not belong in this file, the
+# tool REGISTRY does — taking the Tool(...)/`if name ==` pair out of here is
+# what makes the namespace ungreppable. stdlib + httpx only, like everything
+# this process imports.
+from . import gallery as gallery_mod  # noqa: E402
+
+# What `bot_slug` means when the caller omits it: EVERY bot this workspace's
+# identity can see, not a hardcoded one.
+#
+# The tools this ports from defaulted to the literal "aw-cris". Checked live
+# on 2026-09-21 against this deployment's own gallery: that bot does not exist
+# here — 345 blocks, all under `cp-2` — so a no-argument
+# `list_gallery_images()` would have answered `{"images": []}` with a 200 and
+# no error, which is indistinguishable from "you have no photos". The old
+# default was never wrong out loud only because the whole HTTP path was dead
+# (PLAN.md §0), so nothing ever called it.
+#
+# An empty slug is not unscoped: `/api/admin/gallery/blocks` is behind
+# `require_tenant_or_service`, which binds the caller's tenant, so "no bot
+# filter" already means "this workspace's own galleries". Each returned block
+# carries `bot_slug` for a tenant running more than one.
+DEFAULT_GALLERY_BOT_SLUG = ""
+
 _BOARD: "kanban_dispatch.BoardClient | None" = None
 
 
@@ -1749,6 +1773,100 @@ async def _list_tools() -> list[Tool]:
                           "properties": {"run_id": {"type": "string"},
                                          "name": {"type": "string"}},
                           "required": ["run_id", "name"]}),
+
+        # ----- gallery -----
+        # Images a user uploaded through the Telegram /images mini-app (or an
+        # agent filed back), read from AP-MT's identity-gated admin endpoints
+        # with the identity token this app already holds. Ported out of the
+        # aw-crispal MCP on 2026-09-21 — see gallery.py's docstring for why,
+        # and for why these return URLs where the old tools returned paths.
+        Tool(name="list_gallery_images",
+             description=("Deterministic image intake: resolve gallery upload blocks "
+                          "(created via the Telegram /images link + webapp) to image "
+                          "ids and fetchable URLs. No image bytes ever enter this "
+                          "call's response. Use this instead of asking the user to "
+                          "re-send photos inline. Optionally filter by tag (e.g. 'me "
+                          "dá as imagens de inverno') — call list_gallery_tags first "
+                          "if you need to know what tags exist. Each returned block "
+                          "also carries `source`, so you can tell a user upload apart "
+                          "from an agent-generated post (filter with the `source` "
+                          "param, e.g. 'só as fotos que o Arvin gerou' -> "
+                          "source='arvin').\n\n"
+                          "Returns `images` (each with `id` — what set_gallery_tags "
+                          "takes — plus `url`, `block_id`, `original_name`, `mime`, "
+                          "`bytes`, `created_at`, `tags`) and `image_urls`, the same "
+                          "URLs flat and in the same order. There are NO local file "
+                          "paths: this MCP runs in a different container from every "
+                          "consumer, so a path here would name a file nobody else can "
+                          "open. Put an `url` in a `[[ATTACH: ...]]` marker to send an "
+                          "image back to the user; hand one to a tool that wants an "
+                          "image (e.g. crispal's `arvin`) as `image_url`."),
+             inputSchema={"type": "object", "properties": {
+                 "scope": {"type": "string",
+                           "enum": ["last_block", "block", "since_block", "all"],
+                           "description": (
+                               "last_block = only the most recent upload block; block = "
+                               "one specific block_id; since_block = that block_id "
+                               "onward; all = every block in the selected gallery. "
+                               "Optional when `tags` is given — defaults to 'all' (tag "
+                               "queries are inherently cross-block); otherwise defaults "
+                               "to 'last_block'.")},
+                 "block_id": {"type": "string",
+                              "description": "Required for scope=block or scope=since_block."},
+                 "bot_slug": {"type": "string",
+                              "description": ("Restrict to one bot's gallery. Omit for every "
+                                              "gallery this workspace owns — each block "
+                                              "carries its own `bot_slug`.")},
+                 "tags": {"type": "array", "items": {"type": "string"},
+                          "description": ("Filter to images carrying these tags (names, "
+                                          "normalized internally, e.g. 'inverno').")},
+                 "match": {"type": "string", "enum": ["any", "all"],
+                           "description": ("any (default) = image has at least one of "
+                                           "`tags`; all = image has every tag in `tags`.")},
+                 "source": {"type": "string",
+                            "description": (
+                                "Filter blocks to a single origin. Known values: "
+                                "'upload' (user, via the /images mini-app), "
+                                "'telegram_inbound' (user, an image attached inline in "
+                                "the chat), 'arvin' (agent — filed back by an Arvin "
+                                "generation cycle), 'agent' (agent — generic "
+                                "agent-filed upload). Omit to return blocks from every "
+                                "source.")},
+             }}),
+        Tool(name="list_gallery_tags",
+             description=("List every tag in a bot's gallery vocabulary (with image "
+                          "counts), so you know what's available before answering or "
+                          "filtering list_gallery_images by tag. No image bytes in the "
+                          "response."),
+             inputSchema={"type": "object", "properties": {
+                 "bot_slug": {"type": "string",
+                              "description": ("Restrict to one bot's gallery. Omit for every "
+                                              "gallery this workspace owns — each block "
+                                              "carries its own `bot_slug`.")},
+             }}),
+        Tool(name="set_gallery_tags",
+             description=("Set (add) tags on a list of gallery images, identified by "
+                          "the `images[].id` values returned by list_gallery_images "
+                          "(NOT file paths — there are none). Creates any tag name "
+                          "that doesn't exist in the bot's vocabulary yet, then links "
+                          "every given tag to every given image (idempotent — "
+                          "re-applying an existing tag is a no-op). Does not remove "
+                          "existing tags.\n\n"
+                          "Returns `{tagged_images, tags_applied, missing_image_ids}` "
+                          "— `missing_image_ids` lists ids this bot does not own (wrong "
+                          "id, or another bot's image); the rest are still tagged."),
+             inputSchema={"type": "object", "properties": {
+                 "image_ids": {"type": "array", "items": {"type": "string"},
+                               "description": ("Ids of the images to tag, as returned in "
+                                               "`images[].id` by list_gallery_images.")},
+                 "tags": {"type": "array", "items": {"type": "string"},
+                          "description": ("Tag names to apply to every image in "
+                                          "`image_ids` (normalized internally).")},
+                 "bot_slug": {"type": "string",
+                              "description": ("Restrict to one bot's gallery. Omit for every "
+                                              "gallery this workspace owns — each block "
+                                              "carries its own `bot_slug`.")},
+             }, "required": ["image_ids", "tags"]}),
     ]
 
     # Dynamic per-resource runners (blocking; poll variants live above).
@@ -2809,6 +2927,35 @@ async def _call_tool(name: str, arguments: dict[str, Any] | None) -> list[TextCo
         if name == "delete_run_artefact":
             r = await c.delete(f"{BASE}/api/runs/{args['run_id']}/artefacts/{args['name']}")
             return _err(r.status_code, r.text) if r.status_code != 200 else _ok(r.json())
+
+        # --- gallery ---
+        # `c` already carries AUTH_HEADERS, i.e. this app's agents_platform_token,
+        # which is exactly what AP-MT's admin gallery routes accept
+        # (require_tenant_or_service) — no second client, no second credential.
+        if name in ("list_gallery_images", "list_gallery_tags", "set_gallery_tags"):
+            bot_slug = args.get("bot_slug") or DEFAULT_GALLERY_BOT_SLUG
+            try:
+                if name == "list_gallery_tags":
+                    return _ok(await gallery_mod.list_tags(c, BASE, bot_slug))
+                if name == "set_gallery_tags":
+                    return _ok(await gallery_mod.set_tags(
+                        c, BASE, bot_slug,
+                        args.get("image_ids") or [], args.get("tags") or []))
+                tags = args.get("tags") or []
+                match = args.get("match") or "any"
+                if match not in ("any", "all"):
+                    return _err(400, f"match={match!r} must be 'any' or 'all'")
+                # Same default as the tool this replaces: a tag query is
+                # inherently cross-block, so asking for one implies `all`.
+                scope = args.get("scope") or ("all" if tags else "last_block")
+                block_id = args.get("block_id")
+                if scope in ("block", "since_block") and not block_id:
+                    return _err(400, f"scope={scope!r} requires block_id")
+                return _ok(await gallery_mod.list_images(
+                    c, BASE, bot_slug, scope, block_id, tags, match,
+                    source=args.get("source") or ""))
+            except gallery_mod.GalleryError as exc:
+                return _err(exc.status, exc.message)
 
         # --- dynamic per-resource runners (blocking) ---
         if name.startswith("agent_"):

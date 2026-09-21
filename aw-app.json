@@ -111,6 +111,11 @@
         "id": "aw-agents-flow",
         "path": "skills/aw-agents-flow/SKILL.md",
         "description": "The Agents Flow handoff contract \u2014 the three terminal actions (run_agent_async / return_to_caller_agent / mark_flow_done) an agent must end its turn with when it is a node in an enabled flow. agents-platform's executor auto-injects this skill at dispatch, so it must exist in the workspace skills tree or every flow agent runs without the contract and gets escalated to a human."
+      },
+      {
+        "id": "aw-image-gallery",
+        "path": "skills/aw-image-gallery/SKILL.md",
+        "description": "A Galeria de Imagens da Agents Platform (mini-app Telegram /images) lida pelas tools list_gallery_images / list_gallery_tags / set_gallery_tags deste MCP \u2014 puxar fotos que o usu\u00e1rio j\u00e1 enviou sem pedir reenvio, filtrar por tag, marcar tags. Migrada do app aw-crispal em 21/09/2026 junto com as tools; documenta os nomes novos por tipo de sess\u00e3o e o facto de o retorno ser s\u00f3 URLs, nunca caminhos de ficheiro."
       }
     ],
     "agents": {
