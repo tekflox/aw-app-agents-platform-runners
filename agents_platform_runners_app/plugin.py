@@ -365,11 +365,20 @@ class AgentsPlatformRunnersAppPlugin:
         client = skills_sync_mod.SkillsSyncClient(base=base, token=token, workspace=workspace)
 
         async def _delta() -> None:
+            # Re-read the live token on every tick instead of trusting the
+            # one `client` was constructed with — this closure is created
+            # once at activate() time and, unlike _refresh/_reassert/_ensure
+            # below, used to never look at self._live_config again, so a
+            # token rotated after activation silently 401'd this worker's
+            # skills sync forever. See the card this fixes for the live
+            # 23/22-consecutive-401 evidence.
+            client.token = self._live_config.get("agents_platform_token") or client.token
             result = await asyncio.to_thread(client.sync_incremental)
             log.info("skills_sync delta: %s", result)
 
         async def _reconcile() -> None:
             try:
+                client.token = self._live_config.get("agents_platform_token") or client.token
                 result = await asyncio.to_thread(client.sync_full)
                 log.info("skills_sync reconcile: %s", result)
             finally:
@@ -455,7 +464,10 @@ class AgentsPlatformRunnersAppPlugin:
             import httpx
 
             board = kanban_dispatch_mod.BoardClient(base_url=board_url)
-            platform_headers = {"Authorization": f"Bearer {token}"}
+            # Same live-read fix as the skills watchdog above — `token` in
+            # this closure's enclosing scope is frozen at registration time.
+            live_token = self._live_config.get("agents_platform_token") or token
+            platform_headers = {"Authorization": f"Bearer {live_token}"}
             try:
                 async with httpx.AsyncClient(timeout=30, headers=platform_headers) as c:
                     result = await kanban_dispatch_mod.sweep_ready(
@@ -501,8 +513,24 @@ class AgentsPlatformRunnersAppPlugin:
                 self._live_config["agents_platform_token"] = refreshed
                 log.info("identity_token: refreshed agents_platform_token")
 
+        # run_immediately=True: WatchdogSupervisor.resume() (src/apps/
+        # watchdog.py) restarts a run_immediately=False task's sleep-then-
+        # tick loop from scratch on every RedisLease("core") leadership
+        # handoff — the 6h clock resets to zero on acquisition, not on the
+        # token's real age. RedisLease's 15s TTL/5s renew means leadership
+        # migrates on ordinary Redis blips, so a freshly-promoted leader
+        # whose own cached agents_platform_token is already stale would push
+        # that stale value to agents-platform-multitenant via the 120s
+        # runner-registration-reassert watchdog immediately, then not
+        # independently re-check staleness for up to a further 6h — any
+        # /execute dispatch AP-MT makes in that window 401s. needs_refresh()
+        # is cheap and no-ops when the token isn't actually due, so checking
+        # immediately on every leader acquisition costs nothing in the
+        # steady state. See the card this fixes for the live evidence
+        # (a worker whose identity-token-refresh had last_run: null while
+        # its skills-sync tasks were already failing).
         ctx.watchdog.register("identity-token-refresh", _refresh, IDENTITY_TOKEN_INTERVAL_S,
-                              run_immediately=False)
+                              run_immediately=True)
         log.info("identity_token: watchdog registered (every %.0fs)", IDENTITY_TOKEN_INTERVAL_S)
 
     def _register_runner_registration_watchdog(self, ctx, config: dict) -> None:
