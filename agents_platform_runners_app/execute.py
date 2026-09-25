@@ -971,6 +971,43 @@ def _publish_done(r, run_id: str, returncode: int) -> None:
         log.exception("execute: publish_done failed run=%s", run_id)
 
 
+def _hard_kill_key(run_id: str) -> str:
+    # Bare "run:{run_id}:..." on purpose, unprefixed like `_stream_key` above —
+    # this is agents-platform-multitenant's OWN key
+    # (`redis_streams._hard_kill_key`), read by its `lookup_hard_kill` at
+    # finalisation. Both sides share this Redis db; mirrored key-for-key so
+    # this process can write the fact directly instead of relaying it back
+    # over the /abort HTTP response.
+    return f"run:{run_id}:hard_kill"
+
+
+def _mark_hard_kill(r, run_id: str) -> None:
+    """Tell AP-MT's `lookup_hard_kill` that this run's container was really
+    signalled — written HERE, before the kill goes out, instead of leaving
+    AP-MT's own `kill_run` to write it after this /abort call's HTTP response
+    gets back to it.
+
+    That HTTP round trip is not the fast path: the kill below makes this run's
+    container exit, which (warm path, right below; cold path, the exit
+    monitor) publishes the stream's 'done' sentinel that AP-MT's OWN
+    finalisation is already waiting on directly over the same shared Redis —
+    no network hop needed for that side. A live incident measured
+    finalisation committing `status` ~60ms before the HTTP response even
+    started AP-MT's write of the hard-kill marker, so a marker written only
+    after the round trip completes is provably too late to be read at
+    finalisation. Written before the kill signal goes out so it can only ever
+    be visible earlier than that stream event, never later.
+    """
+    if r is None:
+        return
+    try:
+        r.set(_hard_kill_key(run_id), "1", ex=ABORT_REGISTRY_TTL_S)
+    except Exception:
+        log.warning("execute: could not record the hard-kill marker for run=%s — "
+                    "its AP-MT-side reply may still be mislabelled success",
+                    run_id, exc_info=True)
+
+
 def _sync_home_creds_into_workspace(real_home: Path, spec: dict) -> None:
     """Best-effort ``cp -a``-equivalent of this CLI's creds_dir/creds_file
     from the process's real ``$HOME`` into ``WORKSPACE_CONTAINER_DIR`` — see
@@ -2724,6 +2761,9 @@ def abort_job(run_id: str, redis_url: str | None = None, *,
             except Exception:
                 continue
             log.info("execute: abort run=%s — killing container %s (%s)", run_id, name, source)
+            # Before the signal, not after: see _mark_hard_kill's own docstring
+            # for why the ordering (not just the fact) is the point.
+            _mark_hard_kill(r, run_id)
             try:
                 container.kill()
             except Exception:

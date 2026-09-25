@@ -110,6 +110,9 @@ def engine(monkeypatch):
             #: is how the "flag set BEFORE the kill" contract is asserted
             #: rather than assumed.
             self.abort_flag_at_kill: list[bool] = []
+            #: Same idea for AP-MT's own hard-kill marker (`lookup_hard_kill`'s
+            #: key) — sampled at the instant each kill was issued.
+            self.hard_kill_at_kill: list[bool] = []
             self.redis: _FakeRedis | None = None
             self.run_id = ""
 
@@ -126,6 +129,9 @@ def engine(monkeypatch):
             def _kill():
                 engine.abort_flag_at_kill.append(
                     execute_mod.is_aborted(engine.redis, engine.run_id))
+                engine.hard_kill_at_kill.append(
+                    bool(engine.redis and engine.redis.get(
+                        execute_mod._hard_kill_key(engine.run_id))))
                 original_kill()
 
             container.kill = _kill
@@ -275,6 +281,75 @@ def test_the_flag_is_set_even_when_nothing_was_found(engine, monkeypatch):
     execute_mod.abort_job("run-7", "redis://fake")
 
     assert execute_mod.is_aborted(r, "run-7") is True
+
+
+# ---------------------------------------------------------------------------
+# The hard-kill marker — written before the kill, key-for-key with AP-MT
+# ---------------------------------------------------------------------------
+#
+# Kanban reliability:hard-killed-run-reports-success-to-callback: AP-MT's own
+# `kill_run` only wrote this marker AFTER `abort_on_runner`'s full HTTP round
+# trip returned — by which point the killed container's stream 'done' event
+# (this same abort_job call, warm path below; the exit monitor, cold path)
+# had already reached AP-MT's finalisation over the shared Redis Stream both
+# sides already read/write directly, no network hop needed. A live incident
+# measured the Run row committing `status` ~60ms before AP-MT's own marker
+# write even started. Fix: this process writes the marker itself, before the
+# kill signal goes out — so it is provably visible no later than the stream
+# event that races it, not causally downstream of a response this run's own
+# finalisation was never going to wait for anyway.
+
+def test_the_hard_kill_marker_uses_ap_mts_own_key_scheme():
+    """Bare `run:{id}:hard_kill`, unlike this app's own `runner:`-namespaced
+    abort flag — it has to collide ON PURPOSE with the key
+    `redis_streams._hard_kill_key` in agents-platform-multitenant reads,
+    exactly like `_stream_key` already does for the events stream.
+
+    Mutation: namespace this key (e.g. `runner:run:{id}:hard_kill`) and AP-MT's
+    `lookup_hard_kill` stops ever seeing it.
+    """
+    assert execute_mod._hard_kill_key("x") == "run:x:hard_kill"
+
+
+def test_the_hard_kill_marker_is_set_before_the_container_is_killed(engine, monkeypatch):
+    """THE fix. Mutation: move `_mark_hard_kill` after the kill loop (or drop
+    it) and this fails — the marker would then only ever be written after the
+    kill's own side effects (the stream's 'done' sentinel) are already on
+    their way to AP-MT's finalisation, reproducing the exact race this card
+    reports.
+    """
+    execute_mod._RUN_CONTAINER_NAMES["run-hk-1"] = "aw-runner-run-run-hk-1"
+    engine.alive.add("aw-runner-run-run-hk-1")
+
+    _abort(engine, monkeypatch, "run-hk-1")
+
+    assert engine.hard_kill_at_kill == [True], \
+        "AP-MT's hard-kill marker must already be set when the kill fires"
+
+
+def test_the_hard_kill_marker_is_readable_by_ap_mts_own_lookup_shape(engine, monkeypatch):
+    """Not just "some key got set" — the exact value/TTL shape AP-MT's
+    `redis_streams.lookup_hard_kill` expects (`bool(r.get(key))` truthy)."""
+    execute_mod._RUN_CONTAINER_NAMES["run-hk-2"] = "aw-runner-run-run-hk-2"
+    engine.alive.add("aw-runner-run-run-hk-2")
+
+    _result, r = _abort(engine, monkeypatch, "run-hk-2")
+
+    assert bool(r.get(execute_mod._hard_kill_key("run-hk-2"))) is True
+
+
+def test_the_hard_kill_marker_is_not_set_when_nothing_was_found(engine, monkeypatch):
+    """The race this whole effort started from: the run finished a moment
+    before the abort reached it. Nothing was cut short, so AP-MT's
+    cancel-grace must still see no marker and let the answer stand.
+
+    Mutation: set the marker unconditionally (e.g. alongside `mark_aborted`,
+    which DOES fire even for a miss) and a perfectly complete answer starts
+    being labelled cancelled.
+    """
+    _result, r = _abort(engine, monkeypatch, "run-hk-3")
+
+    assert r.get(execute_mod._hard_kill_key("run-hk-3")) is None
 
 
 def test_the_codex_retry_loop_does_not_respawn_an_aborted_run(monkeypatch):
