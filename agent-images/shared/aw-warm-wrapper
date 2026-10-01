@@ -72,17 +72,34 @@ RELAY_PID=$!
 touch "$RUNDIR/ready"
 echo "aw-warm-wrapper: ready, claude pid=$CLAUDE_PID relay pid=$RELAY_PID" >&2
 
-# 6h TTL backstop (design constraint: enforced INSIDE the container so it's a
-# zero-actor safety net that works even if all the epoch-hash/ownership
-# tracking on the agents-platform side fails completely). A direct kill of
-# OUR OWN child process — not `docker kill`/`docker stop` from the outside,
-# so this is unrelated to (and must never be confused with) the graceful
-# drain path below or with kill_run (cli.py:84, the actual abort mechanism).
+# 30-min TTL backstop (design constraint: enforced INSIDE the container so
+# it's a zero-actor safety net that works even if all the epoch-hash/
+# ownership tracking on the agents-platform side fails completely). Two
+# stages, both self-contained here — neither is `docker kill`/`docker stop`
+# from the outside, so both stay unrelated to (and must never be confused
+# with) kill_run (cli.py:84, the actual abort mechanism):
+#   1. At the TTL mark, touch the SAME drain flag the graceful poll loop
+#      below already watches. That loop only closes fd 3 once claude is done
+#      with whatever turn (if any) it is mid-way through — an uncapped wait
+#      by construction — so this is what keeps the TTL from ever
+#      interrupting a turn in progress, exactly like a host-triggered drain.
+#   2. If claude is STILL running warm_pool.DRAIN_GRACE_S (3600s) after that
+#      — a wedged poll loop, or this container's own drain flag never
+#      getting noticed — a direct kill of OUR OWN child process is the
+#      last-resort backstop that guarantees the container cannot outlive its
+#      TTL indefinitely. Without this stage a wedged container would keep
+#      passing `_is_running()` in warm_pool.get_or_create() and be reused
+#      forever, silently defeating the TTL.
 # Closes its inherited fifo fds immediately (see the comment above the
 # claude/relay backgrounding) — this subshell doesn't touch either FIFO, but
 # without closing them it would otherwise sit on a leaked writer for the
-# entire 6h TTL, silently defeating drain().
-( exec 3<&- 4<&- 4>&- 5<&-; sleep 21600; kill "$CLAUDE_PID" 2>/dev/null || true ) &
+# entire TTL, silently defeating drain().
+( exec 3<&- 4<&- 4>&- 5<&-
+  sleep 1800
+  touch "$RUNDIR/drain"
+  sleep 3600
+  kill "$CLAUDE_PID" 2>/dev/null || true
+) &
 TTL_WATCHER_PID=$!
 
 # Graceful drain: poll (~15s, matching the idle-tick cadence in the design)

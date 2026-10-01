@@ -9,7 +9,7 @@ payload shape branches on `cli`.
 
 Ported from agents-platform-multitenant's ``backend/app/core/warm_pool.py``
 (read that file's docstring for the full design rationale: session-keyed
-containers, epoch/generation invalidation, drain-not-kill semantics, 6h
+containers, epoch/generation invalidation, drain-not-kill semantics, 30-min
 in-container TTL self-destruct). The DESIGN is reused as-is — this file only
 translates the docker-ACCESS mechanism to match this app's own substrate:
 
@@ -57,11 +57,13 @@ SESSION_ID_LABEL = "aw.session_id"
 EPOCH_LABEL = "aw.epoch"
 CLI_LABEL = "aw.cli"
 
-# Same 6h backstop as agents-platform's warm_pool.py — enforced INSIDE the
-# container by aw-warm-wrapper itself (its own TTL watcher subshell); this
-# constant exists here only for callers/tests to reference the same number,
-# never polled or enforced from out here.
-WARM_TTL_S = 21600
+# Warm container lifetime — enforced INSIDE the container by aw-warm-wrapper
+# / aw-warm-wrapper-codex itself (their own TTL watcher subshell, which
+# drains gracefully at this mark rather than killing — see those scripts);
+# this constant exists here only for callers/tests to reference the same
+# number, never polled or enforced from out here. Reduced from the original
+# 6h (21600) to 30 min on 2026-09-30 per product request.
+WARM_TTL_S = 1800
 
 # Grace the HOST-side TTL backstop in reap() gives the in-container watcher
 # before stepping in: it condemns at WARM_TTL_S + WARM_TTL_SLACK_S, never at
@@ -656,7 +658,7 @@ def get_or_create(*, client, agent_id: str, session_id: str, epoch_hash: str,
     container, so the next turn gets a brand-new CLI process. That is the
     only lever there is over a dead MCP client: the clients are built once,
     when the CLI starts, and nothing re-initialises them for the container's
-    whole 6h life. "drain" leaves the old container to finish on its own;
+    whole (up to 30 min) life. "drain" leaves the old container to finish on its own;
     "force" removes it now, for a process too wedged to notice a drain flag.
     Neither is reachable while a turn is in flight — this runs BEFORE the
     turn is fed in — which is what keeps aw-warm-relay.py, and therefore the
@@ -756,7 +758,7 @@ def _with_claude_turn_context(prompt: str, run_id: str, notion_task_id: str | No
     by merging ``turn_env`` into the fresh subprocess env `aw-warm-relay-codex.py`
     spawns for every turn — real, because codex re-execs `codex exec resume` per
     turn. claude has no equivalent: `aw-warm-wrapper` spawns ONE claude process for
-    the container's whole (up to 6h) life, so nothing can push an updated
+    the container's whole (up to 30 min) life, so nothing can push an updated
     NOTION_TASK_ID/AW_RUN_ID/AW_SOURCE_DEVICE into its OS environment after turn 1 —
     a process's env is fixed at exec() time, and there is no live-patch mechanism
     for it. `turn_env` (written above, every turn) has no reader on the claude side

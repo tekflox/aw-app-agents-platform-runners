@@ -52,8 +52,18 @@ echo "$RELAY_PID" > "$RUNDIR/codex.pid"
 touch "$RUNDIR/ready"
 echo "aw-warm-wrapper-codex: ready, relay pid=$RELAY_PID" >&2
 
-# 6h TTL backstop — same constant/reasoning as aw-warm-wrapper's own watcher.
-( exec 3<&- 5<&-; sleep 21600; kill "$RELAY_PID" 2>/dev/null || true ) &
+# 30-min TTL backstop — same two-stage graceful-drain-then-backstop-kill
+# reasoning as aw-warm-wrapper's own watcher (see that script's comment for
+# the full rationale): touch the drain flag at the TTL mark so the poll loop
+# below closes fd 3 only once the relay is between turns, then fall back to
+# a direct kill of our own child DRAIN_GRACE_S (3600s) later if it is still
+# wedged, so a stuck relay can't keep this container alive past its TTL.
+( exec 3<&- 5<&-
+  sleep 1800
+  touch "$RUNDIR/drain"
+  sleep 3600
+  kill "$RELAY_PID" 2>/dev/null || true
+) &
 TTL_WATCHER_PID=$!
 
 # Graceful drain — same polling contract as aw-warm-wrapper. Closing fd 3
