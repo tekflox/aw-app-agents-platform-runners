@@ -105,7 +105,7 @@ def test_ordinary_turn_reuses_the_container(warm):
 
 def test_reconnect_mcp_replaces_a_healthy_container(warm):
     """The cheapest level. An MCP client is constructed once, at CLI start,
-    and nothing re-initialises it for that container's whole 6h life — so a
+    and nothing re-initialises it for that container's whole 30-min life — so a
     new PROCESS is the only lever there is, even though this container is
     running and its epoch matches."""
     client, log, name = warm

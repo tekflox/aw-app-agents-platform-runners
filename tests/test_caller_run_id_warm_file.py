@@ -1,7 +1,7 @@
 """mcp_server._caller_run_id() (commit f0d1bef, 2026-08-29).
 
 In warm mode this MCP server is a single stdio subprocess kept alive for a
-container's whole 6h TTL — its own os.environ and any header baked into its
+container's whole 30-min TTL — its own os.environ and any header baked into its
 mcp.json are fixed at turn 1 and never refresh. Before this fix,
 _caller_run_id() read _gateway_caller_run_id (from the X-Aw-Caller-Run-Id
 header) or AW_RUN_ID as a fallback — both permanently pinned to turn 1's run,

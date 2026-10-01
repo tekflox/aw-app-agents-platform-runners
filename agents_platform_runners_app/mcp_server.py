@@ -1113,7 +1113,7 @@ async def _list_tools() -> list[Tool]:
                           "container returned the full list. An MCP client is built once, "
                           "when the CLI process starts, and nothing ever re-initialises "
                           "it — so a client that failed at startup stays dead for that "
-                          "container's entire 6h life. Only a new CLI process fixes it.\n\n"
+                          "container's entire (up to 30-min) life. Only a new CLI process fixes it.\n\n"
                           "This does NOT act mid-turn. It is applied right before your "
                           "NEXT turn in this session, exactly like clear_session/"
                           "compact_session — so this turn's reply is delivered first, and "
@@ -2114,7 +2114,7 @@ def _caller_run_id(args: dict) -> str | None:
     Three sources, in order:
     1. The warm-container turn file, when it exists. This process (the MCP
        server) is a single subprocess kept alive for the container's whole
-       warm lifetime (6h TTL) — its own os.environ and any header baked into
+       warm lifetime (30-min TTL) — its own os.environ and any header baked into
        its mcp.json at launch are fixed at turn 1 and never refresh, but the
        CLI process itself never restarts either, so nothing re-reads them.
        warm_pool.dispatch_turn() writes this file fresh at the START of

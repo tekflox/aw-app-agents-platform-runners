@@ -6,7 +6,7 @@ things that ever called `warm_pool.bump_generation()` were this app's own
 `activate()` and `on_config_saved()`. Installing, updating or uninstalling
 ANOTHER app changes the tool list every warm container's CLI process built
 its MCP clients against — once, at process start, with nothing
-re-initialising them for the container's whole 6h life — and nothing told
+re-initialising them for the container's whole (up to 30-min) life — and nothing told
 this app that happened. The 2026-08-30 incident is the live case: a shipped
 tool stayed invisible to every running session until a human recycled things
 by hand.

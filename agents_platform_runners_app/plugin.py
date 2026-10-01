@@ -828,8 +828,8 @@ class AgentsPlatformRunnersAppPlugin:
 
         That surface is exactly what a warm container's CLI process built its
         MCP clients against — once, at process start, with nothing
-        re-initialising them for the container's whole 6h life (see
-        :func:`warm_pool.reuse_or_drain`). So a warm container spawned before
+        re-initialising them for the container's whole (up to 30-min) life
+        (see :func:`warm_pool.reuse_or_drain`). So a warm container spawned before
         the change keeps serving the old tool list until something condemns
         it, which until this hook existed was a human noticing and recycling
         the session by hand.
