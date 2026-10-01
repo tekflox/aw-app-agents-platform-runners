@@ -2,7 +2,7 @@
   "manifest_version": 1,
   "id": "agents-platform-runners",
   "name": "Agents Platform Runners",
-  "version": "0.161.0",
+  "version": "0.162.0",
   "description": "Depends on the code-agent-clis app (claude/codex/copilot/cursor-agent already installed at /usr/local/bin, single source of truth) so this workspace's agent-CLI runners are what agents-platform-multitenant's agent sessions use, and contributes the ported \"aw-agents\" MCP (agent_mcp.py) so agents-platform is controllable as MCP tools from this workspace.",
   "tier": "inprocess",
   "requires_ui_refresh": false,
@@ -1076,7 +1076,7 @@
         "default": 40,
         "minimum": 1,
         "title": "Max warm containers",
-        "description": "Hard ceiling on how many warm containers may be alive at once. When the pool is full, a dispatch that would need a NEW container falls back to the per-turn cold path instead of being refused — a session that already HAS its container always keeps it, however full the pool is. Exists because there was previously no bound of any kind: each warm container holds a live CLI process at ~145MB, and a caller that opens a new session per call (the stateless /v1/chat/completions door does exactly that) fills the whole TTL window with them — 228 containers / 37.2GB in 51 minutes on 2026-10-01, which took a 62GB host to 0GB free and made every subsequent fork() fail with no OOM kill ever logged. 40 x ~150MB is ~6GB nominal. The ceiling is approximate under concurrency (per-session locks only, so overshoot up to the worker concurrency is accepted rather than serializing every spawn). 0 or a non-number means 'use the default' — there is deliberately no in-band way to ask for an unlimited pool."
+        "description": "Hard ceiling on how many warm containers may be alive at once. When the pool is full, a dispatch that would need a NEW container falls back to the per-turn cold path instead of being refused \u2014 a session that already HAS its container always keeps it, however full the pool is. Exists because there was previously no bound of any kind: each warm container holds a live CLI process at ~145MB, and a caller that opens a new session per call (the stateless /v1/chat/completions door does exactly that) fills the whole TTL window with them \u2014 228 containers / 37.2GB in 51 minutes on 2026-10-01, which took a 62GB host to 0GB free and made every subsequent fork() fail with no OOM kill ever logged. 40 x ~150MB is ~6GB nominal. The ceiling is approximate under concurrency (per-session locks only, so overshoot up to the worker concurrency is accepted rather than serializing every spawn). 0 or a non-number means 'use the default' \u2014 there is deliberately no in-band way to ask for an unlimited pool."
       },
       "gateway_mcp_url": {
         "type": "string",
