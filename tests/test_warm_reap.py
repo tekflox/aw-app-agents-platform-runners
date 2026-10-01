@@ -23,18 +23,37 @@ from agents_platform_runners_app import warm_pool  # noqa: E402
 
 
 class _FakeContainer:
-    def __init__(self, name: str, status: str = "running", remove_raises: bool = False):
+    def __init__(self, name: str, status: str = "running", remove_raises: bool = False,
+                 created=None, labels=None):
         self.name = name
         self.status = status
         self.removed = False
         self.removed_force = None
         self._remove_raises = remove_raises
+        # `Created` absent by default: reap()'s TTL backstop reads it and
+        # treats unparseable as "leave alone", so every pre-backstop test
+        # below keeps exercising exactly the stage it was written for.
+        self.attrs = {}
+        if created is not None:
+            self.attrs["Created"] = created
+        if labels is not None:
+            self.attrs["Labels"] = labels
+        self.renamed_to = None
+        self.exec_runs = []
 
     def remove(self, force: bool = False):
         if self._remove_raises:
             raise RuntimeError("podman said no")
         self.removed = True
         self.removed_force = force
+
+    def rename(self, new_name: str):
+        self.renamed_to = new_name
+        self.name = new_name
+
+    def exec_run(self, cmd):
+        self.exec_runs.append(cmd)
+        return 0, b""
 
 
 class _FakeContainers:
@@ -70,12 +89,22 @@ def test_stopped_warm_containers_are_removed():
     assert dead.removed
 
 
-def test_running_warm_container_is_never_touched():
-    """This is the pool. An idle one is just a session between messages."""
-    live = _FakeContainer("aw-warm-a-1", status="running")
+def test_running_warm_container_younger_than_ttl_is_never_touched():
+    """This is the pool. An idle one is just a session between messages.
+
+    Was "a running warm container is never touched", full stop, until the
+    TTL backstop landed (card 3ec5bf3b-9510-8106-91f6-d9b31722daa4). The
+    invariant is now bounded by age rather than absolute — but inside the
+    TTL it is unchanged, and that is what this still guards: the backstop
+    must not have quietly become "collect idle containers", which would put
+    the pool back to cold-per-turn.
+    """
+    live = _FakeContainer("aw-warm-a-1", status="running",
+                          created=time.time() - 60)
     client = _FakeClient([live])
     assert warm_pool.reap(client) == 0
     assert not live.removed
+    assert live.renamed_to is None, "an in-TTL container must not even be condemned"
 
 
 def test_wedged_drainer_is_force_removed():

@@ -340,6 +340,15 @@ class AgentsPlatformRunnersAppPlugin:
             threading.Thread(target=execute_mod.reap_dead_warm_containers,
                              name="warm-reap-boot", daemon=True).start()
 
+        # Outside the `if warm_on` above, deliberately: the boot sweep is a
+        # one-shot companion to the generation bump, whereas this is the
+        # only collector that runs when NOTHING is dispatching — the exact
+        # condition of the incident it exists for. Turning warm off stops
+        # new containers, it does not collect the ones already running, so
+        # the loop has to outlive the switch. Idempotent and self-skipping
+        # when there is no container socket (see start_reap_loop).
+        execute_mod.start_reap_loop()
+
         log.info(
             "aw-app-agents-platform-runners activated: mcp.json servers=%s, routes mounted",
             list(mcp_doc["mcpServers"]),

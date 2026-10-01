@@ -1071,6 +1071,13 @@
         "title": "Warm containers",
         "description": "Keep one long-lived \"warm\" claude container per session (aw-warm-<agent_id>-<session_id>, 6h TTL) and dispatch each turn into it, instead of spawning a fresh container per turn. Turn 1 of a session is always cold \u2014 the warm container is keyed by the session_id that turn 1 produces \u2014 so reuse starts from turn 2. ON by default since 0.32.0; untick to force the per-turn ephemeral path. This lives in app config, NOT in the RUNNER_WARM_CONTAINER env var it replaces: aw-remote-host's install.sh only forwards that var into the workspace container when the HOST process has it set, so every workspace recreate (i.e. every update/deploy) silently dropped a hand-set flag and warm mode turned itself back off \u2014 observed repeatedly, last on 2026-08-12. The env var still wins when explicitly set, as a per-host escape hatch."
       },
+      "max_warm_containers": {
+        "type": "integer",
+        "default": 40,
+        "minimum": 1,
+        "title": "Max warm containers",
+        "description": "Hard ceiling on how many warm containers may be alive at once. When the pool is full, a dispatch that would need a NEW container falls back to the per-turn cold path instead of being refused — a session that already HAS its container always keeps it, however full the pool is. Exists because there was previously no bound of any kind: each warm container holds a live CLI process at ~145MB, and a caller that opens a new session per call (the stateless /v1/chat/completions door does exactly that) fills the whole TTL window with them — 228 containers / 37.2GB in 51 minutes on 2026-10-01, which took a 62GB host to 0GB free and made every subsequent fork() fail with no OOM kill ever logged. 40 x ~150MB is ~6GB nominal. The ceiling is approximate under concurrency (per-session locks only, so overshoot up to the worker concurrency is accepted rather than serializing every spawn). 0 or a non-number means 'use the default' — there is deliberately no in-band way to ask for an unlimited pool."
+      },
       "gateway_mcp_url": {
         "type": "string",
         "default": "",

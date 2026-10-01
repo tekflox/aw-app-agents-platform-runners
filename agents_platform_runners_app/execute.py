@@ -2508,6 +2508,63 @@ def reap_dead_warm_containers() -> int:
         return 0
 
 
+_reap_loop_started = False
+_reap_loop_lock = threading.Lock()
+
+
+def _reap_loop(interval_s: float) -> None:
+    """Body of the `warm-reap-loop` thread — sweep forever, never die.
+
+    Every iteration builds its OWN DockerClient rather than closing over
+    one: this thread outlives any single socket connection, and a client
+    that went bad at hour three would otherwise make every later sweep fail
+    identically and silently. Every exception is swallowed per iteration for
+    the same reason — the socket can be absent, slow, or restarting, and a
+    sweep loop that exits on the first of those is a sweep loop that is not
+    running on the day it is needed.
+    """
+    import docker as docker_sdk
+    while True:
+        time.sleep(interval_s)
+        try:
+            client = docker_sdk.DockerClient(base_url="unix://" + CONTAINER_SOCKET)
+            warm_pool.reap(client)
+        except Exception:
+            log.warning("execute: periodic warm reap failed — will retry in %.0fs",
+                        interval_s, exc_info=True)
+
+
+def start_reap_loop(*, interval_s: float | None = None) -> bool:
+    """Start the periodic warm-container sweep, for plugin.activate to call.
+    Returns whether a thread was actually started. Never raises.
+
+    `maybe_reap()` already sweeps, but only ON DISPATCH — and the incident
+    this exists for (card 3ec5bf3b-9510-8106-91f6-d9b31722daa4) was one
+    where dispatches themselves were failing, so the one thing that could
+    have collected the 228 leaked containers only ran when the thing it
+    would have fixed was already working. A sweep independent of dispatch is
+    the point; keep both.
+
+    Started regardless of whether warm mode is ON: switching warm off stops
+    new containers from being made, it does not collect the ones already
+    there, and those are exactly the leftovers nothing else will ever pick
+    up. Idempotent, so repeated activations do not stack threads.
+    """
+    global _reap_loop_started
+    if not CONTAINER_SOCKET:
+        log.info("execute: no container socket — periodic warm reap loop not started")
+        return False
+    interval = warm_pool.REAP_INTERVAL_S if interval_s is None else interval_s
+    with _reap_loop_lock:
+        if _reap_loop_started:
+            return False
+        _reap_loop_started = True
+    threading.Thread(target=_reap_loop, args=(interval,),
+                     name="warm-reap-loop", daemon=True).start()
+    log.info("execute: periodic warm reap loop started (every %.0fs)", interval)
+    return True
+
+
 # ---------------------------------------------------------------------------
 # run_id -> container registry, and the abort verb that reads it.
 #
@@ -2883,24 +2940,51 @@ def _run_job_blocking(job: dict, redis_url: str) -> None:
     # session_id exists — is warmable exactly like claude.
     if (warm_pool.enabled() and (job.get("cli") or "claude") in WARM_CAPABLE_CLIS
             and job.get("agent_id") and job.get("session_id")):
+        pool_full = False
         try:
-            client = docker_sdk.DockerClient(base_url="unix://" + CONTAINER_SOCKET)
-            _dispatch_warm_turn(client, job, redis_url, r)
-            execution_index.start_after_stream_done(run_id, redis_url)
-        except Exception as e:
-            log.exception("execute: warm dispatch failed run=%s", run_id)
-            _publish_line(r, run_id, json.dumps({
-                "type": "result", "subtype": "spawn_error", "is_error": True,
-                "result": f"runner failed to dispatch warm turn: {e}",
-            }))
-            _publish_done(r, run_id, 1)
-            execution_index.start(run_id)
-        finally:
             try:
-                r.close()
-            except Exception:
-                pass
-        return
+                client = docker_sdk.DockerClient(base_url="unix://" + CONTAINER_SOCKET)
+                _dispatch_warm_turn(client, job, redis_url, r)
+                execution_index.start_after_stream_done(run_id, redis_url)
+            except warm_pool.WarmPoolFull as e:
+                # The pool ceiling is a REFUSAL to go warm, not a failure of
+                # the run: fall through to the cold/ephemeral path below,
+                # which predates warm mode and is correct for every CLI.
+                # Caught before the generic handler on purpose — publishing
+                # spawn_error here is exactly the behaviour this replaces
+                # (card 3ec5bf3b-9510-8106-91f6-d9b31722daa4).
+                log.warning("execute: %s — run=%s falling back to cold spawn", e, run_id)
+                pool_full = True
+            except Exception as e:
+                log.exception("execute: warm dispatch failed run=%s", run_id)
+                _publish_line(r, run_id, json.dumps({
+                    "type": "result", "subtype": "spawn_error", "is_error": True,
+                    "result": f"runner failed to dispatch warm turn: {e}",
+                }))
+                _publish_done(r, run_id, 1)
+                execution_index.start(run_id)
+        finally:
+            # The cold path below still needs `r` (and closes it itself on
+            # every one of its own exits), so this close belongs only to the
+            # branches that actually return here.
+            if not pool_full:
+                try:
+                    r.close()
+                except Exception:
+                    pass
+        if not pool_full:
+            return
+
+        # Falling back cold with a session id this Runner MINTED (see
+        # mint_warm_session_id, called a few lines above): that session does
+        # not exist yet, but only `_warm_minted_session` says so — the cold
+        # path picks `--session-id` vs `--resume` off `new_session` alone.
+        # Without this, a minted job would `--resume` an id claude has never
+        # seen, get an empty reply, and record a zero-token SUCCESS. That is
+        # the 2026-08-19 bug the cold path's own comment describes, reached
+        # by a new route (card 3ec5bf3b-9510-8106-91f6-d9b31722daa4).
+        if job.get("_warm_minted_session"):
+            job["new_session"] = True
 
     try:
         client = docker_sdk.DockerClient(base_url="unix://" + CONTAINER_SOCKET)

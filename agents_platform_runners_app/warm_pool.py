@@ -42,9 +42,11 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import shlex
 import threading
 import time
+from datetime import datetime, timezone
 from typing import Any, Callable
 
 log = logging.getLogger("aw_apps.agents_platform_runners.warm_pool")
@@ -61,6 +63,17 @@ CLI_LABEL = "aw.cli"
 # never polled or enforced from out here.
 WARM_TTL_S = 21600
 
+# Grace the HOST-side TTL backstop in reap() gives the in-container watcher
+# before stepping in: it condemns at WARM_TTL_S + WARM_TTL_SLACK_S, never at
+# WARM_TTL_S itself. The watcher above is still the normal mechanism and goes
+# first; this slack is what keeps the two from racing over the same container
+# at the same instant. The backstop firing at all therefore MEANS an
+# in-container watcher failed to fire — which is why it logs at WARNING.
+# (Card 3ec5bf3b-9510-8106-91f6-d9b31722daa4: 228 containers up to 3h old
+# against a 30-min TTL, all still `running`, because nothing outside the
+# container ever checked.)
+WARM_TTL_SLACK_S = 300
+
 # How long drain() waits for a drained container to stop before leaving it to
 # the periodic sweep. Comfortably longer than a normal turn; a genuinely long
 # one just gets collected by reap() instead.
@@ -74,6 +87,33 @@ DRAIN_GRACE_S = 3600
 
 # Minimum spacing between the sweeps maybe_reap() actually runs.
 REAP_INTERVAL_S = 600
+
+# Hard ceiling on how many warm containers may be alive at once, before
+# get_or_create() refuses to spawn another and the caller falls back to a
+# cold spawn. Each warm container holds a live CLI process at ~145MB, and
+# until this existed there was no bound of any kind: a caller that opens a
+# NEW session per call (the stateless /v1/chat/completions door does exactly
+# that) fills the whole TTL window with containers — 228 of them in 51
+# minutes at concurrency 4, 37.2GB, which took a 62GB host to 0GB free and
+# made every subsequent fork() fail. 40 x ~150MB is ~6GB nominal.
+# Overridable per workspace through this app's persisted config
+# (`max_warm_containers`) — see `configure()`.
+MAX_WARM_CONTAINERS = 40
+
+
+class WarmPoolFull(RuntimeError):
+    """Raised by `get_or_create()` when spawning a NEW warm container would
+    take the pool past `max_warm()`.
+
+    Deliberately a distinct type, not a bare RuntimeError: execute.py's warm
+    branch catches exactly this one and falls through to the cold/ephemeral
+    path, while every other failure there stays a hard spawn_error. A caller
+    that cannot tell the two apart would turn "the pool is busy" into a
+    failed run, which is the opposite of the point.
+
+    Never raised on the REUSE path — a session that already has its
+    container keeps it however full the pool is.
+    """
 
 # Mirrors agents-platform's warm_pool.GENERATION_KEY exactly — deliberately
 # the SAME Redis key, on the SAME shared Redis instance (this app's
@@ -91,6 +131,9 @@ ENV_VAR = "RUNNER_WARM_CONTAINER"
 # DEFAULT mode since 0.32.0, opt-OUT rather than opt-in.
 _config_enabled: bool = True
 
+# Resolved alongside it from the `max_warm_containers` config key.
+_config_max_warm: int = MAX_WARM_CONTAINERS
+
 _FALSEY = {"0", "false", "no", "off", ""}
 
 
@@ -101,6 +144,38 @@ def _truthy(raw: Any) -> bool:
     if isinstance(raw, bool):
         return raw
     return str(raw).strip().lower() not in _FALSEY
+
+
+def _resolve_max_warm(raw: Any) -> int:
+    """Pool ceiling from a config value, falling back to the default.
+
+    Accepts an int or a numeric string (a hand-edited config, or a JSON
+    schema that typed the field as text). Absent/None/empty means "use the
+    default" — and so does 0, deliberately: an unlimited pool is the exact
+    condition this ceiling exists to prevent, so there is no in-band way to
+    ask for one. Anything <= 0 or unparseable is refused with a warning
+    rather than silently clamped, because a typo'd ceiling that reads as
+    "no limit" would restore the incident.
+    """
+    if raw is None or (isinstance(raw, str) and not raw.strip()):
+        return MAX_WARM_CONTAINERS
+    try:
+        value = int(str(raw).strip())
+    except (TypeError, ValueError):
+        log.warning("warm_pool: max_warm_containers=%r is not a number — "
+                    "using the default %d", raw, MAX_WARM_CONTAINERS)
+        return MAX_WARM_CONTAINERS
+    if value <= 0:
+        log.warning("warm_pool: max_warm_containers=%r is not a usable ceiling "
+                    "(0 means 'default', not 'unlimited') — using %d",
+                    raw, MAX_WARM_CONTAINERS)
+        return MAX_WARM_CONTAINERS
+    return value
+
+
+def max_warm() -> int:
+    """Current pool ceiling — see MAX_WARM_CONTAINERS and `configure()`."""
+    return _config_max_warm
 
 
 def configure(config: dict | None) -> bool:
@@ -120,10 +195,15 @@ def configure(config: dict | None) -> bool:
     through aw-backend's AppInstall.config, so it survives recreates,
     updates and reinstalls (see the ``public`` field's note in aw-app.json
     for the reinstall half of that reasoning).
+
+    Also resolves ``max_warm_containers`` (the pool ceiling, read back
+    through `max_warm()`) from the same config, for the same durability
+    reason — see `_resolve_max_warm`.
     """
-    global _config_enabled
+    global _config_enabled, _config_max_warm
     raw = (config or {}).get("warm_container")
     _config_enabled = True if raw is None else _truthy(raw)
+    _config_max_warm = _resolve_max_warm((config or {}).get("max_warm_containers"))
     return enabled()
 
 
@@ -216,6 +296,58 @@ def _is_running(client, name: str) -> bool:
         return False
 
 
+# Podman/docker emit `Created` with nanosecond precision and a bare "Z";
+# datetime.fromisoformat only grew tolerance for both in 3.11, so normalise
+# rather than depend on the interpreter version.
+_ISO_SUBSECOND_RE = re.compile(r"(\.\d{6})\d+")
+
+
+def _created_age_s(c, now: float) -> float | None:
+    """Seconds since a container was created, or None when that cannot be
+    determined.
+
+    ``Created`` arrives in two different shapes from the same SDK, exactly
+    as `list_containers` documents for ``Labels``: the abbreviated attrs
+    ``containers.list()`` returns carry an int unix epoch, while a full
+    inspect (``containers.get()`` / post-``reload()``) carries an ISO8601
+    string. Both are accepted here so a caller never has to know which kind
+    of container object it is holding.
+
+    None means "unparseable", and every caller must treat that as "leave it
+    alone" rather than as "old": the TTL backstop below force-starts a drain
+    on what it believes is an expired container, and doing that on a guess
+    would be worse than the leak it exists to stop.
+    """
+    raw = (getattr(c, "attrs", None) or {}).get("Created")
+    # bool is an int subclass — it is never a timestamp.
+    if raw is None or isinstance(raw, bool):
+        return None
+    if isinstance(raw, (int, float)):
+        return now - float(raw)
+    if not isinstance(raw, str) or not raw.strip():
+        return None
+    text = _ISO_SUBSECOND_RE.sub(r"\1", raw.strip())
+    if text.endswith(("Z", "z")):
+        text = text[:-1] + "+00:00"
+    try:
+        dt = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    # A naive timestamp from a container engine is UTC.
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return now - dt.timestamp()
+
+
+def _container_age_s(client, name: str, now: float) -> float | None:
+    """`_created_age_s` for a container looked up by name — None if it has
+    gone away or its Created is unreadable."""
+    try:
+        return _created_age_s(client.containers.get(name), now)
+    except Exception:
+        return None
+
+
 def drain(client, name: str) -> None:
     """Ask a warm container to exit on its own — after its current turn (if
     any) finishes (uncapped wait) or within ~15s if idle. A flag file, NOT a
@@ -264,20 +396,92 @@ _last_reap = 0.0
 _reap_lock = threading.Lock()
 
 
-def reap(client, *, drain_grace_s: int = DRAIN_GRACE_S) -> int:
-    """Remove warm containers that can never serve another turn, and return
-    how many went.
+def _condemn_over_ttl(c, name: str, now: float, *, ttl_s: int, slack_s: int) -> bool:
+    """TTL backstop for ONE running, non-draining warm container: if it is
+    past ``ttl_s + slack_s``, start the ordinary graceful drain on it.
+    Returns whether it was condemned.
 
-    Two kinds of garbage, both created by the normal happy path:
+    Condemning is exactly what `get_or_create` does to a stale container —
+    rename to `-draining-<ts>`, touch the drain flag — and nothing more. No
+    stop(), no kill(), no remove(): the wrapper's own 15s poll loop closes
+    stdin only after the current turn finishes, so even a genuinely in-flight
+    turn on an over-TTL container runs to completion. Force-removal stays
+    where it already was, in reap()'s wedged-drainer stage, which collects
+    this container `drain_grace_s` after the rename if it is *still* running
+    — and one that is, is wedged by definition.
+
+    Taken under the same `_session_lock(agent_id, session_id)` that
+    `get_or_create` holds, so a rename can never land in the middle of one
+    (the labels come off the container itself; a container missing them is
+    still condemned, just unlocked — an unlabelled warm container predates
+    the labels and has no dispatch that could be racing it).
+    """
+    age = _created_age_s(c, now)
+    if age is None or age <= ttl_s + slack_s:
+        return False
+
+    attrs = getattr(c, "attrs", None) or {}
+    labels = attrs.get("Labels") or (attrs.get("Config") or {}).get("Labels") or {}
+    agent_id, session_id = labels.get(AGENT_ID_LABEL), labels.get(SESSION_ID_LABEL)
+    lock = _session_lock(agent_id, session_id) if agent_id and session_id else None
+
+    if lock is not None:
+        lock.acquire()
+    try:
+        stale_name = f"{name}-draining-{int(time.time())}"
+        c.rename(stale_name)
+        try:
+            c.exec_run(["touch", "/home/ubuntu/.aw-warm/drain"])
+        except Exception:
+            # Renamed but unflagged: the stable name is already free, and the
+            # wedged-drainer stage still collects it. Worth a line, not a
+            # rollback.
+            log.warning("warm_pool.reap: drain flag for over-TTL %s could not be "
+                        "touched — leaving it to the wedged-drainer sweep",
+                        stale_name, exc_info=True)
+    finally:
+        if lock is not None:
+            lock.release()
+
+    # WARNING, not INFO: by contract every warm container drains itself at
+    # WARM_TTL_S from the inside. Reaching this line means that watcher did
+    # not fire, which is a fault in the container, not routine housekeeping.
+    log.warning("warm_pool.reap: condemned %s — %.0fs old, past the %ds TTL "
+                "(+%ds slack); its in-container TTL watcher did not fire",
+                name, age, ttl_s, slack_s)
+    return True
+
+
+def reap(client, *, drain_grace_s: int = DRAIN_GRACE_S,
+         ttl_s: int = WARM_TTL_S, slack_s: int = WARM_TTL_SLACK_S) -> int:
+    """Remove warm containers that can never serve another turn, and return
+    how many were REMOVED (condemnations are counted and logged separately —
+    they remove nothing yet, by design).
+
+    Three kinds of garbage now, all created by the normal happy path:
       * **stopped** warm containers — every drained or TTL-expired one, since
         they are spawned with ``remove=False``;
       * **wedged drainers** — a `-draining-<ts>` container still running an
-        hour after it was asked to exit.
+        hour after it was asked to exit;
+      * **over-TTL survivors** — a `running`, non-draining container older
+        than ``ttl_s + slack_s``, i.e. one whose in-container TTL watcher
+        failed. These are *condemned* (drained), not removed; the wedged
+        -drainer stage above collects them a grace period later if the drain
+        does not take. See `_condemn_over_ttl`.
 
-    Never touches a live, correctly-named warm container: those are the whole
-    point of the pool, and one sitting idle between turns is indistinguishable
-    from one about to receive the next message."""
+    That third stage resolves, rather than works around, this docstring's
+    long-standing concession that an idle running container "is
+    indistinguishable from one about to receive the next message" — which is
+    still true. The backstop never needs that distinction: it decides on
+    AGE, which the host can observe directly, and acts gracefully enough
+    that being wrong about idleness costs nothing. Without it a `running`
+    container with a dead watcher was simply immortal (card
+    3ec5bf3b-9510-8106-91f6-d9b31722daa4).
+
+    A live, correctly-named warm container WITHIN its TTL is still never
+    touched: that is the pool."""
     removed = 0
+    condemned = 0
     try:
         containers = client.containers.list(all=True, filters={"label": f"{WARM_LABEL}=1"})
     except Exception:
@@ -292,6 +496,8 @@ def reap(client, *, drain_grace_s: int = DRAIN_GRACE_S) -> int:
                 removed += 1
                 continue
             if "-draining-" not in name:
+                if _condemn_over_ttl(c, name, now, ttl_s=ttl_s, slack_s=slack_s):
+                    condemned += 1
                 continue
             try:
                 started = int(name.rsplit("-draining-", 1)[1])
@@ -304,8 +510,9 @@ def reap(client, *, drain_grace_s: int = DRAIN_GRACE_S) -> int:
                             name, now - started)
         except Exception:
             log.debug("warm_pool.reap: removal of %s failed", name, exc_info=True)
-    if removed:
-        log.info("warm_pool.reap: removed %d dead warm container(s)", removed)
+    if removed or condemned:
+        log.info("warm_pool.reap: removed %d dead warm container(s), "
+                 "condemned %d over-TTL one(s)", removed, condemned)
     return removed
 
 
@@ -403,6 +610,31 @@ def _wait_ready(client, name: str, timeout_s: float = 10.0) -> None:
                name, timeout_s)
 
 
+def _check_ceiling(client, name: str) -> None:
+    """Raise `WarmPoolFull` if the pool is at `max_warm()`. Spawn path only.
+
+    Counts only containers that actually hold a CLI process: `running`, and
+    not `-draining-` (a drainer is on its way out and its replacement is
+    normally the very spawn being checked). A listing that FAILS is not
+    treated as "full" — refusing to go warm because the socket hiccuped
+    would convert a transient engine error into a pool-wide cold fallback.
+    """
+    ceiling = max_warm()
+    try:
+        containers = client.containers.list(filters={"label": f"{WARM_LABEL}=1"})
+    except Exception:
+        log.warning("warm_pool: could not count warm containers before spawning %s "
+                    "— allowing the spawn rather than failing closed", name,
+                    exc_info=True)
+        return
+    live = sum(1 for c in containers
+               if getattr(c, "status", None) == "running"
+               and "-draining-" not in (getattr(c, "name", "") or ""))
+    if live >= ceiling:
+        raise WarmPoolFull(
+            f"warm pool full ({live}/{ceiling}) — not spawning {name}")
+
+
 # (name, epoch_hash) -> (image, docker-SDK run kwargs) for a FRESH warm
 # container. Must NOT set "name"/"detach"/"remove" — get_or_create() does.
 BuildKwargs = Callable[[str, str], tuple[str, dict[str, Any]]]
@@ -429,6 +661,19 @@ def get_or_create(*, client, agent_id: str, session_id: str, epoch_hash: str,
     Neither is reachable while a turn is in flight — this runs BEFORE the
     turn is fed in — which is what keeps aw-warm-relay.py, and therefore the
     user's chat, out of the blast radius.
+
+    Raises `WarmPoolFull` when SPAWNING would take the pool past
+    `max_warm()`; callers are expected to fall back to a cold spawn (see
+    execute.py's warm branch). Reuse never raises.
+
+    That ceiling is APPROXIMATE under concurrency, on purpose. The only
+    locks here are per-session, so N dispatches for N different sessions can
+    all pass the count before any of them has run — overshoot bounded by the
+    worker concurrency, and accepted. A global spawn lock would make it
+    exact and is deliberately NOT taken: it would serialize every spawn in
+    the process behind `_wait_ready`'s 10s, turning a pool-wide cold
+    fallback into a pool-wide queue, which is worse than being a few
+    containers over a ceiling whose own value is a round number.
     """
     lock = _session_lock(agent_id, session_id)
     with lock:
@@ -446,7 +691,18 @@ def get_or_create(*, client, agent_id: str, session_id: str, epoch_hash: str,
                     else:
                         labels = None
             elif labels.get(EPOCH_LABEL) == epoch_hash and _is_running(client, name):
-                return name
+                # ...unless it is already past its TTL. reap()'s backstop is
+                # about to condemn this exact container; handing it to a turn
+                # first is how that condemnation turns into a mid-flight
+                # rename. Treating it as stale here instead sends it down the
+                # drain+respawn path below, which is where an expired
+                # container was always supposed to go.
+                age = _container_age_s(client, name, time.time())
+                if age is None or age <= WARM_TTL_S:
+                    return name
+                log.warning("warm_pool: %s is %.0fs old, past the %ds TTL — not "
+                            "reusing it; draining and respawning",
+                            name, age, WARM_TTL_S)
         if labels is not None:
             # Stale — free the stable name immediately so the fresh spawn
             # below can take it, then drain the old one in the background.
@@ -463,6 +719,12 @@ def get_or_create(*, client, agent_id: str, session_id: str, epoch_hash: str,
                     client.containers.get(name).remove(force=True)
                 except Exception:
                     pass
+
+        # Ceiling check, deliberately HERE: after any stale container of this
+        # session was renamed to `-draining-` (so a 1-for-1 replacement never
+        # counts itself and always passes) and after every `return name`
+        # above (so reuse is never refused), but before anything is spawned.
+        _check_ceiling(client, name)
 
         image, kwargs = build_kwargs(name, epoch_hash)
         kwargs = dict(kwargs)
