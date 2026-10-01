@@ -33,6 +33,7 @@ Run: python3 -m pytest tests/test_warm_pool_full_fallback.py
 from __future__ import annotations
 
 import sys
+import types
 from pathlib import Path
 from unittest.mock import MagicMock
 
@@ -75,8 +76,19 @@ def harness(monkeypatch, tmp_path):
     monkeypatch.setattr(execute_mod, "CONTAINER_SOCKET", str(tmp_path / "fake.sock"))
     monkeypatch.setattr(warm_pool, "enabled", lambda: True)
 
-    import docker as docker_sdk
-    monkeypatch.setattr(docker_sdk, "DockerClient", lambda **kw: MagicMock())
+    # `_run_job_blocking` does a function-local `import docker as docker_sdk`,
+    # so a fake MODULE is what it picks up. The real SDK is deliberately not
+    # imported here: it is a runtime dependency of the app, not of its test
+    # environment, and importing it would make this file fail to collect
+    # anywhere `docker` is not installed — including CI.
+    fake_errors = types.ModuleType("docker.errors")
+    fake_errors.APIError = type("APIError", (Exception,), {})
+    fake_errors.ImageNotFound = type("ImageNotFound", (Exception,), {})
+    fake_docker = types.ModuleType("docker")
+    fake_docker.DockerClient = lambda **kw: MagicMock()
+    fake_docker.errors = fake_errors
+    monkeypatch.setitem(sys.modules, "docker", fake_docker)
+    monkeypatch.setitem(sys.modules, "docker.errors", fake_errors)
 
     def _cold(job, client=None):
         # The cold path's FIRST call. Capture the job as the cold path will

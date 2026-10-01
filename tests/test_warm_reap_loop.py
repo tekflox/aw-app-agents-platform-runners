@@ -24,6 +24,7 @@ Run: python3 -m pytest tests/test_warm_reap_loop.py
 from __future__ import annotations
 
 import sys
+import types
 from pathlib import Path
 
 import pytest
@@ -114,6 +115,17 @@ def test_the_interval_is_overridable():
 # The loop body — what it must survive
 # --------------------------------------------------------------------------
 
+def _fake_docker(monkeypatch, client_factory):
+    """Install a fake `docker` module for `_reap_loop`'s function-local
+    import. The real SDK is an app runtime dependency, not a test one —
+    importing it here would make this file fail to collect wherever docker
+    is not installed, CI included."""
+    mod = types.ModuleType("docker")
+    mod.DockerClient = lambda **kw: client_factory()
+    monkeypatch.setitem(sys.modules, "docker", mod)
+    return mod
+
+
 class _Stop(Exception):
     """Breaks the infinite loop from inside the stubbed sleep."""
 
@@ -129,9 +141,7 @@ def _run_loop(monkeypatch, *, iterations: int, reap):
 
     monkeypatch.setattr(execute_mod.time, "sleep", _sleep)
     monkeypatch.setattr(warm_pool, "reap", reap)
-
-    import docker as docker_sdk
-    monkeypatch.setattr(docker_sdk, "DockerClient", lambda **kw: object())
+    _fake_docker(monkeypatch, object)
 
     with pytest.raises(_Stop):
         execute_mod._reap_loop(0.01)
@@ -157,9 +167,7 @@ def test_the_loop_sleeps_before_its_first_sweep(monkeypatch):
 
     monkeypatch.setattr(execute_mod.time, "sleep", _sleep)
     monkeypatch.setattr(warm_pool, "reap", lambda client: order.append("reap"))
-
-    import docker as docker_sdk
-    monkeypatch.setattr(docker_sdk, "DockerClient", lambda **kw: object())
+    _fake_docker(monkeypatch, object)
 
     with pytest.raises(_Stop):
         execute_mod._reap_loop(0.01)
@@ -203,14 +211,12 @@ def test_each_iteration_builds_a_fresh_client(monkeypatch):
                         lambda _s: None if len(swept) < 3 else (_ for _ in ()).throw(_Stop()))
     monkeypatch.setattr(warm_pool, "reap", lambda client: swept.append(client))
 
-    import docker as docker_sdk
-
-    def _client(**kw):
+    def _client():
         obj = object()
         built.append(obj)
         return obj
 
-    monkeypatch.setattr(docker_sdk, "DockerClient", _client)
+    _fake_docker(monkeypatch, _client)
 
     with pytest.raises(_Stop):
         execute_mod._reap_loop(0.01)
