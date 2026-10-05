@@ -29,6 +29,12 @@ Read the code first — don't write from the task description alone. Use
 simple Markdown, include short concrete examples, and never invent a
 feature, endpoint, or config key that isn't actually in the code.
 
+Before documenting a module or API, call `aw__codegraph__codegraph_explore`
+(if installed) with its name — it hands back the verbatim current source
+plus every caller across the workspace's repos in one call, which is a
+faster and more reliable way to find real usage examples and confirm a
+claim about behavior than grepping file by file.
+
 ## Kanban: docs-only work completes straight to Done (only if this run has a card)
 
 If this run is tied to a Kanban card (via the `aw-kanban` MCP tools, if

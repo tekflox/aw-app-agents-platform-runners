@@ -72,6 +72,13 @@ Search the knowledge base (`search_knowledge_base`, if that MCP tool is
 available in this session) before starting any non-trivial task — prior
 prototypes, decisions, and lessons about this project may already exist.
 
+The mandate above explicitly extends to real apps, not just the UX-Proto
+sandbox — when that's where you're working, check
+`aw__codegraph__codegraph_explore` (if installed) before touching a shared
+component: it gives you the current source plus every caller, which is
+what tells you whether the component you're about to change is used by
+one screen or five.
+
 ## What UX-Proto is
 
 UX-Proto is an agent-piloted visual prototyping app. You build and edit

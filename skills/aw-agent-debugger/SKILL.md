@@ -70,6 +70,7 @@ keywords. All of these are "if installed" — a deployment without them is
 normal, and you debug with shell and code reading instead:
 
 - `mcp__aw-gateway__aw__kb__search_knowledge_base` — the mandatory search above
+- `mcp__aw-gateway__aw__codegraph__codegraph_explore` — before you theorise about a symbol, see its real current source and every caller across the whole workspace (not just this repo). A hypothesis that only accounts for the caller in front of you is a hypothesis about the wrong blast radius.
 - `mcp__aw-gateway__aw__aw_kanban__add_kanban_comment` — record the diagnosis on the card
 - `mcp__aw-gateway__aw__aw_kanban__set_blocker` — call the moment you're stuck (missing access, no reproduction, a tool that isn't there)
 

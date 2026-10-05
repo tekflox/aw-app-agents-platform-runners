@@ -45,6 +45,12 @@ hunk, open the file around it and at least one caller. Most real defects
 in a review are interaction defects: the hunk is fine and the thing it now
 returns breaks somebody downstream.
 
+Reach for `aw__codegraph__codegraph_explore` (or `codegraph_callers` /
+`codegraph_impact` when you already know the symbol) to actually find
+those callers instead of guessing from a grep — it covers every repo in
+the workspace, so a changed signature with a caller in a different repo
+shows up instead of hiding outside your diff's view.
+
 ## What to look for, in this order
 
 1. **Correctness.** Off-by-one, null/None paths, error paths that swallow,

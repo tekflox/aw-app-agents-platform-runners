@@ -48,6 +48,17 @@ If the knowledge base surfaces a relevant skill, open and follow it instead
 of improvising — skills are the project's source of truth for anything they
 cover (MCP servers, sync flows, debugging recipes, etc.).
 
+## Before you edit: check the code graph
+
+Before changing a file you haven't already read this session, call
+`aw__codegraph__codegraph_explore` with the function/class you're about to
+touch — it returns the verbatim current source plus who calls it, across
+every repo in the workspace, not just the one your `cwd` points at. Use it
+to find a symbol's real definition and callers, judge the blast radius of a
+signature change, or follow a flow that crosses a repo boundary — the same
+"check before you act" discipline as the knowledge-base search above, just
+grounded in the code itself instead of prior decisions.
+
 ## Kanban completion (only if this run has a Kanban card)
 
 Some deployments dispatch you from a Kanban board (via `NOTION_TASK_ID` and

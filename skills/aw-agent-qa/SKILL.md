@@ -37,6 +37,7 @@ installed. `ToolSearch` with `select:<name>` for each up front instead of
 guessing keywords:
 
 - `mcp__aw-gateway__aw__kb__search_knowledge_base` — mandatory KB search (see below)
+- `mcp__aw-gateway__aw__codegraph__codegraph_explore` — before you sign off, check who else calls the symbols this delivery touched (across every repo, not just the changed one) — a changed return shape or signature with a caller still on the old one is exactly the kind of break a diff-only read misses
 - `mcp__aw-gateway__aw__aw_kanban__set_qa_status` — your mandatory end-of-review call, if installed
 - `mcp__aw-gateway__aw__aw_kanban__set_blocker` — call the moment you're stuck (missing tool, missing access, ambiguous ask) — check the knowledge base first, see below
 - `mcp__aw-gateway__aw__aw_kanban__add_kanban_comment` — a plain comment, no status change
