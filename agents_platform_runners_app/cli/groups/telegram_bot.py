@@ -75,7 +75,8 @@ def _row(bot: dict) -> tuple:
     return (
         str(bot.get("id", "")), str(bot.get("name", "")), str(bot.get("agent_slug") or ""),
         str(bot.get("workspace") or ""),
-        str(bot.get("enabled", "")), str(bot.get("is_sysadmin", "")), str(bot.get("token", "")),
+        str(bot.get("enabled", "")), str(bot.get("is_sysadmin", "")),
+        str(bot.get("commands_synced_at") or ""), str(bot.get("token", "")),
     )
 
 
@@ -86,7 +87,7 @@ def _list(client: PlatformClient, ns: argparse.Namespace) -> int:
     if ns.as_json:
         emit_json(bots)
     else:
-        headers = ("ID", "NAME", "AGENT", "WORKSPACE", "ENABLED", "SYSADMIN", "TOKEN")
+        headers = ("ID", "NAME", "AGENT", "WORKSPACE", "ENABLED", "SYSADMIN", "COMMANDS_SYNCED_AT", "TOKEN")
         emit_table([_row(b) for b in bots], headers)
     return 0
 
