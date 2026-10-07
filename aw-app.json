@@ -2,7 +2,7 @@
   "manifest_version": 1,
   "id": "agents-platform-runners",
   "name": "Agents Platform Runners",
-  "version": "0.165.0",
+  "version": "0.166.0",
   "description": "Depends on the code-agent-clis app (claude/codex/copilot/cursor-agent already installed at /usr/local/bin, single source of truth) so this workspace's agent-CLI runners are what agents-platform-multitenant's agent sessions use, and contributes the ported \"aw-agents\" MCP (agent_mcp.py) so agents-platform is controllable as MCP tools from this workspace.",
   "tier": "inprocess",
   "requires_ui_refresh": false,
@@ -585,6 +585,32 @@
           "mcp_servers": [
             "aw-gateway"
           ]
+        },
+        {
+          "slug": "devteam-config",
+          "name": "Dev Team",
+          "description": "Full workspace and MCP access for Dev Team agents so they can inspect deployed code, run the workspace CLI, use the shared browser, and update Kanban evidence.",
+          "mcp_servers": [
+            "aw-gateway"
+          ],
+          "permissions": {
+            "workspace_access": true,
+            "share_network": true,
+            "github": true,
+            "docker": true,
+            "tmp_access": true
+          },
+          "auto_compact_threshold_tokens": 500000
+        }
+      ],
+      "groups": [
+        {
+          "slug": "qas",
+          "name": "QAs",
+          "description": "QA Engineers — the independent review lane for completed deliveries.",
+          "instructions_file": "prompts/qa-group.md",
+          "capabilities": "Validates completed work against its requirements and records an independent verdict without editing the delivery.",
+          "kanban_target_status": "running"
         }
       ],
       "agents": [
@@ -692,6 +718,28 @@
           "disable_harness_tools": true,
           "icon": "bot",
           "color": "#ffa657"
+        },
+        {
+          "slug": "qa-gpt",
+          "name": "QA - GPT-5.6 Sol",
+          "description": "Validates a finished delivery independently against what was actually asked for, using the Codex runner.",
+          "system_prompt_file": "prompts/qa.md",
+          "model_slug": "codex-runner-gpt-5-6-sol",
+          "disable_harness_tools": true,
+          "agent_config_slug": "devteam-config",
+          "group_slug": "qas",
+          "skill_slugs": [
+            "aw-agent-qa"
+          ],
+          "capabilities": "Reviews a completed task against its request, exercises the deployed workspace and shared browser, and records a Kanban verdict.",
+          "use_cases": [
+            "review what the coder just delivered",
+            "validate a deployed delivery with the shared workspace tools",
+            "decide whether a Kanban card is ready to deploy"
+          ],
+          "hidden_from_flow": false,
+          "icon": "shield-check",
+          "color": "#10a37f"
         },
         {
           "slug": "monitor-shell",

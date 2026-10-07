@@ -124,11 +124,35 @@ def test_every_agent_names_a_config_this_app_declares(spec):
     row edited by hand.
     """
     configs = {c["slug"] for c in spec["agent_configs"]}
-    assert configs == {"agent-config-aw-full"}
+    assert "agent-config-aw-full" in configs
     for agent in spec["agents"]:
         if agent["slug"] not in TELEGRAM_AGENT_SLUGS:
             continue
         assert agent["agent_config_slug"] in configs, agent["slug"]
+
+
+def test_qa_gpt_is_a_persistent_codex_qa_with_workspace_tools(spec):
+    agents = {agent["slug"]: agent for agent in spec["agents"]}
+    qa = agents["qa-gpt"]
+    assert qa["model_slug"] == "codex-runner-gpt-5-6-sol"
+    assert qa["agent_config_slug"] == "devteam-config"
+    assert qa["group_slug"] == "qas"
+    assert qa["skill_slugs"] == ["aw-agent-qa"]
+    assert qa["disable_harness_tools"] is True
+
+    configs = {config["slug"]: config for config in spec["agent_configs"]}
+    config = configs["devteam-config"]
+    assert config["mcp_servers"] == ["aw-gateway"]
+    assert config["permissions"] == {
+        "workspace_access": True,
+        "share_network": True,
+        "github": True,
+        "docker": True,
+        "tmp_access": True,
+    }
+
+    groups = {group["slug"]: group for group in spec["groups"]}
+    assert groups["qas"]["instructions_file"] == "prompts/qa-group.md"
 
 
 def test_the_config_is_declared_by_reference_not_by_url(spec):
