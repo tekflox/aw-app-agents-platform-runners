@@ -2,7 +2,7 @@
   "manifest_version": 1,
   "id": "agents-platform-runners",
   "name": "Agents Platform Runners",
-  "version": "0.166.0",
+  "version": "0.167.0",
   "description": "Depends on the code-agent-clis app (claude/codex/copilot/cursor-agent already installed at /usr/local/bin, single source of truth) so this workspace's agent-CLI runners are what agents-platform-multitenant's agent sessions use, and contributes the ported \"aw-agents\" MCP (agent_mcp.py) so agents-platform is controllable as MCP tools from this workspace.",
   "tier": "inprocess",
   "requires_ui_refresh": false,
@@ -607,7 +607,7 @@
         {
           "slug": "qas",
           "name": "QAs",
-          "description": "QA Engineers — the independent review lane for completed deliveries.",
+          "description": "QA Engineers \u2014 the independent review lane for completed deliveries.",
           "instructions_file": "prompts/qa-group.md",
           "capabilities": "Validates completed work against its requirements and records an independent verdict without editing the delivery.",
           "kanban_target_status": "running"
