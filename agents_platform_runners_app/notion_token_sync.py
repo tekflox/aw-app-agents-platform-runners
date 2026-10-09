@@ -84,8 +84,17 @@ def _request(config: dict, method: str, **kwargs) -> dict:
     return resp.json()
 
 
-def push(config: dict, token: str) -> dict:
-    return _request(config, "POST", json={"workspace": _workspace(), "token": token})
+def push(config: dict, token: str, board_config: dict | None = None) -> dict:
+    """``board_config`` is the Kanban board fields aw-app-notion's push now
+    carries alongside the token (``kanban_database_id``/``kanban_statuses`` —
+    Kanban ``architecture:decommission-aw-app-notion-into-ap-mt``, comment
+    7.A): AP-MT's own sweep needs a tenant's database_id without being told
+    it out of band. Omitted or empty sends exactly the body this call always
+    sent, so an existing caller needs no change."""
+    body = {"workspace": _workspace(), "token": token}
+    if board_config:
+        body.update(board_config)
+    return _request(config, "POST", json=body)
 
 
 def delete(config: dict) -> dict:

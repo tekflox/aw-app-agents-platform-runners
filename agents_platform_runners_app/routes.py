@@ -180,8 +180,14 @@ def build_routes(config: dict | None = None, *, kanban_sweep_status: dict | None
         token = (data.get("token") or "").strip()
         if not token:
             raise HTTPException(400, "token is required")
+        # Kanban database_id/statuses now ride the same push as the token
+        # (architecture:decommission-aw-app-notion-into-ap-mt, comment 7.A) —
+        # relayed through verbatim, never read or interpreted here.
+        board_config = {k: data[k] for k in ("kanban_database_id", "kanban_statuses")
+                        if k in data}
         try:
-            return await asyncio.to_thread(notion_token_sync_mod.push, cfg, token)
+            return await asyncio.to_thread(
+                notion_token_sync_mod.push, cfg, token, board_config)
         except notion_token_sync_mod.NotionTokenSyncError as exc:
             raise _notion_token_failure(exc) from exc
 

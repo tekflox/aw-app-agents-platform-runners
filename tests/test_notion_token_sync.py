@@ -67,6 +67,16 @@ def test_push_sends_the_workspace_and_bearer_token(monkeypatch):
     assert kwargs["headers"]["Authorization"] == "Bearer tok"
 
 
+def test_push_forwards_the_board_config_when_given(monkeypatch):
+    monkeypatch.setenv("AW_WORKSPACE", "ws-a")
+    seen: list = []
+    _stub_client(monkeypatch, FakeResponse(200, {"configured": True}), seen)
+
+    nts.push(CONFIG, "ntn_abc", {"kanban_database_id": "db1"})
+    assert seen[0][2]["json"] == {"workspace": "ws-a", "token": "ntn_abc",
+                                  "kanban_database_id": "db1"}
+
+
 def test_delete_and_state_pass_the_workspace_as_a_query_param(monkeypatch):
     monkeypatch.setenv("AW_WORKSPACE", "ws-a")
     seen: list = []
@@ -198,6 +208,21 @@ def client():
 
 def test_route_push_requires_a_token(client):
     assert client.post("/notion-token", json={"token": "  "}).status_code == 400
+
+
+def test_route_push_forwards_the_board_config(client, monkeypatch):
+    seen: list = []
+    monkeypatch.setattr(routes_mod.notion_token_sync_mod, "push",
+                        lambda cfg, token, board_config=None: (
+                            seen.append((token, board_config)),
+                            {"configured": True})[1])
+
+    r = client.post("/notion-token", json={
+        "token": "ntn_x", "kanban_database_id": "db1",
+        "kanban_statuses": {"ready": "Ready"}, "ignored_field": "x"})
+    assert r.status_code == 200
+    assert seen == [("ntn_x", {"kanban_database_id": "db1",
+                               "kanban_statuses": {"ready": "Ready"}})]
 
 
 def test_route_maps_not_configured_to_409_and_other_failures_to_502(client, monkeypatch):
