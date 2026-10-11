@@ -1037,6 +1037,9 @@
           "metric_args": {}
         }
       ]
+    },
+    "knowledge": {
+      "path": "docs"
     }
   },
   "config_schema": {
