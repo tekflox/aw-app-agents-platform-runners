@@ -27,8 +27,13 @@ Resolution order (first hit wins):
    not on any bridge gateway).
 2. ``AW_SHARED_REDIS_URL`` env — lets a deployment bake the value in without
    touching per-workspace app settings.
-3. The first candidate host that actually accepts a TCP connection on
-   ``AW_SHARED_REDIS_PORT`` (default 6379). Result is cached process-wide.
+3. The first candidate host that answers an authenticated ``PING`` on
+   ``AW_SHARED_REDIS_PORT`` (default 6379) — ``AW_SHARED_REDIS_PASSWORD``/
+   ``AW_SHARED_REDIS_USER`` (default user ``default``) if set. A host found
+   but refusing that credential (or refusing none) is never cached as a
+   passwordless URL — this was a bare TCP connect check until 2026-10-12,
+   which would "discover" an auth-protected host and hand back a URL that
+   fails on every subsequent command. Result is cached process-wide.
 
 The db index defaults to 1 because that is the db agents-platform-multitenant
 attaches its ``run:{run_id}:events`` consumer groups on; publishing to any
@@ -92,28 +97,59 @@ def candidate_hosts() -> list[str]:
     return hosts
 
 
-def _accepts_tcp(host: str, port: int) -> bool:
+def _probe(host: str, port: int, user: str | None, password: str | None) -> str:
+    """Real RESP ``PING`` against ``host:port``, authenticated if a
+    credential is given. Returns ``"ok"`` (answered — authenticated when a
+    credential was supplied, unauthenticated otherwise), ``"auth"`` (a
+    Redis IS there but refuses us — no credential given and one is
+    required, or the one given is wrong), or ``"down"`` (nothing
+    answered). A bare TCP connect used to be enough when every Redis on
+    this stack ran with no auth at all; once one requires it, a successful
+    connect is no longer the same thing as a usable connection."""
+    import redis as _redis_sync  # lazy, same convention as warm_pool.py/execute.py in this app
+
+    client = _redis_sync.Redis(
+        host=host, port=port, username=user, password=password,
+        socket_connect_timeout=PROBE_TIMEOUT_S, socket_timeout=PROBE_TIMEOUT_S,
+    )
     try:
-        with socket.create_connection((host, port), PROBE_TIMEOUT_S):
-            return True
-    except OSError:
-        return False
+        client.ping()
+        return "ok"
+    except _redis_sync.exceptions.AuthenticationError:
+        return "auth"
+    except _redis_sync.exceptions.ResponseError as e:
+        if "NOAUTH" in str(e) or "WRONGPASS" in str(e):
+            return "auth"
+        return "down"
+    except (_redis_sync.exceptions.ConnectionError, OSError):
+        return "down"
+    finally:
+        client.close()
 
 
-def discover_host(port: int) -> str | None:
-    """First candidate host with something listening on ``port``."""
+def discover_host(port: int, user: str | None, password: str | None) -> tuple[str | None, str]:
+    """First candidate host that answers on ``port``, and how it answered.
+
+    Returns ``(host, "ok")`` when found and usable, ``(host, "auth")`` when
+    found but refusing the given (or absent) credential — this already IS
+    the shared Redis, just locked, so the remaining candidates are not
+    worth trying — or ``(None, "down")`` when nothing answered at all.
+    """
     for host in candidate_hosts():
-        if _accepts_tcp(host, port):
-            return host
-    return None
+        state = _probe(host, port, user, password)
+        if state in ("ok", "auth"):
+            return host, state
+    return None, "down"
 
 
 def resolve(config: dict | None = None) -> str | None:
-    """The shared Redis URL, or None when discovery finds nothing.
+    """The shared Redis URL, or None when discovery finds nothing usable.
 
-    None means no candidate host answered on the Redis port — a real
-    misconfiguration, so callers should keep failing loudly rather than
-    publishing run events into the void.
+    None means no candidate host answered on the Redis port, or one did
+    but refused our credential (or the lack of one) — both are real
+    misconfigurations, so callers should keep failing loudly rather than
+    publishing run events into the void with a URL that will fail on every
+    command.
     """
     global _cached, _probed
 
@@ -130,8 +166,21 @@ def resolve(config: dict | None = None) -> str | None:
         return _cached
 
     port = int(os.environ.get("AW_SHARED_REDIS_PORT", DEFAULT_REDIS_PORT))
-    host = discover_host(port)
+    user = os.environ.get("AW_SHARED_REDIS_USER", "default")
+    password = os.environ.get("AW_SHARED_REDIS_PASSWORD") or None
+    host, state = discover_host(port, user, password)
     _probed = True
+
+    if state == "auth":
+        _cached = None
+        log.error(
+            "found a Redis at %s:%s but it refused us (%s) — set "
+            "AW_SHARED_REDIS_PASSWORD (and AW_SHARED_REDIS_USER if not "
+            "'default') in this app's environment; refusing to cache a "
+            "passwordless URL that would fail on every command",
+            host, port, "wrong credential" if password else "credential missing")
+        return None
+
     if not host:
         _cached = None
         log.error(
@@ -141,10 +190,13 @@ def resolve(config: dict | None = None) -> str | None:
         return None
 
     db = os.environ.get("AW_SHARED_REDIS_DB", DEFAULT_REDIS_DB)
-    _cached = f"redis://{host}:{port}/{db}"
+    auth = f"{user}:{password}@" if password else ""
+    _cached = f"redis://{auth}{host}:{port}/{db}"
     log.info(
         "shared_redis_url unset in app config — discovered %s by probing :%s "
-        "(set the secret on this app's Settings to override)", _cached, port)
+        "(set the secret on this app's Settings to override)",
+        f"redis://{host}:{port}/{db}" if not password else f"redis://{user}:***@{host}:{port}/{db}",
+        port)
     return _cached
 
 
