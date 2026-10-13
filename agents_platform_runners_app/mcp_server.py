@@ -77,6 +77,23 @@ class _NoopServer:
 
 BASE = os.environ.get("AGENTS_BASE", "http://127.0.0.1:8765")
 
+# AGENTS_BASE normally resolves on the same bare-metal host AP-MT itself runs
+# on, whose DNS has intermittent outages lasting tens of seconds to minutes
+# (IPv6-only resolver flaking under NDP failures on its default gateway) — a
+# one-shot request used to surface that straight to the calling tool as a
+# hard failure. httpx's transport retry only re-tries the TCP-connect stage
+# (where DNS resolution happens), so it can never double-send a request that
+# actually reached the server. Mirrors agents-platform-multitenant's
+# RunnerLLM._dispatch retry shape (runner.py's RUNNER_ATTEMPTS=3).
+#
+# A fresh instance per `AsyncClient(...)` construction, never a shared one —
+# `AsyncClient.__aexit__`/`aclose()` unconditionally closes whatever
+# transport it was given, so two concurrent tool calls (this server handles
+# many in parallel) sharing one instance would have the first call to finish
+# tear down the connection pool out from under the other.
+def _agents_base_transport() -> httpx.AsyncHTTPTransport:
+    return httpx.AsyncHTTPTransport(retries=2)
+
 # The Kanban dispatch bridge — the half of the monolith's notion_kanban.py that
 # aw-app-notion deliberately refused, because it needs an orchestrator. Imported
 # lazily-ish (module-level is fine; it is stdlib-only) so this file keeps its
@@ -346,7 +363,8 @@ async def _list_tools() -> list[Tool]:
     _ensure_running()
     global _LAST_GOOD_AGENTS, _LAST_GOOD_WORKFLOWS
     try:
-        async with httpx.AsyncClient(timeout=10, headers=AUTH_HEADERS) as c:
+        async with httpx.AsyncClient(timeout=10, headers=AUTH_HEADERS,
+                                      transport=_agents_base_transport()) as c:
             agents = (await c.get(f"{BASE}/api/agents")).json()
             workflows = (await c.get(f"{BASE}/api/workflows")).json()
         _LAST_GOOD_AGENTS, _LAST_GOOD_WORKFLOWS = agents, workflows
@@ -2156,7 +2174,8 @@ async def _poll_run(c: httpx.AsyncClient, run_id: str, *, timeout_s: int = 900) 
 @server.call_tool()
 async def _call_tool(name: str, arguments: dict[str, Any] | None) -> list[TextContent]:
     args = arguments or {}
-    async with httpx.AsyncClient(timeout=120, headers=AUTH_HEADERS) as c:
+    async with httpx.AsyncClient(timeout=120, headers=AUTH_HEADERS,
+                                  transport=_agents_base_transport()) as c:
         # --- discovery ---
         if name == "list_agents":
             params: dict[str, Any] = {}
@@ -2591,7 +2610,8 @@ async def _call_tool(name: str, arguments: dict[str, Any] | None) -> list[TextCo
                 params["max_cost_usd"] = str(args["max_cost_usd"])
             if args.get("summary"):
                 params["summary"] = "true"
-            async with httpx.AsyncClient(timeout=timeout_s + 30, headers=AUTH_HEADERS) as wc:
+            async with httpx.AsyncClient(timeout=timeout_s + 30, headers=AUTH_HEADERS,
+                                          transport=_agents_base_transport()) as wc:
                 r = await wc.get(f"{BASE}/api/runs/{args['run_id']}/wait", params=params)
             return _err(r.status_code, r.text) if r.status_code != 200 else _ok(r.json())
         if name == "peek_run_output":
