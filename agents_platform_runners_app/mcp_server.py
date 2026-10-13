@@ -107,6 +107,14 @@ from . import kanban_dispatch  # noqa: E402
 # this process imports.
 from . import gallery as gallery_mod  # noqa: E402
 
+# OTel for THIS process — the gateway spawns it in the gateway's own
+# container, so core's own instrumentation never reaches it. stdlib-only at
+# import time and a no-op unless the SDK is installed AND an endpoint is
+# configured; see mcp_otel.py's docstring for the four constraints that
+# shape it (chief among them: a hard SDK import here = dead upstream = zero
+# Agents Platform tools for every agent, silently).
+from . import mcp_otel  # noqa: E402
+
 # What `bot_slug` means when the caller omits it: EVERY bot this workspace's
 # identity can see, not a hardcoded one.
 #
@@ -2173,6 +2181,24 @@ async def _poll_run(c: httpx.AsyncClient, run_id: str, *, timeout_s: int = 900) 
 
 @server.call_tool()
 async def _call_tool(name: str, arguments: dict[str, Any] | None) -> list[TextContent]:
+    """One span per tool call, wrapped around the dispatcher below.
+
+    This is the trace ROOT for this process: aw-mcp-gateway is not itself
+    instrumented yet (its own card), so nothing hands us a parent context.
+    Every httpx client span inside — including the calls to
+    agents-platform-multitenant — becomes a child of it and carries
+    ``traceparent``, which is what makes AP-MT's server span land in the SAME
+    trace instead of starting a second, unrelated one. Log records emitted
+    inside get its ``trace_id`` too, which is the half the screenshot on this
+    app's Kanban card was missing.
+
+    A plain pass-through when telemetry is off (see ``mcp_otel.tool_span``).
+    """
+    with mcp_otel.tool_span(name, _caller_run_id(arguments or {})):
+        return await _dispatch_tool(name, arguments)
+
+
+async def _dispatch_tool(name: str, arguments: dict[str, Any] | None) -> list[TextContent]:
     args = arguments or {}
     async with httpx.AsyncClient(timeout=120, headers=AUTH_HEADERS,
                                   transport=_agents_base_transport()) as c:
@@ -3099,6 +3125,11 @@ async def _async_main() -> None:
 
 
 def main() -> None:
+    # Once per process, and this IS once per process: the gateway keeps this
+    # child alive for its whole upstream session and respawns it on any
+    # mcp.json change, so module entry is the only lifecycle hook needed.
+    # Never raises, never prints — see mcp_otel.py.
+    mcp_otel.setup()
     asyncio.run(_async_main())
 
 

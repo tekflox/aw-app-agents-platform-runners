@@ -26,6 +26,7 @@ from . import execution_index as execution_index_mod
 from . import notion_subscription as notion_subscription_mod
 from . import notion_token_sync as notion_token_sync_mod
 from . import observability_push as observability_push_mod
+from . import otel_env as otel_env_mod
 from . import platform_base as platform_base_mod
 from . import runner_registration as runner_registration_mod
 from . import shared_redis
@@ -40,7 +41,8 @@ _runner_status = runner_registration_mod.runner_status
 log = logging.getLogger("aw_apps.agents_platform_runners.routes")
 
 
-def build_routes(config: dict | None = None, *, kanban_sweep_status: dict | None = None) -> FastAPI:
+def build_routes(config: dict | None = None, *, kanban_sweep_status: dict | None = None,
+                 package_dir: str | None = None) -> FastAPI:
     """Mode-agnostic factory — call this fresh for each mode (plugin.py /
     __main__.py both call it exactly once).
 
@@ -53,7 +55,12 @@ def build_routes(config: dict | None = None, *, kanban_sweep_status: dict | None
     request — no full workspace-process restart required. Using
     ``config or {}`` here would silently break that identity the moment
     the live config is empty (``{} or {}`` evaluates the right-hand
-    literal, a NEW dict) — use an explicit None-check instead."""
+    literal, a NEW dict) — use an explicit None-check instead.
+
+    ``package_dir`` is this app's install dir, passed by plugin.py so
+    ``/register-observability`` can regenerate the mcp.json next to it.
+    Absent in standalone mode (``__main__.py``), where there is no gateway
+    to serve that file to anyway."""
     app = FastAPI(title="agents-platform-runners")
     cfg = config if config is not None else {}
     # Same identity rule as cfg above: plugin.py hands us its own
@@ -102,6 +109,12 @@ def build_routes(config: dict | None = None, *, kanban_sweep_status: dict | None
                 "reason": sweep_status.get("reason"),
             },
             "notion_webhook": notion_subscription_mod.state(cfg),
+            # Whether the MCP child (mcp_server.py, spawned by aw-mcp-gateway
+            # in ITS container) is actually being handed an OTLP endpoint.
+            # Reported because the alternative is silence: otel_env.py imports
+            # core's resolver guardedly, so a rename on core's side would
+            # otherwise show up only as telemetry quietly disappearing.
+            "otel": otel_env_mod.status(),
         }
 
     @app.get("/warm-containers")
@@ -152,9 +165,29 @@ def build_routes(config: dict | None = None, *, kanban_sweep_status: dict | None
         cycle, no polling delay. Also usable standalone as a manual retry if
         that push failed (e.g. AP-MT was briefly unreachable) while the save
         itself still succeeded. See ``observability_push.push_once`` for the
-        actual two-hop logic."""
+        actual two-hop logic.
+
+        Also regenerates this app's mcp.json, because the same setting decides
+        where the MCP child exports to (``otel_env.py``) and that value only
+        reaches the child as env baked into that file. ``reload_on_save``
+        already respawns the child when the file changes, so this is the whole
+        refresh path for a settings save — the watchdog in plugin.py is the
+        backstop for every other way it can go stale. Deliberately AFTER the
+        push and non-fatal: a failure here must not turn a successful AP-MT
+        push into an error the save surfaces."""
         import asyncio
-        return await asyncio.to_thread(observability_push_mod.push_once, cfg)
+        result = await asyncio.to_thread(observability_push_mod.push_once, cfg)
+        if package_dir:
+            try:
+                from . import plugin as plugin_mod
+                await asyncio.to_thread(plugin_mod.write_mcp_json, package_dir, cfg)
+            except Exception:  # noqa: BLE001 — never fail the push over this
+                log.warning("otel_env: could not refresh mcp.json after an "
+                            "observability save", exc_info=True)
+            else:
+                result = {**result, "mcp_json_refreshed": True,
+                          "otel": otel_env_mod.status()}
+        return result
 
     # ------------------------------------------------------------------
     # Notion token relay — see notion_token_sync.py for why this app is the

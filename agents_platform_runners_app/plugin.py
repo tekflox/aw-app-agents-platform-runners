@@ -39,6 +39,7 @@ from . import identity_token as identity_token_mod
 from . import kanban_dispatch as kanban_dispatch_mod
 from . import kanban_sweep_default as kanban_sweep_default_mod
 from . import notion_token_sync as notion_token_sync_mod
+from . import otel_env as otel_env_mod
 from . import platform_base as platform_base_mod
 from . import platform_settings as platform_settings_mod
 from . import routes as routes_mod
@@ -101,6 +102,19 @@ RUNNER_REGISTRATION_REASSERT_INTERVAL_S = 120.0
 # call, not something to leave to chance.
 EXECUTE_SECRET_ENSURE_INTERVAL_S = 120.0
 
+# mcp.json OTEL-env refresh cadence. Needed because the value is resolved
+# from core and core resolves it LATER than this app activates: core's first
+# `ensure_export_state` runs at the END of the boot reconcile, after every
+# app's activate(), so the mcp.json written at activation on a cold boot
+# carries no endpoint and the MCP child starts untraced — the exact silent
+# degradation this card was opened about. `/register-observability` (a
+# settings save) and a config save already rewrite the file, but neither
+# fires on a plain workspace restart. A tick is free when nothing changed
+# (write_mcp_json skips a byte-identical write, so no gateway reload), which
+# is why this can be short enough to converge in minutes rather than
+# waiting for the next human action.
+MCP_OTEL_ENV_REFRESH_INTERVAL_S = 120.0
+
 # agents_platform_base resolution (what address this app calls
 # agents-platform-multitenant on) lives in platform_base.py now — the old
 # fixed bridge-gateway default (http://172.18.0.1:10014) only ever worked
@@ -144,6 +158,13 @@ def build_mcp_servers(config: dict) -> dict:
                 "AGENTS_PLATFORM_TOKEN": str(token),
                 "AW_WORKSPACE_API_URL": _workspace_env("AW_WORKSPACE_API_URL"),
                 "AW_WORKSPACE_API_KEY": _workspace_env("AW_WORKSPACE_API_KEY"),
+                # Where that child should export OTLP (mcp_otel.py). Resolved
+                # from core's Observability setting, omitted entirely when
+                # there is nothing to export to — see otel_env.py. This is
+                # the ONLY channel: the gateway spawns the child in its own
+                # container, so nothing from this process's environment
+                # reaches it, same reason the four values above are baked in.
+                **otel_env_mod.child_env(),
             }.items() if v},
             # aw-mcp-gateway spawns stdio upstreams with cwd defaulting to its
             # own BASE_DIR (/app), which doesn't have this app's package on
@@ -160,10 +181,26 @@ def build_mcp_servers(config: dict) -> dict:
 
 def write_mcp_json(package_dir: str, config: dict) -> dict:
     """Regenerate this app's own root mcp.json from config and write it to
-    disk — the file aw-mcp-gateway scans directly."""
+    disk — the file aw-mcp-gateway scans directly.
+
+    Skips the write when the content is byte-identical, the same way every
+    other mcp.json-contributing app does it (aw-app-android-studio's
+    ``mcp_config.py`` and friends). That became load-bearing here once the
+    OTEL env joined the document: the gateway reloads on **mtime** and each
+    reload briefly drops every tool it proxies, so the repeat callers this now
+    has — the refresh watchdog below, ``/register-observability``, and one
+    ``activate()`` per worker at ``AW_WORKSPACE_WORKERS``>1 — would otherwise
+    be a tool-outage loop. The doc is still returned either way; callers log
+    it rather than branching on whether it landed."""
     doc = {"mcpServers": build_mcp_servers(config)}
+    body = json.dumps(doc, indent=2) + "\n"
     path = Path(package_dir) / "mcp.json"
-    path.write_text(json.dumps(doc, indent=2) + "\n", encoding="utf-8")
+    try:
+        if path.read_text(encoding="utf-8") == body:
+            return doc
+    except OSError:
+        pass  # no file yet, or unreadable — write it
+    path.write_text(body, encoding="utf-8")
     return doc
 
 
@@ -187,6 +224,10 @@ class AgentsPlatformRunnersAppPlugin:
         # exists so a missing watchdog is visible in /status, not only as the
         # one-time log.warning it used to be.
         self._kanban_sweep_status: dict = {}
+        # Last state the OTEL-env refresh watchdog saw, so it logs the
+        # transition instead of a line per tick. /status reports the LIVE
+        # answer (otel_env.status()), not this.
+        self._otel_env_injected: bool = False
 
     def _refresh_derived_config(self, ctx) -> dict:
         """In-process derived state ONLY, safe to run on every worker: mutate
@@ -286,13 +327,15 @@ class AgentsPlatformRunnersAppPlugin:
         mcp_doc = write_mcp_json(ctx.package_dir, self._live_config)
 
         ctx.routes.register(routes_mod.build_routes(
-            self._live_config, kanban_sweep_status=self._kanban_sweep_status))
+            self._live_config, kanban_sweep_status=self._kanban_sweep_status,
+            package_dir=ctx.package_dir))
 
         self._register_skills_watchdog(ctx, self._live_config)
         self._register_kanban_sweep_watchdog(ctx, self._live_config)
         self._register_identity_token_watchdog(ctx, self._live_config)
         self._register_runner_registration_watchdog(ctx, self._live_config)
         self._register_execute_secret_watchdog(ctx, self._live_config)
+        self._register_mcp_otel_env_watchdog(ctx, self._live_config)
 
         # Sweep stale isolated run dirs at ACTIVATION, not only where they are
         # created.
@@ -628,6 +671,39 @@ class AgentsPlatformRunnersAppPlugin:
                               EXECUTE_SECRET_ENSURE_INTERVAL_S, run_immediately=False)
         log.info("execute_secret: ensure-configured watchdog registered (every %.0fs)",
                  EXECUTE_SECRET_ENSURE_INTERVAL_S)
+
+    def _register_mcp_otel_env_watchdog(self, ctx, config: dict) -> None:
+        """Keep the MCP child's OTEL env in mcp.json converged on what core's
+        Observability setting currently resolves to — see
+        MCP_OTEL_ENV_REFRESH_INTERVAL_S for why activate() alone cannot get
+        this right on a cold boot, and otel_env.py for what is being
+        resolved. A tick that changes nothing writes nothing."""
+        if not ctx.has("watchdog:tasks"):
+            log.warning("otel_env: 'watchdog:tasks' capability not granted — MCP "
+                        "child's OTEL env will only refresh on a config save")
+            return
+
+        package_dir = ctx.package_dir
+
+        async def _refresh() -> None:
+            try:
+                before = otel_env_mod.child_env()
+                await asyncio.to_thread(write_mcp_json, package_dir, self._live_config)
+            except Exception:  # noqa: BLE001 — a watchdog tick must never raise
+                log.warning("otel_env: mcp.json refresh tick failed", exc_info=True)
+                return
+            # Logged only on the transition, never per tick: the endpoint is
+            # safe to print, the headers (a credential) are never touched.
+            if bool(before) != self._otel_env_injected:
+                self._otel_env_injected = bool(before)
+                log.info("otel_env: MCP child OTEL env %s (%s)",
+                         "injected" if before else "removed",
+                         before.get("OTEL_EXPORTER_OTLP_ENDPOINT", "no endpoint"))
+
+        ctx.watchdog.register("mcp-otel-env-refresh", _refresh,
+                              MCP_OTEL_ENV_REFRESH_INTERVAL_S, run_immediately=False)
+        log.info("otel_env: MCP child OTEL env refresh watchdog registered (every %.0fs)",
+                 MCP_OTEL_ENV_REFRESH_INTERVAL_S)
 
     def register_contributed_agents(self, app_id: str, spec: dict) -> dict:
         """Seed one ``contributes.agents`` declaration into Agents Platform.
