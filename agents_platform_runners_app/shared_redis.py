@@ -121,7 +121,23 @@ def _probe(host: str, port: int, user: str | None, password: str | None) -> str:
         if "NOAUTH" in str(e) or "WRONGPASS" in str(e):
             return "auth"
         return "down"
-    except (_redis_sync.exceptions.ConnectionError, OSError):
+    # TimeoutError is listed explicitly because redis-py does NOT derive it
+    # from ConnectionError (verified on the installed version:
+    # issubclass(TimeoutError, ConnectionError) is False). Without it, a
+    # candidate whose packets are dropped rather than refused — a firewall,
+    # a half-applied VPN route — raises straight out of this function, past
+    # discover_host and resolve, and kills the plugin's activate. "Nothing
+    # answered" is exactly what this function exists to report as "down";
+    # a silent drop is the most ordinary way for nothing to answer.
+    #
+    # Live on 2026-10-13: an aw-remote-host recreate left a tailscale exit
+    # node selected with its scoping routes NOT installed, so the probe to
+    # the bridge gateway was swallowed by the tunnel ACL. This app failed
+    # to attach, never mounted /execute, and every Agents Platform run
+    # dispatched to it came back 404 — for what should have been one
+    # candidate reporting "down" and the loop moving on.
+    except (_redis_sync.exceptions.TimeoutError,
+            _redis_sync.exceptions.ConnectionError, OSError):
         return "down"
     finally:
         client.close()

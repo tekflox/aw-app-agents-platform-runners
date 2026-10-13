@@ -140,3 +140,72 @@ def test_default_gateway_ip_none_when_unreadable(monkeypatch):
         raise OSError("no /proc here")
     monkeypatch.setattr("builtins.open", _boom)
     assert shared_redis.default_gateway_ip() is None
+
+
+
+# ── a candidate that is silently dropped, not refused ────────────────────────
+# redis-py does NOT derive TimeoutError from ConnectionError, so before the
+# explicit catch in _probe a candidate whose packets are dropped rather than
+# refused raised straight out of the function — past discover_host and
+# resolve — and killed the plugin's activate.
+#
+# Live on 2026-10-13: an aw-remote-host recreate left a tailscale exit node
+# selected with its scoping routes NOT installed, so the probe to the bridge
+# gateway was swallowed by the tunnel ACL. This app never mounted /execute and
+# every Agents Platform run dispatched to it came back 404 — for what should
+# have been one candidate reporting "down" and the loop moving on.
+#
+# These resolve `redis` the way _probe does, at call time, and raise from THAT
+# module object: several tests in this suite install a fake `redis` in
+# sys.modules, and a test that raised from its own import would pass or fail
+# on suite ordering rather than on the behaviour.
+
+def _hanging_redis(monkeypatch):
+    """Make the next redis client raise the timeout _probe must swallow.
+
+    Several tests in this suite install a fake ``redis`` in sys.modules and
+    leave it there — one without a ``Redis`` attribute at all. Drop any such
+    stub and import the real package, so these two assert on redis-py's actual
+    exception hierarchy instead of on suite ordering. monkeypatch puts
+    sys.modules back afterwards.
+    """
+    import importlib
+    import sys
+
+    for name in [n for n in list(sys.modules) if n == "redis" or n.startswith("redis.")]:
+        monkeypatch.delitem(sys.modules, name, raising=False)
+    mod = importlib.import_module("redis")
+
+    class _Hangs:
+        def __init__(self, *a, **kw):
+            pass
+
+        def ping(self):
+            raise mod.exceptions.TimeoutError("Timeout connecting to server")
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(mod, "Redis", _Hangs)
+
+
+def test_a_silently_dropped_probe_is_down_not_an_exception(monkeypatch):
+    _hanging_redis(monkeypatch)
+    assert shared_redis._probe("10.0.0.1", 6379, None, None) == "down"
+
+
+def test_discovery_survives_a_hanging_candidate(monkeypatch):
+    """The consequence, as behaviour: one dead candidate must not stop the
+    sweep from reaching a live one."""
+    real_probe = shared_redis._probe
+
+    def probe(host, port, user, password):
+        if host == "10.89.0.1":          # the one that hangs
+            _hanging_redis(monkeypatch)  # …through the REAL _probe, so the
+            return real_probe(host, port, user, password)  # fix is what saves it
+        return "ok" if host == "172.18.0.1" else "down"
+
+    monkeypatch.setattr(shared_redis, "default_gateway_ip", lambda: "10.89.0.1")
+    monkeypatch.setattr(shared_redis, "_probe", probe)
+
+    assert shared_redis.discover_host(6379, None, None) == ("172.18.0.1", "ok")
