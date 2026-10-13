@@ -155,42 +155,75 @@ def test_default_gateway_ip_none_when_unreadable(monkeypatch):
 # every Agents Platform run dispatched to it came back 404 — for what should
 # have been one candidate reporting "down" and the loop moving on.
 #
-# These resolve `redis` the way _probe does, at call time, and raise from THAT
-# module object: several tests in this suite install a fake `redis` in
-# sys.modules, and a test that raised from its own import would pass or fail
-# on suite ordering rather than on the behaviour.
+# `redis` is a RUNTIME dependency and is not installed in CI, which is why the
+# rest of this suite fakes it. These do the same: the fake below reproduces
+# redis-py's hierarchy where it matters — TimeoutError is a sibling of
+# ConnectionError, not a subclass — so `except ConnectionError` alone does not
+# catch it. test_the_real_redis_still_has_the_hierarchy_this_assumes pins that
+# premise against the real package wherever it IS installed.
 
-def _hanging_redis(monkeypatch):
-    """Make the next redis client raise the timeout _probe must swallow.
-
-    Several tests in this suite install a fake ``redis`` in sys.modules and
-    leave it there — one without a ``Redis`` attribute at all. Drop any such
-    stub and import the real package, so these two assert on redis-py's actual
-    exception hierarchy instead of on suite ordering. monkeypatch puts
-    sys.modules back afterwards.
-    """
-    import importlib
+def _fake_redis(monkeypatch, *, ping):
+    """Install a `redis` module shaped like redis-py's, whose client's ping()
+    does whatever `ping` does."""
     import sys
+    import types
 
-    for name in [n for n in list(sys.modules) if n == "redis" or n.startswith("redis.")]:
-        monkeypatch.delitem(sys.modules, name, raising=False)
-    mod = importlib.import_module("redis")
+    mod = types.ModuleType("redis")
+    exc = types.ModuleType("redis.exceptions")
 
-    class _Hangs:
+    class RedisError(Exception):
+        pass
+
+    class ConnectionError_(RedisError):
+        pass
+
+    class TimeoutError_(RedisError):          # sibling, NOT a subclass
+        pass
+
+    class AuthenticationError(RedisError):
+        pass
+
+    class ResponseError(RedisError):
+        pass
+
+    exc.RedisError = RedisError
+    exc.ConnectionError = ConnectionError_
+    exc.TimeoutError = TimeoutError_
+    exc.AuthenticationError = AuthenticationError
+    exc.ResponseError = ResponseError
+
+    class _Client:
         def __init__(self, *a, **kw):
             pass
 
         def ping(self):
-            raise mod.exceptions.TimeoutError("Timeout connecting to server")
+            return ping(exc)
 
         def close(self):
             pass
 
-    monkeypatch.setattr(mod, "Redis", _Hangs)
+    mod.exceptions = exc
+    mod.Redis = _Client
+    monkeypatch.setitem(sys.modules, "redis", mod)
+    monkeypatch.setitem(sys.modules, "redis.exceptions", exc)
+    return exc
 
 
 def test_a_silently_dropped_probe_is_down_not_an_exception(monkeypatch):
-    _hanging_redis(monkeypatch)
+    def _hang(exc):
+        raise exc.TimeoutError("Timeout connecting to server")
+
+    _fake_redis(monkeypatch, ping=_hang)
+    assert shared_redis._probe("10.0.0.1", 6379, None, None) == "down"
+
+
+def test_a_refused_probe_is_still_down(monkeypatch):
+    """The case that already worked — kept so a future narrowing of the catch
+    cannot pass by only handling the timeout."""
+    def _refuse(exc):
+        raise exc.ConnectionError("Connection refused")
+
+    _fake_redis(monkeypatch, ping=_refuse)
     assert shared_redis._probe("10.0.0.1", 6379, None, None) == "down"
 
 
@@ -199,13 +232,47 @@ def test_discovery_survives_a_hanging_candidate(monkeypatch):
     sweep from reaching a live one."""
     real_probe = shared_redis._probe
 
+    def _hang(exc):
+        raise exc.TimeoutError("Timeout connecting to server")
+
+    _fake_redis(monkeypatch, ping=_hang)
+
     def probe(host, port, user, password):
-        if host == "10.89.0.1":          # the one that hangs
-            _hanging_redis(monkeypatch)  # …through the REAL _probe, so the
-            return real_probe(host, port, user, password)  # fix is what saves it
+        if host == "10.89.0.1":                            # the one that hangs…
+            return real_probe(host, port, user, password)  # …via the REAL _probe
         return "ok" if host == "172.18.0.1" else "down"
 
     monkeypatch.setattr(shared_redis, "default_gateway_ip", lambda: "10.89.0.1")
     monkeypatch.setattr(shared_redis, "_probe", probe)
 
     assert shared_redis.discover_host(6379, None, None) == ("172.18.0.1", "ok")
+
+def test_the_real_redis_still_has_the_hierarchy_this_assumes():
+    """The fake above is only honest while redis-py keeps TimeoutError off
+    ConnectionError. Pin that against the real package wherever it IS
+    installed, and skip where it is not (CI — `redis` is a runtime dependency).
+
+    In a subprocess on purpose: several tests in this suite leave a fake
+    `redis` in sys.modules, one of which has no `exceptions` attribute, so an
+    in-process import here would assert on whichever fake ran last rather than
+    on redis-py.
+    """
+    import subprocess
+    import sys
+
+    probe = (
+        "import sys\n"
+        "try:\n"
+        "    import redis\n"
+        "except ImportError:\n"
+        "    sys.exit(3)\n"
+        "print(issubclass(redis.exceptions.TimeoutError,\n"
+        "                 redis.exceptions.ConnectionError))\n"
+    )
+    r = subprocess.run([sys.executable, "-c", probe], capture_output=True, text=True)
+    if r.returncode == 3:
+        pytest.skip("redis is a runtime dependency and is not installed here")
+    assert r.returncode == 0, r.stderr
+    assert r.stdout.strip() == "False", (
+        "redis-py now derives TimeoutError from ConnectionError — _probe's "
+        "explicit catch is redundant but harmless; this test's premise is stale")
