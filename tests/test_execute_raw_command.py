@@ -117,6 +117,64 @@ def test_build_container_kwargs_branches_to_raw_before_touching_cli_specs(monkey
     assert "user" in kwargs and "environment" in kwargs
 
 
+def test_raw_command_branch_calls_execution_index_start(monkeypatch):
+    """Regression for Kanban bug:execution-index-hook-silently-drops-most-
+    runs, root cause #2: the raw_command branch in ``_run_job_blocking``
+    used to return via its own ``_publish_done``/``_forget_run``/``r.close()``
+    sequence without EVER calling ``execution_index.start()`` or
+    ``start_after_stream_done()`` — a flat missing call, not a fail-open
+    absorption. An erroring monitor run, which ``_interesting()`` would
+    otherwise admit via its error branch, was unconditionally unindexable.
+
+    ``execution_index.start()`` (the cold-path hook, same one the CLI-agent
+    path's own ``finally`` calls) is the right one here, not
+    ``start_after_stream_done()`` — a raw_command job never carries
+    agent_id/session_id (monitor_run.py's payload in agents-platform-
+    multitenant sends only run_id/raw_command/cwd/timeout_seconds), so it
+    never satisfies the warm branch's gate and always falls through to this
+    cold raw_command branch."""
+    import sys
+    import types
+
+    fake_docker = types.ModuleType("docker")
+
+    class _FakeContainer:
+        def wait(self):
+            return {"StatusCode": 0}
+
+        def logs(self, stdout=True, stderr=True, stream=False):
+            return b"ok\n"
+
+        def remove(self, force=True):
+            pass
+
+    class _FakeContainers:
+        def run(self, _image, **_kwargs):
+            return _FakeContainer()
+
+    fake_docker.DockerClient = lambda base_url=None: types.SimpleNamespace(
+        images=types.SimpleNamespace(pull=lambda *_a, **_k: None),
+        containers=_FakeContainers())
+    fake_docker.errors = types.SimpleNamespace(APIError=Exception)
+    monkeypatch.setitem(sys.modules, "docker", fake_docker)
+
+    monkeypatch.setattr(execute_mod, "CONTAINER_SOCKET", "/fake.sock")
+    monkeypatch.setattr(execute_mod.warm_pool, "enabled", lambda: False)
+    monkeypatch.setattr(execute_mod, "_redis_client", lambda url: object())
+    monkeypatch.setattr(execute_mod, "_publish_line", lambda *_a, **_k: None)
+    monkeypatch.setattr(execute_mod, "_publish_done", lambda *_a, **_k: None)
+
+    index_started = []
+    monkeypatch.setattr(execute_mod.execution_index, "start",
+                        lambda run_id: index_started.append(run_id))
+
+    job = {"run_id": "monitor-run-1", "raw_command": "git rev-parse HEAD",
+           "timeout_seconds": 5}
+    execute_mod._run_job_blocking(job, "redis://example.test:6379/0")
+
+    assert index_started == ["monitor-run-1"]
+
+
 def test_execute_route_forwards_raw_command_and_cwd(monkeypatch):
     captured = {}
 

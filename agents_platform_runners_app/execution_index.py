@@ -11,6 +11,7 @@ from typing import Any, Callable
 import httpx
 
 from . import platform_base as platform_base_mod
+from . import shared_redis
 
 log = logging.getLogger("aw_apps.agents_platform_runners.execution_index")
 
@@ -20,6 +21,86 @@ MAX_CHUNKS = 12
 TERMINAL = {"success", "error", "cancelled"}
 
 _config: dict = {}
+
+# Redis-backed counters (Kanban bug:execution-index-hook-silently-drops-most-
+# runs) — a plain in-process dict would undercount silently the moment this
+# app runs more than one worker, same class of bug as every other WORKERS=N
+# per-process-state gap already in this workspace's KB. Fixed, named reasons
+# instead of one "skipped" bucket: the whole point is telling "the KB
+# rejected our secret" apart from "the gate correctly excluded this run".
+#
+# warm_watchers_started/resolved are the direct fingerprint of the dominant
+# root cause: start_after_stream_done's watcher thread is killed silently by
+# any restart of this (Tier-1, in-process) app before it ever reaches a
+# resolution branch — a persistent, growing gap between the two is proof of
+# exactly that, and nothing else in this system can show it.
+COUNTER_NAMES = (
+    "attempted",
+    "indexed",
+    "skipped:gate",
+    "skipped:finalize_timeout",
+    "skipped:http_error",
+    "skipped:secret_reject",
+    "skipped:other",
+    "warm_watchers_started",
+    "warm_watchers_resolved",
+)
+
+_COUNTER_PREFIX = "execution_index:counters:"
+
+_counter_lock = threading.Lock()
+_counter_client = None
+_counter_client_url: str | None = None
+
+
+def _counter_redis_client():
+    """Lazily resolve and cache a sync Redis client for the counters.
+
+    Reuses the same shared Redis every run event already publishes to
+    (``shared_redis.resolve``) rather than inventing a second one. Returns
+    None when no Redis is configured/discoverable — callers must treat that
+    as "counting is unavailable", never as a reason to skip indexing itself.
+    """
+    global _counter_client, _counter_client_url
+    url = shared_redis.resolve(_config)
+    if not url:
+        return None
+    with _counter_lock:
+        if _counter_client is None or _counter_client_url != url:
+            import redis
+            _counter_client = redis.Redis.from_url(
+                url, decode_responses=True, socket_connect_timeout=5, socket_timeout=30)
+            _counter_client_url = url
+        return _counter_client
+
+
+def _incr(name: str) -> None:
+    """Best-effort INCR — a counting failure must never affect indexing."""
+    try:
+        client = _counter_redis_client()
+        if client is not None:
+            client.incr(_COUNTER_PREFIX + name)
+    except Exception:
+        log.debug("execution index: could not increment counter %s", name, exc_info=True)
+
+
+def counters_snapshot() -> dict[str, int | None]:
+    """Read-only snapshot of every counter — used by the status endpoint and
+    the doctor check. Values are None (rather than 0) when Redis itself is
+    unavailable, so a caller can tell "nothing has happened yet" apart from
+    "we cannot even measure this right now"."""
+    try:
+        client = _counter_redis_client()
+    except Exception:
+        client = None
+    if client is None:
+        return {name: None for name in COUNTER_NAMES}
+    try:
+        raw = client.mget([_COUNTER_PREFIX + name for name in COUNTER_NAMES])
+    except Exception:
+        return {name: None for name in COUNTER_NAMES}
+    return {name: (int(value) if value is not None else 0)
+            for name, value in zip(COUNTER_NAMES, raw)}
 
 
 def configure(config: dict | None) -> None:
@@ -150,6 +231,7 @@ def index_run(run_id: str, *, config: dict | None = None,
     mode = str(cfg.get("execution_index_mode") or "interesting")
     if mode == "off":
         return False
+    _incr("attempted")
     base = platform_base_mod.resolve(cfg).rstrip("/")
     kb_base = str(cfg.get("kb_base_url") or "http://aw-app-kb:8000").rstrip("/")
     secret = str(cfg.get("execution_index_secret") or "")
@@ -167,6 +249,7 @@ def index_run(run_id: str, *, config: dict | None = None,
                     break
                 if monotonic() - started >= deadline_s:
                     log.warning("execution index: run=%s did not finalize before deadline; skipped", run_id)
+                    _incr("skipped:finalize_timeout")
                     return False
                 sleep(delay)
                 delay = min(delay * 2, 5.0)
@@ -178,6 +261,7 @@ def index_run(run_id: str, *, config: dict | None = None,
             if not isinstance(events, list):
                 raise ValueError("run events response is not a list")
             if not _interesting(run, events, mode):
+                _incr("skipped:gate")
                 return False
             truncated = len(events) >= EVENTS_LIMIT
             chunks = _chunks(run, events, truncated)
@@ -186,15 +270,36 @@ def index_run(run_id: str, *, config: dict | None = None,
                 "chunks": chunks,
                 "metadata_common": {"events_truncated": truncated},
             }
-            response = client.post(
-                f"{kb_base}/api/kb/executions", json=payload,
-                headers={"X-KB-Exec-Secret": secret},
-            )
-            response.raise_for_status()
+            try:
+                response = client.post(
+                    f"{kb_base}/api/kb/executions", json=payload,
+                    headers={"X-KB-Exec-Secret": secret},
+                )
+                response.raise_for_status()
+            except httpx.HTTPStatusError as exc:
+                # A wrong/rotated execution_index_secret answers 401/403 —
+                # distinguish it from a generic KB-side error so this counter
+                # alone can name a credential mismatch without a log grep.
+                if exc.response.status_code in (401, 403):
+                    log.warning("execution index: skipped run=%s — kb rejected secret (%s)",
+                                run_id, exc.response.status_code)
+                    _incr("skipped:secret_reject")
+                else:
+                    log.warning("execution index: skipped run=%s after error: %s", run_id, exc)
+                    _incr("skipped:http_error")
+                return False
             log.info("execution index: indexed run=%s chunks=%d", run_id, len(chunks))
+            _incr("indexed")
             return True
+    except httpx.HTTPStatusError as exc:
+        # The AP-MT run/events GET calls above failing non-2xx — same bucket
+        # as a KB-side error that isn't specifically a secret mismatch.
+        log.warning("execution index: skipped run=%s after error: %s", run_id, exc)
+        _incr("skipped:http_error")
+        return False
     except Exception as exc:  # fail-open: indexing can never affect run delivery
         log.warning("execution index: skipped run=%s after error: %s", run_id, exc)
+        _incr("skipped:other")
         return False
 
 
@@ -220,7 +325,12 @@ def start_after_stream_done(run_id: str, redis_url: str) -> threading.Thread | N
         client = None
         try:
             import redis
-            client = redis.Redis.from_url(redis_url, decode_responses=True)
+            # Same connect/read timeouts as execute.py's own _redis_client()
+            # helper — this client used to set neither, leaving it able to
+            # hang indefinitely on a stale/half-open socket below the
+            # xread(block=5000) bound, with no exception and no warning.
+            client = redis.Redis.from_url(redis_url, decode_responses=True,
+                                          socket_connect_timeout=5, socket_timeout=30)
             cursor = "0-0"
             deadline = time.monotonic() + 24 * 3600
             key = f"run:{run_id}:events"
@@ -231,10 +341,13 @@ def start_after_stream_done(run_id: str, redis_url: str) -> threading.Thread | N
                         cursor = entry_id
                         if str(fields.get("done") or "").lower() in {"1", "true"}:
                             index_run(run_id)
+                            _incr("warm_watchers_resolved")
                             return
             log.warning("execution index: warm run=%s emitted no done before watcher deadline", run_id)
+            _incr("warm_watchers_resolved")
         except Exception as exc:
             log.warning("execution index: warm completion watch failed run=%s: %s", run_id, exc)
+            _incr("warm_watchers_resolved")
         finally:
             if client is not None:
                 try:
@@ -245,6 +358,12 @@ def start_after_stream_done(run_id: str, redis_url: str) -> threading.Thread | N
     try:
         thread = threading.Thread(target=_wait, name=f"execution-index-wait-{run_id[:12]}",
                                   daemon=True)
+        # Right before thread.start(): a persistent, growing gap between this
+        # and warm_watchers_resolved is the direct fingerprint of a watcher
+        # thread killed by a restart of this (Tier-1, in-process) app before
+        # it ever reached one of _wait()'s three resolution branches above —
+        # see this module's module-level COUNTER_NAMES comment.
+        _incr("warm_watchers_started")
         thread.start()
         return thread
     except Exception as exc:

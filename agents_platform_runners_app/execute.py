@@ -3102,6 +3102,17 @@ def _run_job_blocking(job: dict, redis_url: str) -> None:
         if kill_timer:
             kill_timer.cancel()
         _publish_done(r, run_id, returncode)
+        # A raw_command job never carries agent_id/session_id (monitor_run.py
+        # in agents-platform-multitenant sends only run_id/raw_command/cwd/
+        # timeout_seconds), so it never takes the warm branch above and
+        # always lands here cold — execution_index.start() (the same call
+        # every cold CLI-agent run makes in this function's own `finally`
+        # below) is the right hook, not start_after_stream_done(). This
+        # branch used to return without calling either, making an erroring
+        # monitor run — which _interesting() would otherwise admit via its
+        # error branch — unconditionally unindexable (Kanban
+        # bug:execution-index-hook-silently-drops-most-runs, root cause #2).
+        execution_index.start(run_id)
         try:
             container.remove(force=True)
         except Exception:

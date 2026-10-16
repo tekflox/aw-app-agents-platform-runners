@@ -13,6 +13,24 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
 from agents_platform_runners_app import execute as execute_mod  # noqa: E402
+from agents_platform_runners_app import execution_index as execution_index_mod  # noqa: E402
+
+
+@pytest.fixture(autouse=True)
+def no_real_execution_index_counter_redis(monkeypatch):
+    """Stop every test that calls ``index_run``/``start_after_stream_done``
+    from making ``_incr`` reach out over the network.
+
+    ``_counter_redis_client`` falls back to ``shared_redis.resolve``'s real
+    gateway-probing discovery when no URL is configured — fine in production
+    (a one-time, cached probe), but every test in this file that exercises
+    the indexing hook would otherwise pay that probe's latency once per
+    process and, on a host with something listening on 6379, could start
+    incrementing real counters on whatever Redis it finds. ``_incr``/
+    ``counters_snapshot`` are fail-open by design, so defaulting the client
+    to None here changes no test's assertions — only the counter tests in
+    test_execution_index_counters.py override this themselves."""
+    monkeypatch.setattr(execution_index_mod, "_counter_redis_client", lambda: None)
 
 
 @pytest.fixture(autouse=True)

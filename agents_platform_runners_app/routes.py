@@ -40,6 +40,18 @@ _runner_status = runner_registration_mod.runner_status
 
 log = logging.getLogger("aw_apps.agents_platform_runners.routes")
 
+# /execution-index/doctor thresholds. Both are heuristics, not measured
+# ceilings — there is no history of "normal" concurrent in-flight warm
+# watcher count to calibrate against yet, since the counters this reads
+# did not exist before this fix. Chosen to be well above the handful of
+# warm turns normally in flight at once (a watcher resolves within seconds
+# of its run's "done" sentinel) while still catching the bug's signature
+# (a gap that only grows) long before it reaches the ~75% scale measured
+# live on 2026-10-16.
+_WARM_WATCHER_GAP_THRESHOLD = 20
+_SKIP_RATIO_THRESHOLD = 0.5
+_SKIP_RATIO_MIN_SAMPLE = 20
+
 
 def build_routes(config: dict | None = None, *, kanban_sweep_status: dict | None = None,
                  package_dir: str | None = None) -> FastAPI:
@@ -139,6 +151,47 @@ def build_routes(config: dict | None = None, *, kanban_sweep_status: dict | None
         except Exception as exc:  # noqa: BLE001 — surfaced as an error, never as []
             raise HTTPException(502, f"could not list warm containers: {exc}") from exc
         return {"warm_enabled": warm_pool.enabled(), "containers": containers}
+
+    @app.get("/execution-index/status")
+    async def execution_index_status() -> dict:
+        """Observability for the post-run indexing hook (Kanban bug:
+        execution-index-hook-silently-drops-most-runs): attempted/indexed/
+        skipped-by-reason counters plus the warm-watcher started/resolved
+        gap. Read-only, no secret required — mirrors aw-app-kb's own
+        ``/api/kb/executions/status`` posture."""
+        return execution_index_mod.counters_snapshot()
+
+    @app.get("/execution-index/doctor")
+    async def execution_index_doctor() -> dict:
+        """``contributes.doctor`` entry for the same counters — ``ok=False``
+        when either fingerprint of the silent-drop bug shows up: a growing
+        warm_watchers_started/resolved gap (watcher threads killed by a
+        restart before they ever indexed their run), or a high skipped-vs-
+        attempted ratio once there is enough volume to judge it by."""
+        counters = execution_index_mod.counters_snapshot()
+        if any(v is None for v in counters.values()):
+            return {"ok": False, "detail": {
+                "counters": counters,
+                "problems": ["Redis unavailable — counters cannot be read"],
+            }}
+        attempted = counters["attempted"]
+        indexed = counters["indexed"]
+        started = counters["warm_watchers_started"]
+        resolved = counters["warm_watchers_resolved"]
+        gap = started - resolved
+        skipped = max(attempted - indexed, 0)
+        skip_ratio = (skipped / attempted) if attempted else 0.0
+        problems = []
+        if gap > _WARM_WATCHER_GAP_THRESHOLD:
+            problems.append(
+                f"warm_watchers_started ({started}) exceeds warm_watchers_resolved "
+                f"({resolved}) by {gap} — the fingerprint of a watcher thread killed "
+                f"by a restart of this app before it ever indexed its run")
+        if attempted >= _SKIP_RATIO_MIN_SAMPLE and skip_ratio > _SKIP_RATIO_THRESHOLD:
+            problems.append(
+                f"{skipped}/{attempted} attempted runs were skipped ({skip_ratio:.0%}) "
+                f"— see the skipped:<reason> breakdown at /execution-index/status")
+        return {"ok": not problems, "detail": {"counters": counters, "problems": problems}}
 
     @app.post("/register")
     async def register() -> dict:

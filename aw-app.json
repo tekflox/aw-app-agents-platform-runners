@@ -41,6 +41,12 @@
         "prefix": "/api/apps/agents-platform-runners"
       }
     ],
+    "doctor": [
+      {
+        "label": "Execution index",
+        "route": "/execution-index/doctor"
+      }
+    ],
     "mcp": {
       "reload_on_save": true
     },
