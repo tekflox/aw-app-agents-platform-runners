@@ -12,6 +12,7 @@ from __future__ import annotations
 import fnmatch
 import sys
 import threading
+import time
 from pathlib import Path
 
 import httpx
@@ -24,13 +25,45 @@ from agents_platform_runners_app import execution_index as idx  # noqa: E402
 from agents_platform_runners_app.routes import build_routes  # noqa: E402
 
 
+class _FakePipeline:
+    """Minimal stand-in for redis.Redis.pipeline() — enough for ``_incr``'s
+    INCR lifetime key + INCR/EXPIRE bucket key dual write. No real
+    batching/atomicity; just records ops and applies them against the same
+    FakeCounterRedis on ``execute()``, same as the real pipeline resolving
+    against the same keyspace."""
+
+    def __init__(self, redis: "FakeCounterRedis"):
+        self._redis = redis
+        self._ops: list[tuple] = []
+
+    def incr(self, key):
+        self._ops.append(("incr", key))
+        return self
+
+    def expire(self, key, ttl):
+        self._ops.append(("expire", key, ttl))
+        return self
+
+    def execute(self):
+        results = []
+        for op in self._ops:
+            if op[0] == "incr":
+                results.append(self._redis.incr(op[1]))
+            else:
+                self._redis.expirations[op[1]] = op[2]
+                results.append(True)
+        self._ops = []
+        return results
+
+
 class FakeCounterRedis:
-    """Minimal stand-in for the sync redis client's INCR/MGET — real Redis
-    semantics: INCR stores (and MGET returns) a string, even though INCR's
-    own reply is an integer."""
+    """Minimal stand-in for the sync redis client's INCR/MGET/pipeline —
+    real Redis semantics: INCR stores (and MGET returns) a string, even
+    though INCR's own reply is an integer."""
 
     def __init__(self):
         self.data: dict[str, str] = {}
+        self.expirations: dict[str, int] = {}
 
     def incr(self, key):
         self.data[key] = str(int(self.data.get(key, "0")) + 1)
@@ -43,6 +76,16 @@ class FakeCounterRedis:
         if match is None:
             return list(self.data.keys())
         return [k for k in self.data if fnmatch.fnmatch(k, match)]
+
+    def pipeline(self):
+        return _FakePipeline(self)
+
+
+def _window_key(name: str, hours_ago: int = 0) -> str:
+    """The hourly bucket key ``_incr``/``counters_window_snapshot`` use for
+    ``name`` at ``hours_ago`` hours before now — lets a test seed/assert on
+    the window without duplicating the hour-bucket format."""
+    return idx._WINDOW_BUCKET_PREFIX + name + ":" + idx._hour_bucket(time.time() - hours_ago * 3600)
 
 
 def _run(ended_at="2026-09-04T10:00:00Z", **overrides):
@@ -405,32 +448,121 @@ def test_execution_index_doctor_flags_a_persistent_warm_watcher_gap(monkeypatch)
     assert any("warm_watchers_started" in p for p in body["detail"]["problems"])
 
 
-def test_execution_index_doctor_flags_a_high_skip_ratio_with_enough_volume(monkeypatch):
+def test_execution_index_doctor_ok_with_high_gate_ratio_and_zero_failures(monkeypatch):
+    """Acceptance test #1 (card 3fc5bf3b): skipped:gate is the
+    _interesting() gate's intentional exclusion, not a failure — a window
+    dominated by gate exclusions (562/935 live) must not trip the doctor
+    just because overall attempted vs indexed looks skewed."""
     fake = FakeCounterRedis()
     monkeypatch.setattr(idx, "_counter_redis_client", lambda: fake)
-    fake.data[idx._COUNTER_PREFIX + "attempted"] = "40"
-    fake.data[idx._COUNTER_PREFIX + "indexed"] = "5"
-
-    client = TestClient(build_routes({}))
-    body = client.get("/execution-index/doctor").json()
-
-    assert body["ok"] is False
-    assert any("skipped" in p for p in body["detail"]["problems"])
-
-
-def test_execution_index_doctor_ignores_skip_ratio_below_the_sample_floor(monkeypatch):
-    """A fresh/low-traffic deployment with e.g. 1 attempted and 0 indexed is
-    a 100% skip ratio by arithmetic alone — must not flag on that with no
-    real sample size behind it."""
-    fake = FakeCounterRedis()
-    monkeypatch.setattr(idx, "_counter_redis_client", lambda: fake)
-    fake.data[idx._COUNTER_PREFIX + "attempted"] = "1"
-    fake.data[idx._COUNTER_PREFIX + "indexed"] = "0"
+    fake.data[_window_key("attempted")] = "100"
+    fake.data[_window_key("skipped:gate")] = "94"
+    fake.data[_window_key("indexed")] = "6"
 
     client = TestClient(build_routes({}))
     body = client.get("/execution-index/doctor").json()
 
     assert body["ok"] is True
+    assert body["detail"]["problems"] == []
+
+
+def test_execution_index_doctor_flags_real_failures_above_threshold_in_the_window(monkeypatch):
+    """Acceptance test #2: a real failure rate (not gate exclusions) above
+    the 0.2 threshold must flag, and the problem message must name the
+    ratio."""
+    fake = FakeCounterRedis()
+    monkeypatch.setattr(idx, "_counter_redis_client", lambda: fake)
+    fake.data[_window_key("attempted")] = "100"
+    fake.data[_window_key("skipped:http_error")] = "30"
+    fake.data[_window_key("indexed")] = "70"
+
+    client = TestClient(build_routes({}))
+    body = client.get("/execution-index/doctor").json()
+
+    assert body["ok"] is False
+    assert any("30/100" in p and "30%" in p for p in body["detail"]["problems"])
+
+
+def test_execution_index_doctor_ignores_historical_lifetime_pollution_with_a_clean_window(monkeypatch):
+    """The historical-contamination regression test: a legacy lifetime
+    skipped:other of 208 (pre-v0.173.0 catch-all pollution) must not leak
+    into a doctor verdict that now reads the window, not the lifetime
+    counters."""
+    fake = FakeCounterRedis()
+    monkeypatch.setattr(idx, "_counter_redis_client", lambda: fake)
+    fake.data[idx._COUNTER_PREFIX + "skipped:other"] = "208"
+    fake.data[_window_key("attempted")] = "10"
+    fake.data[_window_key("indexed")] = "10"
+
+    client = TestClient(build_routes({}))
+    body = client.get("/execution-index/doctor").json()
+
+    assert body["ok"] is True
+
+
+def test_execution_index_doctor_counts_a_dynamic_skipped_other_bucket_in_the_window(monkeypatch):
+    """A skipped:other:<ExceptionType> bucket discovered dynamically must
+    count in the window numerator with no code change — the whole point of
+    the prefix rule."""
+    fake = FakeCounterRedis()
+    monkeypatch.setattr(idx, "_counter_redis_client", lambda: fake)
+    fake.data[_window_key("attempted")] = "20"
+    fake.data[_window_key("skipped:other:ReadTimeout")] = "10"
+    fake.data[_window_key("indexed")] = "10"
+
+    client = TestClient(build_routes({}))
+    body = client.get("/execution-index/doctor").json()
+
+    assert body["ok"] is False
+    assert body["detail"]["counters_window"]["skipped:other:ReadTimeout"] == 10
+
+
+def test_execution_index_doctor_does_not_count_in_flight_runs_as_failures(monkeypatch):
+    """attempted increments at the top of index_run before any outcome is
+    known — a run still in flight (no skipped:*/indexed counter yet) must
+    not be treated as a failure just because eligible - indexed is
+    nonzero. The numerator is the explicit skipped:* sum, not a
+    subtraction."""
+    fake = FakeCounterRedis()
+    monkeypatch.setattr(idx, "_counter_redis_client", lambda: fake)
+    fake.data[_window_key("attempted")] = "10"
+
+    client = TestClient(build_routes({}))
+    body = client.get("/execution-index/doctor").json()
+
+    assert body["ok"] is True
+    assert body["detail"]["problems"] == []
+
+
+def test_execution_index_doctor_notes_insufficient_volume_below_min_sample(monkeypatch):
+    """A fresh/low-traffic window — e.g. 4 eligible runs, all failed — is a
+    100% failure ratio by arithmetic alone but must not flag with no real
+    sample size behind it; it must still surface an explicit note."""
+    fake = FakeCounterRedis()
+    monkeypatch.setattr(idx, "_counter_redis_client", lambda: fake)
+    fake.data[_window_key("attempted")] = "4"
+    fake.data[_window_key("skipped:http_error")] = "4"
+
+    client = TestClient(build_routes({}))
+    body = client.get("/execution-index/doctor").json()
+
+    assert body["ok"] is True
+    assert "insufficient volume" in body["detail"]["note"]
+
+
+def test_incr_sets_a_ttl_on_the_window_bucket_key(monkeypatch):
+    """No unbounded key growth: every window bucket write carries an
+    EXPIRE in the same pipeline as the INCR."""
+    fake = FakeCounterRedis()
+    monkeypatch.setattr(idx, "_counter_redis_client", lambda: fake)
+
+    idx._incr("attempted")
+
+    bucket_key = _window_key("attempted")
+    assert fake.data[bucket_key] == "1"
+    assert fake.expirations[bucket_key] == idx._WINDOW_BUCKET_TTL_S
+    # Lifetime key also incremented in the same dual write.
+    assert fake.data[idx._COUNTER_PREFIX + "attempted"] == "1"
 
 
 def test_execution_index_doctor_ok_when_nothing_has_happened_yet(monkeypatch):
@@ -441,8 +573,13 @@ def test_execution_index_doctor_ok_when_nothing_has_happened_yet(monkeypatch):
     resp = client.get("/execution-index/doctor")
 
     assert resp.status_code == 200
-    assert resp.json() == {"ok": True, "detail": {
-        "counters": {name: 0 for name in idx.COUNTER_NAMES}, "problems": []}}
+    body = resp.json()
+    assert body["ok"] is True
+    assert body["detail"]["counters"] == {name: 0 for name in idx.COUNTER_NAMES}
+    assert body["detail"]["counters_window"] == {name: 0 for name in idx.COUNTER_NAMES}
+    assert body["detail"]["window_hours"] == idx.WINDOW_LOOKBACK_HOURS
+    assert body["detail"]["problems"] == []
+    assert "insufficient volume" in body["detail"]["note"]
 
 
 def test_execution_index_doctor_reports_not_ok_when_redis_is_unavailable():

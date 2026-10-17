@@ -77,6 +77,22 @@ COUNTER_NAMES = (
 
 _COUNTER_PREFIX = "execution_index:counters:"
 
+# Windowed mirror of the lifetime counters above (Kanban observability:
+# execution-index-doctor-false-alarm-from-gate-exclusions): the doctor
+# check's failure ratio must forget an old incident instead of staying red
+# forever, so each counter also gets an hourly UTC bucket key alongside its
+# lifetime key. WINDOW_LOOKBACK_HOURS is the nominal span the doctor reads;
+# the snapshot actually sums WINDOW_LOOKBACK_HOURS+1 buckets (the current,
+# still-filling hour plus that many full hours back) so the lookback never
+# undercounts a window that started mid-hour. TTL outlives the lookback by
+# a comfortable margin (a bucket is only ever written during its own hour,
+# so it is read for at most ~25h after creation) — the keyspace is self-
+# pruning, no reset job, no manual surgery.
+WINDOW_LOOKBACK_HOURS = 24
+_WINDOW_BUCKET_COUNT = WINDOW_LOOKBACK_HOURS + 1
+_WINDOW_BUCKET_TTL_S = 26 * 3600
+_WINDOW_BUCKET_PREFIX = _COUNTER_PREFIX + "w:"
+
 # Kanban observability:execution-index-skipped-other-unclassified: the
 # generic except-handler in index_run used to collapse every exception type
 # into one anonymous "skipped:other" bucket. It now names the bucket after
@@ -113,12 +129,30 @@ def _counter_redis_client():
         return _counter_client
 
 
+def _hour_bucket(ts: float | None = None) -> str:
+    """UTC hour bucket, e.g. ``2026101715`` — a pure function of wall-clock
+    time, so every WORKERS=N worker derives the identical key for "now"
+    with no coordination between them."""
+    return time.strftime("%Y%m%d%H", time.gmtime(ts if ts is not None else time.time()))
+
+
 def _incr(name: str) -> None:
-    """Best-effort INCR — a counting failure must never affect indexing."""
+    """Best-effort INCR — a counting failure must never affect indexing.
+
+    Dual-writes in one pipeline: the existing lifetime key, and an hourly
+    UTC bucket key (``_WINDOW_BUCKET_PREFIX<name>:<hour>``) that the
+    doctor's windowed failure ratio reads via ``counters_window_snapshot``.
+    Both writes stay inside this one try — a bucket-write failure must
+    never affect indexing or the lifetime count, same as before."""
     try:
         client = _counter_redis_client()
         if client is not None:
-            client.incr(_COUNTER_PREFIX + name)
+            bucket_key = _WINDOW_BUCKET_PREFIX + name + ":" + _hour_bucket()
+            pipe = client.pipeline()
+            pipe.incr(_COUNTER_PREFIX + name)
+            pipe.incr(bucket_key)
+            pipe.expire(bucket_key, _WINDOW_BUCKET_TTL_S)
+            pipe.execute()
     except Exception:
         log.debug("execution index: could not increment counter %s", name, exc_info=True)
 
@@ -160,6 +194,64 @@ def counters_snapshot() -> dict[str, int | None]:
         return {name: None for name in COUNTER_NAMES}
     return {name: (int(value) if value is not None else 0)
             for name, value in zip(names, raw)}
+
+
+def _dynamic_skipped_other_names_window(client) -> list[str]:
+    """Window counterpart of ``_dynamic_skipped_other_names`` — scans the
+    bucket pattern (``...:w:skipped:other:*``), not the lifetime one, and
+    parses the counter name back out by stripping the trailing
+    ``:<hour>`` segment. Counter names themselves contain colons
+    (``skipped:other:ReadTimeout``), so this splits on the LAST colon —
+    safe because the hour suffix is always a plain digit string with no
+    colon of its own."""
+    scan_iter = getattr(client, "scan_iter", None)
+    if scan_iter is None:
+        return []
+    try:
+        match = _WINDOW_BUCKET_PREFIX + _SKIPPED_OTHER_PREFIX + "*"
+        names = set()
+        for key in scan_iter(match=match):
+            suffix = key[len(_WINDOW_BUCKET_PREFIX):]
+            name, _, _hour = suffix.rpartition(":")
+            if name:
+                names.add(name)
+        return sorted(names)
+    except Exception:
+        return []
+
+
+def _window_bucket_keys(name: str, bucket_count: int = _WINDOW_BUCKET_COUNT) -> list[str]:
+    now = time.time()
+    return [_WINDOW_BUCKET_PREFIX + name + ":" + _hour_bucket(now - i * 3600)
+            for i in range(bucket_count)]
+
+
+def counters_window_snapshot(hours: int = WINDOW_LOOKBACK_HOURS) -> dict[str, int | None]:
+    """Windowed mirror of ``counters_snapshot()`` — the doctor check's
+    failure ratio reads this instead of the lifetime counters, so an old
+    incident ages out instead of keeping the check red forever. Sums
+    ``hours + 1`` hourly UTC buckets (the current, still-filling hour plus
+    that many full hours back) per counter name — one MGET per name, same
+    shape as the lifetime snapshot's single MGET across all names, just
+    repeated because each name has its own set of bucket keys. ``None``
+    for every name when Redis is unreachable — same contract as
+    ``counters_snapshot()``."""
+    try:
+        client = _counter_redis_client()
+    except Exception:
+        client = None
+    if client is None:
+        return {name: None for name in COUNTER_NAMES}
+    bucket_count = hours + 1
+    names = COUNTER_NAMES + tuple(_dynamic_skipped_other_names_window(client))
+    try:
+        result: dict[str, int | None] = {}
+        for name in names:
+            raw = client.mget(_window_bucket_keys(name, bucket_count))
+            result[name] = sum(int(value) for value in raw if value is not None)
+        return result
+    except Exception:
+        return {name: None for name in COUNTER_NAMES}
 
 
 def configure(config: dict | None) -> None:

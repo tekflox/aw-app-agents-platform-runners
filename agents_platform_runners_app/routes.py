@@ -49,8 +49,17 @@ log = logging.getLogger("aw_apps.agents_platform_runners.routes")
 # (a gap that only grows) long before it reaches the ~75% scale measured
 # live on 2026-10-16.
 _WARM_WATCHER_GAP_THRESHOLD = 20
-_SKIP_RATIO_THRESHOLD = 0.5
-_SKIP_RATIO_MIN_SAMPLE = 20
+
+# Kanban observability:execution-index-doctor-false-alarm-from-gate-
+# exclusions: the failure ratio below is computed from WINDOWED counters
+# (execution_index_mod.counters_window_snapshot) over eligible runs only —
+# skipped:gate is the _interesting() gate's intentional exclusion, not a
+# failure, and is excluded from both eligible and the numerator. With a
+# clean numerator a sustained 20% failure rate among eligible runs is
+# already an incident, unlike the old 0.5/20 pair which was calibrated
+# against a ratio polluted by gate exclusions.
+_FAILURE_RATIO_THRESHOLD = 0.2
+_FAILURE_RATIO_MIN_SAMPLE = 5
 
 
 def build_routes(config: dict | None = None, *, kanban_sweep_status: dict | None = None,
@@ -166,32 +175,69 @@ def build_routes(config: dict | None = None, *, kanban_sweep_status: dict | None
         """``contributes.doctor`` entry for the same counters — ``ok=False``
         when either fingerprint of the silent-drop bug shows up: a growing
         warm_watchers_started/resolved gap (watcher threads killed by a
-        restart before they ever indexed their run), or a high skipped-vs-
-        attempted ratio once there is enough volume to judge it by."""
+        restart before they ever indexed their run), or a windowed failure
+        ratio above threshold once there is enough eligible volume in the
+        window to judge it by.
+
+        The failure ratio reads ``counters_window_snapshot`` (the last
+        ``WINDOW_LOOKBACK_HOURS``), not the lifetime counters: lifetime
+        ``skipped:gate`` — the ``_interesting()`` gate's intentional
+        exclusions, not failures — used to dominate the old ``skipped /
+        attempted`` ratio and keep this check red by construction even
+        while the indexer was healthy (Kanban observability:execution-
+        index-doctor-false-alarm-from-gate-exclusions). The numerator here
+        is the sum of every ``skipped:*`` counter except ``skipped:gate``
+        (a prefix rule, so a newly-discovered ``skipped:other:<Exc>`` name
+        counts with no code change), and the denominator excludes
+        ``skipped:gate`` too, so an eligible run is one the indexer should
+        have indexed. The warm-watcher gap check above stays on lifetime
+        counters deliberately — see the design doc for why."""
         counters = execution_index_mod.counters_snapshot()
-        if any(v is None for v in counters.values()):
+        window_counters = execution_index_mod.counters_window_snapshot()
+        if any(v is None for v in counters.values()) or any(v is None for v in window_counters.values()):
             return {"ok": False, "detail": {
                 "counters": counters,
+                "counters_window": window_counters,
+                "window_hours": execution_index_mod.WINDOW_LOOKBACK_HOURS,
                 "problems": ["Redis unavailable — counters cannot be read"],
             }}
-        attempted = counters["attempted"]
-        indexed = counters["indexed"]
         started = counters["warm_watchers_started"]
         resolved = counters["warm_watchers_resolved"]
         gap = started - resolved
-        skipped = max(attempted - indexed, 0)
-        skip_ratio = (skipped / attempted) if attempted else 0.0
+
+        attempted_w = window_counters["attempted"]
+        gate_w = window_counters.get("skipped:gate", 0)
+        eligible = max(attempted_w - gate_w, 0)
+        failures = sum(value for name, value in window_counters.items()
+                       if name.startswith("skipped:") and name != "skipped:gate")
+        failure_ratio = (failures / eligible) if eligible else 0.0
+
         problems = []
         if gap > _WARM_WATCHER_GAP_THRESHOLD:
             problems.append(
                 f"warm_watchers_started ({started}) exceeds warm_watchers_resolved "
                 f"({resolved}) by {gap} — the fingerprint of a watcher thread killed "
                 f"by a restart of this app before it ever indexed its run")
-        if attempted >= _SKIP_RATIO_MIN_SAMPLE and skip_ratio > _SKIP_RATIO_THRESHOLD:
+
+        detail_extra: dict = {}
+        if eligible < _FAILURE_RATIO_MIN_SAMPLE:
+            detail_extra["note"] = (
+                f"insufficient volume to judge: {eligible} eligible runs in the "
+                f"last {execution_index_mod.WINDOW_LOOKBACK_HOURS}h window "
+                f"(minimum {_FAILURE_RATIO_MIN_SAMPLE})")
+        elif failure_ratio > _FAILURE_RATIO_THRESHOLD:
             problems.append(
-                f"{skipped}/{attempted} attempted runs were skipped ({skip_ratio:.0%}) "
-                f"— see the skipped:<reason> breakdown at /execution-index/status")
-        return {"ok": not problems, "detail": {"counters": counters, "problems": problems}}
+                f"{failures}/{eligible} eligible runs failed in the last "
+                f"{execution_index_mod.WINDOW_LOOKBACK_HOURS}h window "
+                f"({failure_ratio:.0%}) — see counters_window at /execution-index/doctor")
+
+        return {"ok": not problems, "detail": {
+            "counters": counters,
+            "counters_window": window_counters,
+            "window_hours": execution_index_mod.WINDOW_LOOKBACK_HOURS,
+            **detail_extra,
+            "problems": problems,
+        }}
 
     @app.post("/register")
     async def register() -> dict:
