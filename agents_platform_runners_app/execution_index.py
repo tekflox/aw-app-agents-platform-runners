@@ -20,6 +20,19 @@ MAX_CHARS = 1500
 MAX_CHUNKS = 12
 TERMINAL = {"success", "error", "cancelled"}
 
+# The shared httpx.Client below is built with timeout=5, which the two AP-MT
+# GETs (run poll, events) comfortably meet — confirmed live, they never miss
+# it. aw-app-kb's POST /api/kb/executions does not: it runs synchronous
+# embedding generation (exec_pg.py's _kb._embed_docs) before the INSERT,
+# measured live at 18.07s for a SINGLE trivial chunk, and real payloads carry
+# up to MAX_CHUNKS=12. That mismatch was the entire cause of Kanban
+# observability:execution-index-skipped-other-unclassified: every one of
+# those POSTs raised httpx.ReadTimeout, which isn't an httpx.HTTPStatusError
+# so it fell through both specific handlers into the generic catch-all. This
+# is a per-call override (httpx.Client.post(..., timeout=...)), not a change
+# to the shared client's default — the AP-MT GETs keep their fast 5s budget.
+KB_POST_TIMEOUT_S = 120.0
+
 _config: dict = {}
 
 # Redis-backed counters (Kanban bug:execution-index-hook-silently-drops-most-
@@ -47,6 +60,16 @@ COUNTER_NAMES = (
 )
 
 _COUNTER_PREFIX = "execution_index:counters:"
+
+# Kanban observability:execution-index-skipped-other-unclassified: the
+# generic except-handler in index_run used to collapse every exception type
+# into one anonymous "skipped:other" bucket. It now names the bucket after
+# the exception type (e.g. "skipped:other:ReadTimeout") so a NEW failure
+# mode shows up named instead of hiding inside a catch-all that already
+# swallowed 75% of traffic once. COUNTER_NAMES stays a fixed tuple for the
+# well-known buckets — these dynamic names aren't known ahead of time, so
+# counters_snapshot() discovers them with a key-pattern scan instead.
+_SKIPPED_OTHER_PREFIX = "skipped:other:"
 
 _counter_lock = threading.Lock()
 _counter_client = None
@@ -84,23 +107,43 @@ def _incr(name: str) -> None:
         log.debug("execution index: could not increment counter %s", name, exc_info=True)
 
 
+def _dynamic_skipped_other_names(client) -> list[str]:
+    """Discover ``skipped:other:<ExceptionType>`` names already written to
+    Redis — COUNTER_NAMES can't list these ahead of time since the whole
+    point is that a new exception type gets its own name the first time it
+    occurs. Best-effort: a fake/stub client without ``scan_iter`` (as in
+    most of this module's existing tests) just yields none, same as a scan
+    that finds nothing."""
+    scan_iter = getattr(client, "scan_iter", None)
+    if scan_iter is None:
+        return []
+    try:
+        match = _COUNTER_PREFIX + _SKIPPED_OTHER_PREFIX + "*"
+        return sorted(key[len(_COUNTER_PREFIX):] for key in scan_iter(match=match))
+    except Exception:
+        return []
+
+
 def counters_snapshot() -> dict[str, int | None]:
     """Read-only snapshot of every counter — used by the status endpoint and
     the doctor check. Values are None (rather than 0) when Redis itself is
     unavailable, so a caller can tell "nothing has happened yet" apart from
-    "we cannot even measure this right now"."""
+    "we cannot even measure this right now". Includes whichever dynamic
+    skipped:other:<ExceptionType> buckets have been written, on top of the
+    fixed COUNTER_NAMES set."""
     try:
         client = _counter_redis_client()
     except Exception:
         client = None
     if client is None:
         return {name: None for name in COUNTER_NAMES}
+    names = COUNTER_NAMES + tuple(_dynamic_skipped_other_names(client))
     try:
-        raw = client.mget([_COUNTER_PREFIX + name for name in COUNTER_NAMES])
+        raw = client.mget([_COUNTER_PREFIX + name for name in names])
     except Exception:
         return {name: None for name in COUNTER_NAMES}
     return {name: (int(value) if value is not None else 0)
-            for name, value in zip(COUNTER_NAMES, raw)}
+            for name, value in zip(names, raw)}
 
 
 def configure(config: dict | None) -> None:
@@ -274,6 +317,7 @@ def index_run(run_id: str, *, config: dict | None = None,
                 response = client.post(
                     f"{kb_base}/api/kb/executions", json=payload,
                     headers={"X-KB-Exec-Secret": secret},
+                    timeout=KB_POST_TIMEOUT_S,
                 )
                 response.raise_for_status()
             except httpx.HTTPStatusError as exc:
@@ -299,7 +343,7 @@ def index_run(run_id: str, *, config: dict | None = None,
         return False
     except Exception as exc:  # fail-open: indexing can never affect run delivery
         log.warning("execution index: skipped run=%s after error: %s", run_id, exc)
-        _incr("skipped:other")
+        _incr(f"{_SKIPPED_OTHER_PREFIX}{type(exc).__name__}")
         return False
 
 

@@ -9,6 +9,7 @@ Run: .venv/aw/bin/python -m pytest tests/test_execution_index_counters.py
 """
 from __future__ import annotations
 
+import fnmatch
 import sys
 import threading
 from pathlib import Path
@@ -37,6 +38,11 @@ class FakeCounterRedis:
 
     def mget(self, keys):
         return [self.data.get(k) for k in keys]
+
+    def scan_iter(self, match=None):
+        if match is None:
+            return list(self.data.keys())
+        return [k for k in self.data if fnmatch.fnmatch(k, match)]
 
 
 def _run(ended_at="2026-09-04T10:00:00Z", **overrides):
@@ -97,6 +103,41 @@ def test_indexed_counter_increments_on_success(monkeypatch):
     assert snapshot["attempted"] == 1
     assert snapshot["indexed"] == 1
     assert snapshot["skipped:gate"] == 0
+
+
+def test_kb_post_gets_its_own_longer_timeout_without_touching_the_shared_client(monkeypatch):
+    """Kanban observability:execution-index-skipped-other-unclassified: the
+    KB POST used to inherit the shared client's timeout=5, measured live at
+    18s+ for a single trivial chunk. It must now carry its own override,
+    while the two AP-MT GET calls stay on the shared client's fast default
+    (not asserted here directly — every other test in this module still
+    relies on those GETs resolving instantly against MockTransport)."""
+    fake = FakeCounterRedis()
+    monkeypatch.setattr(idx, "_counter_redis_client", lambda: fake)
+
+    captured = {}
+    original_post = httpx.Client.post
+
+    def spy_post(self, url, **kwargs):
+        captured["timeout"] = kwargs.get("timeout")
+        return original_post(self, url, **kwargs)
+
+    monkeypatch.setattr(httpx.Client, "post", spy_post)
+
+    def handler(request):
+        if request.method == "GET" and request.url.path.endswith("/events"):
+            return httpx.Response(200, json=[{"kind": "tool_call"}])
+        if request.method == "GET":
+            return httpx.Response(200, json=_run())
+        return httpx.Response(200, json={"ok": True})
+
+    assert idx.index_run("run-1", config={
+        "agents_platform_base": "http://ap", "kb_base_url": "http://kb",
+        "execution_index_mode": "interesting",
+    }, transport=httpx.MockTransport(handler)) is True
+
+    assert captured["timeout"] == idx.KB_POST_TIMEOUT_S
+    assert captured["timeout"] > 5
 
 
 def test_finalize_timeout_counter_increments(monkeypatch):
@@ -160,7 +201,7 @@ def test_http_error_counter_for_a_non_secret_kb_failure(monkeypatch):
     assert snapshot["skipped:secret_reject"] == 0
 
 
-def test_other_counter_for_a_network_level_failure(monkeypatch):
+def test_other_counter_for_a_network_level_failure_is_named_by_exception_type(monkeypatch):
     fake = FakeCounterRedis()
     monkeypatch.setattr(idx, "_counter_redis_client", lambda: fake)
 
@@ -177,8 +218,41 @@ def test_other_counter_for_a_network_level_failure(monkeypatch):
     }, transport=httpx.MockTransport(handler)) is False
 
     snapshot = idx.counters_snapshot()
-    assert snapshot["skipped:other"] == 1
+    # The undifferentiated bucket never gets written to anymore — this is
+    # the exact defect the Kanban card reported (200/266 runs anonymous).
+    assert snapshot["skipped:other:ConnectError"] == 1
+    assert snapshot.get("skipped:other", 0) == 0
     assert snapshot["skipped:http_error"] == 0
+
+
+def test_two_distinct_exception_types_get_two_distinct_named_buckets(monkeypatch):
+    fake = FakeCounterRedis()
+    monkeypatch.setattr(idx, "_counter_redis_client", lambda: fake)
+
+    def handler_connect_error(request):
+        if request.method == "GET" and request.url.path.endswith("/events"):
+            return httpx.Response(200, json=[{"kind": "tool_call"}])
+        if request.method == "GET":
+            return httpx.Response(200, json=_run())
+        raise httpx.ConnectError("connection refused", request=request)
+
+    def handler_value_error(request):
+        if request.method == "GET" and request.url.path.endswith("/events"):
+            return httpx.Response(200, json="not-a-list")
+        return httpx.Response(200, json=_run())
+
+    idx.index_run("run-1", config={
+        "agents_platform_base": "http://ap", "kb_base_url": "http://dead-kb",
+        "execution_index_mode": "interesting",
+    }, transport=httpx.MockTransport(handler_connect_error))
+    idx.index_run("run-1", config={
+        "agents_platform_base": "http://ap", "kb_base_url": "http://kb",
+        "execution_index_mode": "interesting",
+    }, transport=httpx.MockTransport(handler_value_error))
+
+    snapshot = idx.counters_snapshot()
+    assert snapshot["skipped:other:ConnectError"] == 1
+    assert snapshot["skipped:other:ValueError"] == 1
 
 
 def _install_fake_redis_module(monkeypatch, xread):
