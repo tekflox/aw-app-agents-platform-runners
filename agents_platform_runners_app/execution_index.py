@@ -20,18 +20,34 @@ MAX_CHARS = 1500
 MAX_CHUNKS = 12
 TERMINAL = {"success", "error", "cancelled"}
 
-# The shared httpx.Client below is built with timeout=5, which the two AP-MT
-# GETs (run poll, events) comfortably meet — confirmed live, they never miss
-# it. aw-app-kb's POST /api/kb/executions does not: it runs synchronous
-# embedding generation (exec_pg.py's _kb._embed_docs) before the INSERT,
-# measured live at 18.07s for a SINGLE trivial chunk, and real payloads carry
-# up to MAX_CHUNKS=12. That mismatch was the entire cause of Kanban
+# The shared httpx.Client below is built with timeout=5. aw-app-kb's POST
+# /api/kb/executions does not meet that: it runs synchronous embedding
+# generation (exec_pg.py's _kb._embed_docs) before the INSERT, measured live
+# at 18.07s for a SINGLE trivial chunk, and real payloads carry up to
+# MAX_CHUNKS=12. That mismatch was the entire cause of Kanban
 # observability:execution-index-skipped-other-unclassified: every one of
 # those POSTs raised httpx.ReadTimeout, which isn't an httpx.HTTPStatusError
 # so it fell through both specific handlers into the generic catch-all. This
 # is a per-call override (httpx.Client.post(..., timeout=...)), not a change
-# to the shared client's default — the AP-MT GETs keep their fast 5s budget.
+# to the shared client's default — the shared 5s stays the floor.
 KB_POST_TIMEOUT_S = 120.0
+
+# The two AP-MT GETs (run poll, events) used to inherit the shared client's
+# flat timeout=5 too — but a flat scalar applies the same budget to connect
+# AND read. Connect is where "AP-MT is unreachable" must fail fast, so that
+# stays 5s (resilience:execution-index-apmt-get-timeout-5s, Kanban
+# 3fc5bf3b-9510-8158-800a-ea32a7be662e): index_run only ever runs on a daemon
+# background thread (start()/start_after_stream_done below), so no GET
+# budget can delay run delivery — the 5s connect fast-fail is about bailing
+# out of a dead AP-MT quickly, not about the delivery path. Read is a
+# different failure mode: AP-MT alive but slow to answer under load, which
+# is exactly the state measured live on 2026-10-17 (skipped:other:ReadTimeout
+# 0→4 while a sequential backfill hammered /api/runs) — and load is when the
+# most runs finish and the most needs indexing, so a 5s read budget goes
+# blind during its busiest windows. This per-call override raises only the
+# read phase; if the ReadTimeout counter climbs again with read=30, fix
+# AP-MT's slow tail server-side rather than bumping this further.
+AP_MT_GET_TIMEOUT = httpx.Timeout(5.0, read=30.0)
 
 _config: dict = {}
 
@@ -285,7 +301,7 @@ def index_run(run_id: str, *, config: dict | None = None,
     try:
         with httpx.Client(headers=headers, timeout=5, transport=transport) as client:
             while True:
-                response = client.get(f"{base}/api/runs/{run_id}")
+                response = client.get(f"{base}/api/runs/{run_id}", timeout=AP_MT_GET_TIMEOUT)
                 response.raise_for_status()
                 run = response.json()
                 if run.get("ended_at") is not None:
@@ -298,7 +314,8 @@ def index_run(run_id: str, *, config: dict | None = None,
                 delay = min(delay * 2, 5.0)
 
             response = client.get(f"{base}/api/runs/{run_id}/events",
-                                  params={"limit": str(EVENTS_LIMIT)})
+                                  params={"limit": str(EVENTS_LIMIT)},
+                                  timeout=AP_MT_GET_TIMEOUT)
             response.raise_for_status()
             events = response.json()
             if not isinstance(events, list):

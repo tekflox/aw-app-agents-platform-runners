@@ -108,10 +108,10 @@ def test_indexed_counter_increments_on_success(monkeypatch):
 def test_kb_post_gets_its_own_longer_timeout_without_touching_the_shared_client(monkeypatch):
     """Kanban observability:execution-index-skipped-other-unclassified: the
     KB POST used to inherit the shared client's timeout=5, measured live at
-    18s+ for a single trivial chunk. It must now carry its own override,
-    while the two AP-MT GET calls stay on the shared client's fast default
-    (not asserted here directly — every other test in this module still
-    relies on those GETs resolving instantly against MockTransport)."""
+    18s+ for a single trivial chunk. It must now carry its own override.
+    The shared client itself must still default to 5 — that default is the
+    floor every future call site inherits unless it opts into its own
+    override, same as this POST and the AP-MT GETs below."""
     fake = FakeCounterRedis()
     monkeypatch.setattr(idx, "_counter_redis_client", lambda: fake)
 
@@ -120,6 +120,7 @@ def test_kb_post_gets_its_own_longer_timeout_without_touching_the_shared_client(
 
     def spy_post(self, url, **kwargs):
         captured["timeout"] = kwargs.get("timeout")
+        assert self.timeout == httpx.Timeout(5)
         return original_post(self, url, **kwargs)
 
     monkeypatch.setattr(httpx.Client, "post", spy_post)
@@ -138,6 +139,44 @@ def test_kb_post_gets_its_own_longer_timeout_without_touching_the_shared_client(
 
     assert captured["timeout"] == idx.KB_POST_TIMEOUT_S
     assert captured["timeout"] > 5
+
+
+def test_ap_mt_gets_carry_a_30s_read_budget_but_a_5s_connect_budget(monkeypatch):
+    """resilience:execution-index-apmt-get-timeout-5s (Kanban 3fc5bf3b-9510-
+    8158-800a-ea32a7be662e) — the two AP-MT GETs (run poll, events) used to
+    share the client's flat timeout=5 for every phase, and a sequential
+    backfill measured 4 live httpx.ReadTimeout under load. The fix is a
+    per-call override, AP_MT_GET_TIMEOUT, that raises only the read phase;
+    connect must stay at 5s so a genuinely unreachable AP-MT still fails
+    fast. httpx normalizes a Timeout into request.extensions["timeout"] as a
+    dict of connect/read/write/pool floats — assert both GETs carry it."""
+    fake = FakeCounterRedis()
+    monkeypatch.setattr(idx, "_counter_redis_client", lambda: fake)
+
+    captured_timeouts = []
+
+    def handler(request):
+        captured_timeouts.append((request.url.path, request.extensions["timeout"]))
+        if request.method == "GET" and request.url.path.endswith("/events"):
+            return httpx.Response(200, json=[{"kind": "tool_call"}])
+        if request.method == "GET":
+            return httpx.Response(200, json=_run())
+        return httpx.Response(200, json={"ok": True})
+
+    assert idx.index_run("run-1", config={
+        "agents_platform_base": "http://ap", "kb_base_url": "http://kb",
+        "execution_index_mode": "interesting",
+    }, transport=httpx.MockTransport(handler)) is True
+
+    get_timeouts = [t for path, t in captured_timeouts if path.startswith("/api/runs")]
+    assert len(get_timeouts) == 2  # the run-poll GET and the events GET
+    for timeout in get_timeouts:
+        assert timeout["connect"] == 5.0
+        assert timeout["read"] == 30.0
+
+    post_timeouts = [t for path, t in captured_timeouts if path.endswith("/executions")]
+    assert len(post_timeouts) == 1
+    assert post_timeouts[0]["read"] == 120.0
 
 
 def test_finalize_timeout_counter_increments(monkeypatch):
