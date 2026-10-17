@@ -64,6 +64,7 @@ class FakeCounterRedis:
     def __init__(self):
         self.data: dict[str, str] = {}
         self.expirations: dict[str, int] = {}
+        self.hashes: dict[str, dict[str, str]] = {}
 
     def incr(self, key):
         self.data[key] = str(int(self.data.get(key, "0")) + 1)
@@ -79,6 +80,22 @@ class FakeCounterRedis:
 
     def pipeline(self):
         return _FakePipeline(self)
+
+    def hsetnx(self, key, field, value):
+        h = self.hashes.setdefault(key, {})
+        if field in h:
+            return 0
+        h[field] = value
+        return 1
+
+    def hset(self, key, field, value):
+        self.hashes.setdefault(key, {})[field] = value
+
+    def hgetall(self, key):
+        return dict(self.hashes.get(key, {}))
+
+    def hdel(self, key, field):
+        self.hashes.get(key, {}).pop(field, None)
 
 
 def _window_key(name: str, hours_ago: int = 0) -> str:
@@ -488,7 +505,7 @@ def test_warm_watchers_started_and_resolved_both_increment_on_success(monkeypatc
     fake = FakeCounterRedis()
     monkeypatch.setattr(idx, "_counter_redis_client", lambda: fake)
     idx.configure({"execution_index_mode": "all"})
-    monkeypatch.setattr(idx, "index_run", lambda run_id: None)
+    monkeypatch.setattr(idx, "index_run", lambda run_id, **_kw: None)
     _install_fake_redis_module(
         monkeypatch, lambda self, *_a, **_k: [("stream", [("1-0", {"done": "1"})])])
 
@@ -721,3 +738,160 @@ def test_execution_index_doctor_reports_not_ok_when_redis_is_unavailable():
 
     assert resp.status_code == 200
     assert resp.json()["ok"] is False
+
+
+# --- Retry queue (card 3fc5bf3b-9510-81ec-8752-fc06d82a8a5e) ---------------
+#
+# Live traffic loses ~19% of eligible runs to the warm watcher's one-shot
+# index_run() call discarding any skipped:* outcome, while a synchronous
+# backfill re-running the same index_run() loses only 0.1%. These tests
+# cover the retry-queue decision (queue a real failure, never a legitimate
+# skipped:gate exclusion) and the hourly sweep that drains it.
+
+
+def test_index_and_maybe_queue_retry_queues_a_real_failure(monkeypatch):
+    fake = FakeCounterRedis()
+    monkeypatch.setattr(idx, "_counter_redis_client", lambda: fake)
+
+    def handler(request):
+        raise httpx.ReadTimeout("timed out", request=request)
+
+    ok = idx._index_and_maybe_queue_retry("run-1", config={
+        "agents_platform_base": "http://ap", "kb_base_url": "http://kb",
+        "execution_index_mode": "interesting",
+    }, transport=httpx.MockTransport(handler))
+
+    assert ok is False
+    assert fake.hashes[idx._RETRY_QUEUE_KEY] == {"run-1": "0"}
+
+
+def test_index_and_maybe_queue_retry_does_not_queue_a_gate_exclusion(monkeypatch):
+    fake = FakeCounterRedis()
+    monkeypatch.setattr(idx, "_counter_redis_client", lambda: fake)
+
+    def handler(request):
+        if request.method == "GET" and request.url.path.endswith("/events"):
+            return httpx.Response(200, json=[])
+        return httpx.Response(200, json=_run(output="short"))
+
+    ok = idx._index_and_maybe_queue_retry("run-1", config={
+        "agents_platform_base": "http://ap", "kb_base_url": "http://kb",
+        "execution_index_mode": "interesting",
+    }, transport=httpx.MockTransport(handler))
+
+    assert ok is False
+    assert idx._RETRY_QUEUE_KEY not in fake.hashes
+
+
+def test_index_and_maybe_queue_retry_does_not_queue_on_success(monkeypatch):
+    fake = FakeCounterRedis()
+    monkeypatch.setattr(idx, "_counter_redis_client", lambda: fake)
+
+    def handler(request):
+        if request.method == "GET" and request.url.path.endswith("/events"):
+            return httpx.Response(200, json=[{"kind": "tool_call"}])
+        if request.method == "GET":
+            return httpx.Response(200, json=_run())
+        return httpx.Response(200, json={"ok": True})
+
+    ok = idx._index_and_maybe_queue_retry("run-1", config={
+        "agents_platform_base": "http://ap", "kb_base_url": "http://kb",
+        "execution_index_mode": "interesting",
+    }, transport=httpx.MockTransport(handler))
+
+    assert ok is True
+    assert idx._RETRY_QUEUE_KEY not in fake.hashes
+
+
+def test_queue_retry_does_not_reset_an_existing_attempt_count(monkeypatch):
+    fake = FakeCounterRedis()
+    monkeypatch.setattr(idx, "_counter_redis_client", lambda: fake)
+    fake.hashes[idx._RETRY_QUEUE_KEY] = {"run-1": "7"}
+
+    idx._queue_retry("run-1")
+
+    assert fake.hashes[idx._RETRY_QUEUE_KEY] == {"run-1": "7"}
+
+
+def test_sweep_retry_queue_removes_entry_on_success(monkeypatch):
+    fake = FakeCounterRedis()
+    monkeypatch.setattr(idx, "_counter_redis_client", lambda: fake)
+    fake.hashes[idx._RETRY_QUEUE_KEY] = {"run-ok": "0"}
+    monkeypatch.setattr(idx, "index_run", lambda run_id, **_kw: True)
+
+    result = idx.sweep_retry_queue()
+
+    assert result == {"queued": 1, "indexed": 1, "gated": 0, "requeued": 0, "exhausted": 0}
+    assert fake.hashes[idx._RETRY_QUEUE_KEY] == {}
+
+
+def test_sweep_retry_queue_removes_entry_on_a_legitimate_gate_exclusion(monkeypatch):
+    fake = FakeCounterRedis()
+    monkeypatch.setattr(idx, "_counter_redis_client", lambda: fake)
+    fake.hashes[idx._RETRY_QUEUE_KEY] = {"run-gated": "3"}
+
+    def fake_index_run(run_id, *, on_skip=None, **_kw):
+        if on_skip is not None:
+            on_skip("skipped:gate")
+        return False
+
+    monkeypatch.setattr(idx, "index_run", fake_index_run)
+
+    result = idx.sweep_retry_queue()
+
+    assert result["gated"] == 1
+    assert fake.hashes[idx._RETRY_QUEUE_KEY] == {}
+
+
+def test_sweep_retry_queue_requeues_a_repeat_failure_with_incremented_attempts(monkeypatch):
+    fake = FakeCounterRedis()
+    monkeypatch.setattr(idx, "_counter_redis_client", lambda: fake)
+    fake.hashes[idx._RETRY_QUEUE_KEY] = {"run-stuck": "5"}
+
+    def fake_index_run(run_id, *, on_skip=None, **_kw):
+        if on_skip is not None:
+            on_skip("skipped:http_error")
+        return False
+
+    monkeypatch.setattr(idx, "index_run", fake_index_run)
+
+    result = idx.sweep_retry_queue()
+
+    assert result["requeued"] == 1
+    assert fake.hashes[idx._RETRY_QUEUE_KEY] == {"run-stuck": "6"}
+
+
+def test_sweep_retry_queue_gives_up_after_max_attempts(monkeypatch):
+    fake = FakeCounterRedis()
+    monkeypatch.setattr(idx, "_counter_redis_client", lambda: fake)
+    fake.hashes[idx._RETRY_QUEUE_KEY] = {"run-dead": str(idx._RETRY_MAX_ATTEMPTS - 1)}
+
+    def fake_index_run(run_id, *, on_skip=None, **_kw):
+        if on_skip is not None:
+            on_skip("skipped:other:ConnectError")
+        return False
+
+    monkeypatch.setattr(idx, "index_run", fake_index_run)
+
+    result = idx.sweep_retry_queue()
+
+    assert result["exhausted"] == 1
+    assert fake.hashes[idx._RETRY_QUEUE_KEY] == {}
+    snapshot = idx.counters_snapshot()
+    assert snapshot["retry_exhausted"] == 1
+
+
+def test_sweep_retry_queue_is_a_noop_when_queue_is_empty(monkeypatch):
+    fake = FakeCounterRedis()
+    monkeypatch.setattr(idx, "_counter_redis_client", lambda: fake)
+
+    result = idx.sweep_retry_queue()
+
+    assert result == {"queued": 0, "indexed": 0, "gated": 0, "requeued": 0, "exhausted": 0}
+
+
+def test_sweep_retry_queue_returns_zeros_when_redis_unavailable():
+    # No override — conftest's default _counter_redis_client returns None.
+    result = idx.sweep_retry_queue()
+
+    assert result == {"queued": 0, "indexed": 0, "gated": 0, "requeued": 0, "exhausted": 0}

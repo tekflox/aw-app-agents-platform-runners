@@ -115,6 +115,16 @@ EXECUTE_SECRET_ENSURE_INTERVAL_S = 120.0
 # waiting for the next human action.
 MCP_OTEL_ENV_REFRESH_INTERVAL_S = 120.0
 
+# execution-index retry-queue sweep cadence (card 3fc5bf3b-9510-81ec-8752-
+# fc06d82a8a5e): the warm-dispatch watcher (execution_index.
+# start_after_stream_done) gets exactly one shot at indexing a run, and a
+# transient AP-MT ReadTimeout or the 60s finalize-wait deadline used to just
+# discard it — measured at ~19% loss on live traffic even though a
+# synchronous backfill re-running the same index_run() loses only 0.1%.
+# Hourly matches the card's own framing: by the time this tick runs, every
+# queued run has long since finalized, so this is a plain retry, not a race.
+EXECUTION_INDEX_RETRY_SWEEP_INTERVAL_S = 3600.0
+
 # agents_platform_base resolution (what address this app calls
 # agents-platform-multitenant on) lives in platform_base.py now — the old
 # fixed bridge-gateway default (http://172.18.0.1:10014) only ever worked
@@ -336,6 +346,7 @@ class AgentsPlatformRunnersAppPlugin:
         self._register_runner_registration_watchdog(ctx, self._live_config)
         self._register_execute_secret_watchdog(ctx, self._live_config)
         self._register_mcp_otel_env_watchdog(ctx, self._live_config)
+        self._register_execution_index_retry_watchdog(ctx, self._live_config)
 
         # Sweep stale isolated run dirs at ACTIVATION, not only where they are
         # created.
@@ -584,6 +595,34 @@ class AgentsPlatformRunnersAppPlugin:
         ctx.watchdog.register("identity-token-refresh", _refresh, IDENTITY_TOKEN_INTERVAL_S,
                               run_immediately=True)
         log.info("identity_token: watchdog registered (every %.0fs)", IDENTITY_TOKEN_INTERVAL_S)
+
+    def _register_execution_index_retry_watchdog(self, ctx, config: dict) -> None:
+        """Register the hourly execution-index retry-queue sweep (card
+        3fc5bf3b-9510-81ec-8752-fc06d82a8a5e). See
+        ``execution_index.sweep_retry_queue`` for why this is a plain
+        synchronous retry (the backfill script's own already-proven
+        pattern), not a race against anything, by the time an hourly tick
+        actually runs.
+        """
+        if not ctx.has("watchdog:tasks"):
+            log.warning("execution_index: 'watchdog:tasks' capability not granted — "
+                        "retry-sweep watchdog not started")
+            return
+
+        async def _sweep() -> None:
+            try:
+                await asyncio.to_thread(execution_index_mod.sweep_retry_queue, self._live_config)
+            except Exception:  # noqa: BLE001 — a watchdog tick must never raise
+                log.warning("execution_index: retry sweep tick failed", exc_info=True)
+
+        # run_immediately=True: sweep_retry_queue is a cheap no-op (one
+        # HGETALL) when the queue is empty, and it means a run queued
+        # moments before a restart gets retried on the very next boot
+        # instead of waiting a full hour.
+        ctx.watchdog.register("execution-index-retry-sweep", _sweep,
+                              EXECUTION_INDEX_RETRY_SWEEP_INTERVAL_S, run_immediately=True)
+        log.info("execution_index: retry-sweep watchdog registered (every %.0fs)",
+                 EXECUTION_INDEX_RETRY_SWEEP_INTERVAL_S)
 
     def _register_runner_registration_watchdog(self, ctx, config: dict) -> None:
         """Register the periodic runner-registration reassert watchdog

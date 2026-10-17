@@ -184,7 +184,7 @@ def test_warm_stream_watcher_waits_for_done_then_indexes(monkeypatch):
     called = []
     idx.configure({"execution_index_mode": "all"})
     monkeypatch.setitem(sys.modules, "redis", RedisModule)
-    monkeypatch.setattr(idx, "index_run", lambda run_id: called.append(run_id))
+    monkeypatch.setattr(idx, "index_run", lambda run_id, **_kw: called.append(run_id))
     thread = idx.start_after_stream_done("warm-1", "redis://fake")
     thread.join(timeout=1)
     assert thread.daemon is True

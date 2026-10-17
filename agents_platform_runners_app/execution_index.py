@@ -73,6 +73,7 @@ COUNTER_NAMES = (
     "skipped:other",
     "warm_watchers_started",
     "warm_watchers_resolved",
+    "retry_exhausted",
 )
 
 _COUNTER_PREFIX = "execution_index:counters:"
@@ -126,6 +127,20 @@ _DYNAMIC_SKIPPED_PREFIXES = (
     f"skipped:{_PHASE_KB_POST}:",
 )
 
+# Durable retry queue (card 3fc5bf3b-9510-81ec-8752-fc06d82a8a5e): live
+# traffic loses ~19% of eligible runs to a ONE-SHOT warm watcher
+# (start_after_stream_done) that just discards any skipped:* outcome,
+# while a synchronous backfill re-running the exact same index_run() loses
+# only 0.1% — the backfill is just never racing AP-MT's own finalize/read
+# timing, so its cleanliness is survivorship, not extra robustness. A
+# Redis HASH of run_id -> attempt_count (not a counter-style INCR key) so
+# the sweep can both enumerate what's pending and give up on an entry that
+# keeps failing instead of sweeping it forever. skipped:gate (the
+# _interesting() gate's intentional exclusion) must never be queued or
+# kept queued — it isn't a failure, there's nothing to retry.
+_RETRY_QUEUE_KEY = "execution_index:retry_queue"
+_RETRY_MAX_ATTEMPTS = 24  # ~1 day of hourly sweeps before giving up on an entry
+
 _counter_lock = threading.Lock()
 _counter_client = None
 _counter_client_url: str | None = None
@@ -178,6 +193,22 @@ def _incr(name: str) -> None:
             pipe.execute()
     except Exception:
         log.debug("execution index: could not increment counter %s", name, exc_info=True)
+
+
+def _queue_retry(run_id: str) -> None:
+    """Best-effort: queue ``run_id`` for the hourly retry sweep.
+
+    ``HSETNX`` so a run already queued (e.g. the warm watcher's own first
+    attempt already failed once before, or the sweep itself re-queues it)
+    keeps its existing attempt count rather than resetting to 0. Same
+    fail-open contract as ``_incr`` — a queuing failure must never affect
+    indexing itself."""
+    try:
+        client = _counter_redis_client()
+        if client is not None:
+            client.hsetnx(_RETRY_QUEUE_KEY, run_id, "0")
+    except Exception:
+        log.debug("execution index: could not queue retry for run=%s", run_id, exc_info=True)
 
 
 def _dynamic_skipped_other_names(client) -> list[str]:
@@ -405,12 +436,28 @@ def _interesting(run: dict, events: list[dict], mode: str) -> bool:
 def index_run(run_id: str, *, config: dict | None = None,
               transport: httpx.BaseTransport | None = None,
               deadline_s: float = 60.0, sleep: Callable[[float], None] = time.sleep,
-              monotonic: Callable[[], float] = time.monotonic) -> bool:
-    """Fetch a finalized run and index it. Never raises to its caller."""
+              monotonic: Callable[[], float] = time.monotonic,
+              on_skip: Callable[[str], None] | None = None) -> bool:
+    """Fetch a finalized run and index it. Never raises to its caller.
+
+    ``on_skip``, if given, is called with the exact ``skipped:<reason>``
+    counter name right before it is incremented — lets a caller (the warm
+    watcher, the retry sweep) learn WHY a run was skipped without
+    index_run growing a second return channel every other caller would
+    have to thread through."""
     cfg = _config if config is None else config
     mode = str(cfg.get("execution_index_mode") or "interesting")
     if mode == "off":
         return False
+
+    def _skip(reason: str) -> None:
+        _incr(reason)
+        if on_skip is not None:
+            try:
+                on_skip(reason)
+            except Exception:
+                log.debug("execution index: on_skip callback failed", exc_info=True)
+
     _incr("attempted")
     base = platform_base_mod.resolve(cfg).rstrip("/")
     kb_base = str(cfg.get("kb_base_url") or "http://aw-app-kb:8000").rstrip("/")
@@ -430,14 +477,14 @@ def index_run(run_id: str, *, config: dict | None = None,
                 except Exception as exc:
                     log.warning("execution index: skipped run=%s after error in %s: %s",
                                 run_id, _PHASE_AP_MT_GET_RUN, exc)
-                    _incr(f"skipped:{_PHASE_AP_MT_GET_RUN}:{type(exc).__name__}")
+                    _skip(f"skipped:{_PHASE_AP_MT_GET_RUN}:{type(exc).__name__}")
                     return False
                 run = response.json()
                 if run.get("ended_at") is not None:
                     break
                 if monotonic() - started >= deadline_s:
                     log.warning("execution index: run=%s did not finalize before deadline; skipped", run_id)
-                    _incr("skipped:finalize_timeout")
+                    _skip("skipped:finalize_timeout")
                     return False
                 sleep(delay)
                 delay = min(delay * 2, 5.0)
@@ -452,13 +499,13 @@ def index_run(run_id: str, *, config: dict | None = None,
             except Exception as exc:
                 log.warning("execution index: skipped run=%s after error in %s: %s",
                             run_id, _PHASE_AP_MT_GET_EVENTS, exc)
-                _incr(f"skipped:{_PHASE_AP_MT_GET_EVENTS}:{type(exc).__name__}")
+                _skip(f"skipped:{_PHASE_AP_MT_GET_EVENTS}:{type(exc).__name__}")
                 return False
             events = response.json()
             if not isinstance(events, list):
                 raise ValueError("run events response is not a list")
             if not _interesting(run, events, mode):
-                _incr("skipped:gate")
+                _skip("skipped:gate")
                 return False
             truncated = len(events) >= EVENTS_LIMIT
             chunks = _chunks(run, events, truncated)
@@ -481,15 +528,15 @@ def index_run(run_id: str, *, config: dict | None = None,
                 if exc.response.status_code in (401, 403):
                     log.warning("execution index: skipped run=%s — kb rejected secret (%s)",
                                 run_id, exc.response.status_code)
-                    _incr("skipped:secret_reject")
+                    _skip("skipped:secret_reject")
                 else:
                     log.warning("execution index: skipped run=%s after error: %s", run_id, exc)
-                    _incr("skipped:http_error")
+                    _skip("skipped:http_error")
                 return False
             except Exception as exc:
                 log.warning("execution index: skipped run=%s after error in %s: %s",
                             run_id, _PHASE_KB_POST, exc)
-                _incr(f"skipped:{_PHASE_KB_POST}:{type(exc).__name__}")
+                _skip(f"skipped:{_PHASE_KB_POST}:{type(exc).__name__}")
                 return False
             log.info("execution index: indexed run=%s chunks=%d", run_id, len(chunks))
             _incr("indexed")
@@ -498,12 +545,74 @@ def index_run(run_id: str, *, config: dict | None = None,
         # The AP-MT run/events GET calls above failing non-2xx — same bucket
         # as a KB-side error that isn't specifically a secret mismatch.
         log.warning("execution index: skipped run=%s after error: %s", run_id, exc)
-        _incr("skipped:http_error")
+        _skip("skipped:http_error")
         return False
     except Exception as exc:  # fail-open: indexing can never affect run delivery
         log.warning("execution index: skipped run=%s after error: %s", run_id, exc)
-        _incr(f"{_SKIPPED_OTHER_PREFIX}{type(exc).__name__}")
+        _skip(f"{_SKIPPED_OTHER_PREFIX}{type(exc).__name__}")
         return False
+
+
+def _index_and_maybe_queue_retry(run_id: str, *, config: dict | None = None,
+                                 transport: httpx.BaseTransport | None = None) -> bool:
+    """``index_run()`` once; any genuine failure — anything but success or
+    the legitimate ``skipped:gate`` exclusion — gets queued for the hourly
+    retry sweep instead of being lost outright. Shared by the warm watcher
+    below and (indirectly, via re-queuing) by the sweep itself. ``transport``
+    is a test-only seam (production always lets it default to ``None``,
+    the real network)."""
+    skip_reason: list[str] = []
+    ok = index_run(run_id, config=config, transport=transport, on_skip=skip_reason.append)
+    if not ok and skip_reason and skip_reason[0] != "skipped:gate":
+        _queue_retry(run_id)
+    return ok
+
+
+def sweep_retry_queue(config: dict | None = None) -> dict[str, int]:
+    """Drain the retry queue: synchronously re-run ``index_run()`` on each
+    queued run_id — the exact pattern ``scripts/backfill_execution_index.py``
+    already proved safe (0.1% loss over 1013 runs), reused here rather than
+    reinvented, because by the time this sweep runs (hourly) every queued
+    run has long since finalized — a plain retry, not a race against
+    anything. Removes an entry on success or on a legitimate
+    ``skipped:gate`` exclusion (not a failure); any other skip leaves it
+    queued for the next sweep, up to ``_RETRY_MAX_ATTEMPTS`` before giving
+    up (counted in ``retry_exhausted`` so a permanently stuck entry is
+    visible instead of silently disappearing)."""
+    result = {"queued": 0, "indexed": 0, "gated": 0, "requeued": 0, "exhausted": 0}
+    try:
+        client = _counter_redis_client()
+    except Exception:
+        client = None
+    if client is None:
+        return result
+    try:
+        entries = client.hgetall(_RETRY_QUEUE_KEY)
+    except Exception:
+        log.warning("execution index: retry sweep could not read the queue", exc_info=True)
+        return result
+    result["queued"] = len(entries)
+    for run_id, attempts_raw in entries.items():
+        skip_reason: list[str] = []
+        ok = index_run(run_id, config=config, on_skip=skip_reason.append)
+        if ok:
+            result["indexed"] += 1
+            client.hdel(_RETRY_QUEUE_KEY, run_id)
+        elif skip_reason and skip_reason[0] == "skipped:gate":
+            result["gated"] += 1
+            client.hdel(_RETRY_QUEUE_KEY, run_id)
+        else:
+            attempts = int(attempts_raw or 0) + 1
+            if attempts >= _RETRY_MAX_ATTEMPTS:
+                result["exhausted"] += 1
+                client.hdel(_RETRY_QUEUE_KEY, run_id)
+                _incr("retry_exhausted")
+            else:
+                result["requeued"] += 1
+                client.hset(_RETRY_QUEUE_KEY, run_id, str(attempts))
+    if result["queued"]:
+        log.info("execution index: retry sweep %s", result)
+    return result
 
 
 def start(run_id: str) -> threading.Thread | None:
@@ -543,7 +652,7 @@ def start_after_stream_done(run_id: str, redis_url: str) -> threading.Thread | N
                     for entry_id, fields in entries:
                         cursor = entry_id
                         if str(fields.get("done") or "").lower() in {"1", "true"}:
-                            index_run(run_id)
+                            _index_and_maybe_queue_retry(run_id)
                             _incr("warm_watchers_resolved")
                             return
             log.warning("execution index: warm run=%s emitted no done before watcher deadline", run_id)
