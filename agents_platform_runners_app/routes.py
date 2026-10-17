@@ -167,8 +167,17 @@ def build_routes(config: dict | None = None, *, kanban_sweep_status: dict | None
         execution-index-hook-silently-drops-most-runs): attempted/indexed/
         skipped-by-reason counters plus the warm-watcher started/resolved
         gap. Read-only, no secret required — mirrors aw-app-kb's own
-        ``/api/kb/executions/status`` posture."""
-        return execution_index_mod.counters_snapshot()
+        ``/api/kb/executions/status`` posture.
+
+        ``retry_queue`` (card 3fc5bf3b-9510-81ec-8752-fc06d82a8a5e) is the
+        set of runs a one-shot watcher failure queued for the hourly sweep,
+        each with its attempt count and the exact ``skipped:<reason>`` that
+        sent it there — the retry must not drain silently, or it trades a
+        visible loss for an invisible one."""
+        return {
+            **execution_index_mod.counters_snapshot(),
+            "retry_queue": execution_index_mod.retry_queue_snapshot(),
+        }
 
     @app.get("/execution-index/doctor")
     async def execution_index_doctor() -> dict:

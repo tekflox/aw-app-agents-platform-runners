@@ -578,7 +578,7 @@ def test_execution_index_status_endpoint_reports_the_raw_counters(monkeypatch):
     body = resp.json()
     assert body["attempted"] == 5
     assert body["indexed"] == 3
-    assert set(body.keys()) == set(idx.COUNTER_NAMES)
+    assert set(body.keys()) == set(idx.COUNTER_NAMES) | {"retry_queue"}
 
 
 def test_execution_index_doctor_flags_a_persistent_warm_watcher_gap(monkeypatch):
@@ -762,7 +762,10 @@ def test_index_and_maybe_queue_retry_queues_a_real_failure(monkeypatch):
     }, transport=httpx.MockTransport(handler))
 
     assert ok is False
-    assert fake.hashes[idx._RETRY_QUEUE_KEY] == {"run-1": "0"}
+    # The original skipped:<reason> must survive alongside the attempt
+    # count — the explicit QA-accountability condition on this card: a
+    # retry that drains silently trades a visible loss for an invisible one.
+    assert fake.hashes[idx._RETRY_QUEUE_KEY] == {"run-1": "0:skipped:apmt_get_run:ReadTimeout"}
 
 
 def test_index_and_maybe_queue_retry_does_not_queue_a_gate_exclusion(monkeypatch):
@@ -803,20 +806,20 @@ def test_index_and_maybe_queue_retry_does_not_queue_on_success(monkeypatch):
     assert idx._RETRY_QUEUE_KEY not in fake.hashes
 
 
-def test_queue_retry_does_not_reset_an_existing_attempt_count(monkeypatch):
+def test_queue_retry_does_not_reset_an_existing_attempt_count_or_reason(monkeypatch):
     fake = FakeCounterRedis()
     monkeypatch.setattr(idx, "_counter_redis_client", lambda: fake)
-    fake.hashes[idx._RETRY_QUEUE_KEY] = {"run-1": "7"}
+    fake.hashes[idx._RETRY_QUEUE_KEY] = {"run-1": "7:skipped:finalize_timeout"}
 
-    idx._queue_retry("run-1")
+    idx._queue_retry("run-1", "skipped:http_error")
 
-    assert fake.hashes[idx._RETRY_QUEUE_KEY] == {"run-1": "7"}
+    assert fake.hashes[idx._RETRY_QUEUE_KEY] == {"run-1": "7:skipped:finalize_timeout"}
 
 
 def test_sweep_retry_queue_removes_entry_on_success(monkeypatch):
     fake = FakeCounterRedis()
     monkeypatch.setattr(idx, "_counter_redis_client", lambda: fake)
-    fake.hashes[idx._RETRY_QUEUE_KEY] = {"run-ok": "0"}
+    fake.hashes[idx._RETRY_QUEUE_KEY] = {"run-ok": "0:skipped:http_error"}
     monkeypatch.setattr(idx, "index_run", lambda run_id, **_kw: True)
 
     result = idx.sweep_retry_queue()
@@ -828,7 +831,7 @@ def test_sweep_retry_queue_removes_entry_on_success(monkeypatch):
 def test_sweep_retry_queue_removes_entry_on_a_legitimate_gate_exclusion(monkeypatch):
     fake = FakeCounterRedis()
     monkeypatch.setattr(idx, "_counter_redis_client", lambda: fake)
-    fake.hashes[idx._RETRY_QUEUE_KEY] = {"run-gated": "3"}
+    fake.hashes[idx._RETRY_QUEUE_KEY] = {"run-gated": "3:skipped:http_error"}
 
     def fake_index_run(run_id, *, on_skip=None, **_kw):
         if on_skip is not None:
@@ -843,11 +846,13 @@ def test_sweep_retry_queue_removes_entry_on_a_legitimate_gate_exclusion(monkeypa
     assert fake.hashes[idx._RETRY_QUEUE_KEY] == {}
 
 
-def test_sweep_retry_queue_requeues_a_repeat_failure_with_incremented_attempts(monkeypatch):
+def test_sweep_retry_queue_requeues_a_repeat_failure_preserving_the_original_reason(monkeypatch):
     fake = FakeCounterRedis()
     monkeypatch.setattr(idx, "_counter_redis_client", lambda: fake)
-    fake.hashes[idx._RETRY_QUEUE_KEY] = {"run-stuck": "5"}
+    fake.hashes[idx._RETRY_QUEUE_KEY] = {"run-stuck": "5:skipped:finalize_timeout"}
 
+    # A different failure on THIS retry attempt — the stored reason must
+    # stay the ORIGINAL one that first queued the run, not this one.
     def fake_index_run(run_id, *, on_skip=None, **_kw):
         if on_skip is not None:
             on_skip("skipped:http_error")
@@ -858,13 +863,14 @@ def test_sweep_retry_queue_requeues_a_repeat_failure_with_incremented_attempts(m
     result = idx.sweep_retry_queue()
 
     assert result["requeued"] == 1
-    assert fake.hashes[idx._RETRY_QUEUE_KEY] == {"run-stuck": "6"}
+    assert fake.hashes[idx._RETRY_QUEUE_KEY] == {"run-stuck": "6:skipped:finalize_timeout"}
 
 
 def test_sweep_retry_queue_gives_up_after_max_attempts(monkeypatch):
     fake = FakeCounterRedis()
     monkeypatch.setattr(idx, "_counter_redis_client", lambda: fake)
-    fake.hashes[idx._RETRY_QUEUE_KEY] = {"run-dead": str(idx._RETRY_MAX_ATTEMPTS - 1)}
+    fake.hashes[idx._RETRY_QUEUE_KEY] = {
+        "run-dead": f"{idx._RETRY_MAX_ATTEMPTS - 1}:skipped:other:ConnectError"}
 
     def fake_index_run(run_id, *, on_skip=None, **_kw):
         if on_skip is not None:
@@ -879,6 +885,31 @@ def test_sweep_retry_queue_gives_up_after_max_attempts(monkeypatch):
     assert fake.hashes[idx._RETRY_QUEUE_KEY] == {}
     snapshot = idx.counters_snapshot()
     assert snapshot["retry_exhausted"] == 1
+
+
+def test_retry_queue_snapshot_reports_attempts_and_reason(monkeypatch):
+    fake = FakeCounterRedis()
+    monkeypatch.setattr(idx, "_counter_redis_client", lambda: fake)
+    fake.hashes[idx._RETRY_QUEUE_KEY] = {"run-stuck": "2:skipped:finalize_timeout"}
+
+    assert idx.retry_queue_snapshot() == {
+        "run-stuck": {"attempts": 2, "reason": "skipped:finalize_timeout"}}
+
+
+def test_retry_queue_snapshot_is_none_when_redis_unavailable():
+    # No override — conftest's default _counter_redis_client returns None.
+    assert idx.retry_queue_snapshot() is None
+
+
+def test_execution_index_status_endpoint_reports_the_retry_queue(monkeypatch):
+    fake = FakeCounterRedis()
+    monkeypatch.setattr(idx, "_counter_redis_client", lambda: fake)
+    fake.hashes[idx._RETRY_QUEUE_KEY] = {"run-stuck": "1:skipped:http_error"}
+
+    client = TestClient(build_routes({}))
+    body = client.get("/execution-index/status").json()
+
+    assert body["retry_queue"] == {"run-stuck": {"attempts": 1, "reason": "skipped:http_error"}}
 
 
 def test_sweep_retry_queue_is_a_noop_when_queue_is_empty(monkeypatch):

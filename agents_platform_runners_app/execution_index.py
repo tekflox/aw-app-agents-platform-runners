@@ -195,18 +195,21 @@ def _incr(name: str) -> None:
         log.debug("execution index: could not increment counter %s", name, exc_info=True)
 
 
-def _queue_retry(run_id: str) -> None:
-    """Best-effort: queue ``run_id`` for the hourly retry sweep.
-
-    ``HSETNX`` so a run already queued (e.g. the warm watcher's own first
-    attempt already failed once before, or the sweep itself re-queues it)
-    keeps its existing attempt count rather than resetting to 0. Same
-    fail-open contract as ``_incr`` — a queuing failure must never affect
-    indexing itself."""
+def _queue_retry(run_id: str, reason: str) -> None:
+    """Best-effort: queue ``run_id`` for the hourly retry sweep, recording
+    the exact ``skipped:<reason>`` that sent it here as ``<attempts>:
+    <reason>`` — a QA-accountability condition on this card's own fix: a
+    self-healing retry that drains silently trades a *visible* 19% loss
+    for an *invisible* one, which is worse. ``HSETNX`` so a run already
+    queued (e.g. the sweep itself re-queuing it) keeps its ORIGINAL attempt
+    count and ORIGINAL reason — a later, possibly different failure on
+    retry doesn't overwrite why it first landed here. Same fail-open
+    contract as ``_incr`` — a queuing failure must never affect indexing
+    itself."""
     try:
         client = _counter_redis_client()
         if client is not None:
-            client.hsetnx(_RETRY_QUEUE_KEY, run_id, "0")
+            client.hsetnx(_RETRY_QUEUE_KEY, run_id, f"0:{reason}")
     except Exception:
         log.debug("execution index: could not queue retry for run=%s", run_id, exc_info=True)
 
@@ -564,7 +567,7 @@ def _index_and_maybe_queue_retry(run_id: str, *, config: dict | None = None,
     skip_reason: list[str] = []
     ok = index_run(run_id, config=config, transport=transport, on_skip=skip_reason.append)
     if not ok and skip_reason and skip_reason[0] != "skipped:gate":
-        _queue_retry(run_id)
+        _queue_retry(run_id, skip_reason[0])
     return ok
 
 
@@ -592,7 +595,8 @@ def sweep_retry_queue(config: dict | None = None) -> dict[str, int]:
         log.warning("execution index: retry sweep could not read the queue", exc_info=True)
         return result
     result["queued"] = len(entries)
-    for run_id, attempts_raw in entries.items():
+    for run_id, value in entries.items():
+        attempts_raw, _, original_reason = str(value).partition(":")
         skip_reason: list[str] = []
         ok = index_run(run_id, config=config, on_skip=skip_reason.append)
         if ok:
@@ -607,11 +611,38 @@ def sweep_retry_queue(config: dict | None = None) -> dict[str, int]:
                 result["exhausted"] += 1
                 client.hdel(_RETRY_QUEUE_KEY, run_id)
                 _incr("retry_exhausted")
+                log.warning("execution index: retry exhausted run=%s original_reason=%s "
+                            "last_reason=%s", run_id, original_reason,
+                            skip_reason[0] if skip_reason else None)
             else:
                 result["requeued"] += 1
-                client.hset(_RETRY_QUEUE_KEY, run_id, str(attempts))
+                client.hset(_RETRY_QUEUE_KEY, run_id, f"{attempts}:{original_reason}")
     if result["queued"]:
         log.info("execution index: retry sweep %s", result)
+    return result
+
+
+def retry_queue_snapshot() -> dict[str, dict[str, Any]] | None:
+    """Read-only view of the retry queue for ``/execution-index/status`` —
+    the QA-accountability condition on card 3fc5bf3b-9510-81ec-8752-
+    fc06d82a8a5e: a run stuck in the queue, and the exact reason it landed
+    there, must be visible without a redis-cli session, or this fix trades
+    a visible 19% loss for an invisible one. ``None`` when Redis itself is
+    unavailable — same contract as ``counters_snapshot``."""
+    try:
+        client = _counter_redis_client()
+    except Exception:
+        client = None
+    if client is None:
+        return None
+    try:
+        entries = client.hgetall(_RETRY_QUEUE_KEY)
+    except Exception:
+        return None
+    result: dict[str, dict[str, Any]] = {}
+    for run_id, value in entries.items():
+        attempts_raw, _, reason = str(value).partition(":")
+        result[run_id] = {"attempts": int(attempts_raw or 0), "reason": reason}
     return result
 
 
