@@ -302,8 +302,11 @@ def test_other_counter_for_a_network_level_failure_is_named_by_exception_type(mo
     snapshot = idx.counters_snapshot()
     # The undifferentiated bucket never gets written to anymore — this is
     # the exact defect the Kanban card reported (200/266 runs anonymous).
-    assert snapshot["skipped:other:ConnectError"] == 1
+    # It now also names the call site: this ConnectError happens on the KB
+    # POST, so it lands in skipped:kb_post:ConnectError, not skipped:other.
+    assert snapshot["skipped:kb_post:ConnectError"] == 1
     assert snapshot.get("skipped:other", 0) == 0
+    assert snapshot.get("skipped:other:ConnectError", 0) == 0
     assert snapshot["skipped:http_error"] == 0
 
 
@@ -333,8 +336,136 @@ def test_two_distinct_exception_types_get_two_distinct_named_buckets(monkeypatch
     }, transport=httpx.MockTransport(handler_value_error))
 
     snapshot = idx.counters_snapshot()
-    assert snapshot["skipped:other:ConnectError"] == 1
+    # The POST-side ConnectError is phase-attributed; the events-not-a-list
+    # ValueError happens outside all three phases' own try/excepts, so it
+    # still falls back to the generic skipped:other bucket.
+    assert snapshot["skipped:kb_post:ConnectError"] == 1
     assert snapshot["skipped:other:ValueError"] == 1
+
+
+def test_apmt_get_run_readtimeout_is_attributed_to_its_phase(monkeypatch):
+    """Kanban observability:execution-index-readtimeout-has-no-call-site:
+    a ReadTimeout from the run-detail poll GET must name that call site,
+    not just the exception type, so it is distinguishable from the same
+    exception raised by the other two HTTP calls."""
+    fake = FakeCounterRedis()
+    monkeypatch.setattr(idx, "_counter_redis_client", lambda: fake)
+
+    def handler(request):
+        if request.url.path == "/api/runs/run-1":
+            raise httpx.ReadTimeout("timed out", request=request)
+        return httpx.Response(200, json=_run())
+
+    assert idx.index_run("run-1", config={
+        "agents_platform_base": "http://ap", "kb_base_url": "http://kb",
+        "execution_index_mode": "interesting",
+    }, transport=httpx.MockTransport(handler)) is False
+
+    snapshot = idx.counters_snapshot()
+    assert snapshot["skipped:apmt_get_run:ReadTimeout"] == 1
+    assert snapshot.get("skipped:other:ReadTimeout", 0) == 0
+
+    # Enough eligible volume (>= _FAILURE_RATIO_MIN_SAMPLE) for the doctor
+    # to judge by, with the named failure above the 0.2 threshold — proves
+    # the prefix rule counts this phase-attributed key as a failure, not
+    # as skipped:gate, with no change to routes.py.
+    fake.data[_window_key("attempted")] = "10"
+    fake.data[_window_key("skipped:apmt_get_run:ReadTimeout")] = "3"
+    fake.data[_window_key("indexed")] = "7"
+
+    client = TestClient(build_routes({}))
+    body = client.get("/execution-index/doctor").json()
+    assert body["ok"] is False
+    assert body["detail"]["counters_window"]["skipped:apmt_get_run:ReadTimeout"] == 3
+    assert any("3/10" in p for p in body["detail"]["problems"])
+
+
+def test_apmt_get_events_readtimeout_is_attributed_to_its_phase(monkeypatch):
+    """Same as above for the events GET — the second of the three calls."""
+    fake = FakeCounterRedis()
+    monkeypatch.setattr(idx, "_counter_redis_client", lambda: fake)
+
+    def handler(request):
+        if request.url.path.endswith("/events"):
+            raise httpx.ReadTimeout("timed out", request=request)
+        return httpx.Response(200, json=_run())
+
+    assert idx.index_run("run-1", config={
+        "agents_platform_base": "http://ap", "kb_base_url": "http://kb",
+        "execution_index_mode": "interesting",
+    }, transport=httpx.MockTransport(handler)) is False
+
+    snapshot = idx.counters_snapshot()
+    assert snapshot["skipped:apmt_get_events:ReadTimeout"] == 1
+    assert snapshot.get("skipped:other:ReadTimeout", 0) == 0
+
+    fake.data[_window_key("attempted")] = "10"
+    fake.data[_window_key("skipped:apmt_get_events:ReadTimeout")] = "3"
+    fake.data[_window_key("indexed")] = "7"
+
+    client = TestClient(build_routes({}))
+    body = client.get("/execution-index/doctor").json()
+    assert body["ok"] is False
+    assert body["detail"]["counters_window"]["skipped:apmt_get_events:ReadTimeout"] == 3
+    assert any("3/10" in p for p in body["detail"]["problems"])
+
+
+def test_kb_post_readtimeout_is_attributed_to_its_phase(monkeypatch):
+    """Same as above for the KB POST — the slow, 120s-budget third call,
+    which is wrapped by its own try/except (for the secret-reject/
+    http_error split) so a ReadTimeout there needs its own except branch
+    rather than falling through to the generic catch-all."""
+    fake = FakeCounterRedis()
+    monkeypatch.setattr(idx, "_counter_redis_client", lambda: fake)
+
+    def handler(request):
+        if request.method == "GET" and request.url.path.endswith("/events"):
+            return httpx.Response(200, json=[{"kind": "tool_call"}])
+        if request.method == "GET":
+            return httpx.Response(200, json=_run())
+        raise httpx.ReadTimeout("timed out", request=request)
+
+    assert idx.index_run("run-1", config={
+        "agents_platform_base": "http://ap", "kb_base_url": "http://kb",
+        "execution_index_mode": "interesting",
+    }, transport=httpx.MockTransport(handler)) is False
+
+    snapshot = idx.counters_snapshot()
+    assert snapshot["skipped:kb_post:ReadTimeout"] == 1
+    assert snapshot.get("skipped:other:ReadTimeout", 0) == 0
+
+    fake.data[_window_key("attempted")] = "10"
+    fake.data[_window_key("skipped:kb_post:ReadTimeout")] = "3"
+    fake.data[_window_key("indexed")] = "7"
+
+    client = TestClient(build_routes({}))
+    body = client.get("/execution-index/doctor").json()
+    assert body["ok"] is False
+    assert body["detail"]["counters_window"]["skipped:kb_post:ReadTimeout"] == 3
+    assert any("3/10" in p for p in body["detail"]["problems"])
+
+
+def test_exception_outside_the_three_phases_still_falls_back_to_skipped_other(monkeypatch):
+    """A swallowed exception raised outside index_run's three HTTP calls
+    (here, the events-not-a-list ValueError) must stay anonymous-fallback
+    generic, not silently disappear now that the three phases have their
+    own named buckets."""
+    fake = FakeCounterRedis()
+    monkeypatch.setattr(idx, "_counter_redis_client", lambda: fake)
+
+    def handler(request):
+        if request.url.path.endswith("/events"):
+            return httpx.Response(200, json="not-a-list")
+        return httpx.Response(200, json=_run())
+
+    assert idx.index_run("run-1", config={
+        "agents_platform_base": "http://ap", "kb_base_url": "http://kb",
+        "execution_index_mode": "interesting",
+    }, transport=httpx.MockTransport(handler)) is False
+
+    snapshot = idx.counters_snapshot()
+    assert snapshot["skipped:other:ValueError"] == 1
+    assert snapshot.get("skipped:apmt_get_events:ValueError", 0) == 0
 
 
 def _install_fake_redis_module(monkeypatch, xread):

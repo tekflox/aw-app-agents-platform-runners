@@ -103,6 +103,29 @@ _WINDOW_BUCKET_PREFIX = _COUNTER_PREFIX + "w:"
 # counters_snapshot() discovers them with a key-pattern scan instead.
 _SKIPPED_OTHER_PREFIX = "skipped:other:"
 
+# Kanban observability:execution-index-readtimeout-has-no-call-site:
+# skipped:other:<ExceptionType> named the exception but not which of
+# index_run's three HTTP calls raised it, so a ReadTimeout from the fast
+# AP-MT run-poll, the AP-MT events GET, or the slow KB POST were all
+# indistinguishable even though each has a different remedy. index_run
+# attributes an exception from any of these three call sites to its own
+# phase-named bucket instead; an exception raised outside all three (e.g.
+# a bad /events payload) still falls into the generic _SKIPPED_OTHER_PREFIX
+# bucket above.
+_PHASE_AP_MT_GET_RUN = "apmt_get_run"
+_PHASE_AP_MT_GET_EVENTS = "apmt_get_events"
+_PHASE_KB_POST = "kb_post"
+
+# Every prefix counters_snapshot()/counters_window_snapshot() must scan for
+# dynamically-named skipped:<...>:<ExceptionType> keys — the generic
+# catch-all plus the three phase-attributed buckets above.
+_DYNAMIC_SKIPPED_PREFIXES = (
+    _SKIPPED_OTHER_PREFIX,
+    f"skipped:{_PHASE_AP_MT_GET_RUN}:",
+    f"skipped:{_PHASE_AP_MT_GET_EVENTS}:",
+    f"skipped:{_PHASE_KB_POST}:",
+)
+
 _counter_lock = threading.Lock()
 _counter_client = None
 _counter_client_url: str | None = None
@@ -158,18 +181,22 @@ def _incr(name: str) -> None:
 
 
 def _dynamic_skipped_other_names(client) -> list[str]:
-    """Discover ``skipped:other:<ExceptionType>`` names already written to
-    Redis — COUNTER_NAMES can't list these ahead of time since the whole
-    point is that a new exception type gets its own name the first time it
-    occurs. Best-effort: a fake/stub client without ``scan_iter`` (as in
-    most of this module's existing tests) just yields none, same as a scan
-    that finds nothing."""
+    """Discover dynamically-named ``skipped:<...>:<ExceptionType>`` keys
+    already written to Redis — one scan per prefix in
+    ``_DYNAMIC_SKIPPED_PREFIXES``, since COUNTER_NAMES can't list these
+    ahead of time: the whole point is that a new (call-site, exception
+    type) pair gets its own name the first time it occurs. Best-effort: a
+    fake/stub client without ``scan_iter`` (as in most of this module's
+    existing tests) just yields none, same as a scan that finds nothing."""
     scan_iter = getattr(client, "scan_iter", None)
     if scan_iter is None:
         return []
+    names: set[str] = set()
     try:
-        match = _COUNTER_PREFIX + _SKIPPED_OTHER_PREFIX + "*"
-        return sorted(key[len(_COUNTER_PREFIX):] for key in scan_iter(match=match))
+        for prefix in _DYNAMIC_SKIPPED_PREFIXES:
+            match = _COUNTER_PREFIX + prefix + "*"
+            names.update(key[len(_COUNTER_PREFIX):] for key in scan_iter(match=match))
+        return sorted(names)
     except Exception:
         return []
 
@@ -198,23 +225,25 @@ def counters_snapshot() -> dict[str, int | None]:
 
 def _dynamic_skipped_other_names_window(client) -> list[str]:
     """Window counterpart of ``_dynamic_skipped_other_names`` — scans the
-    bucket pattern (``...:w:skipped:other:*``), not the lifetime one, and
-    parses the counter name back out by stripping the trailing
-    ``:<hour>`` segment. Counter names themselves contain colons
-    (``skipped:other:ReadTimeout``), so this splits on the LAST colon —
-    safe because the hour suffix is always a plain digit string with no
-    colon of its own."""
+    bucket pattern for each prefix in ``_DYNAMIC_SKIPPED_PREFIXES``
+    (``...:w:skipped:other:*``, ``...:w:skipped:apmt_get_run:*``, etc.),
+    not the lifetime one, and parses the counter name back out by
+    stripping the trailing ``:<hour>`` segment. Counter names themselves
+    contain colons (``skipped:apmt_get_run:ReadTimeout``), so this splits
+    on the LAST colon — safe because the hour suffix is always a plain
+    digit string with no colon of its own."""
     scan_iter = getattr(client, "scan_iter", None)
     if scan_iter is None:
         return []
+    names: set[str] = set()
     try:
-        match = _WINDOW_BUCKET_PREFIX + _SKIPPED_OTHER_PREFIX + "*"
-        names = set()
-        for key in scan_iter(match=match):
-            suffix = key[len(_WINDOW_BUCKET_PREFIX):]
-            name, _, _hour = suffix.rpartition(":")
-            if name:
-                names.add(name)
+        for prefix in _DYNAMIC_SKIPPED_PREFIXES:
+            match = _WINDOW_BUCKET_PREFIX + prefix + "*"
+            for key in scan_iter(match=match):
+                suffix = key[len(_WINDOW_BUCKET_PREFIX):]
+                name, _, _hour = suffix.rpartition(":")
+                if name:
+                    names.add(name)
         return sorted(names)
     except Exception:
         return []
@@ -393,8 +422,16 @@ def index_run(run_id: str, *, config: dict | None = None,
     try:
         with httpx.Client(headers=headers, timeout=5, transport=transport) as client:
             while True:
-                response = client.get(f"{base}/api/runs/{run_id}", timeout=AP_MT_GET_TIMEOUT)
-                response.raise_for_status()
+                try:
+                    response = client.get(f"{base}/api/runs/{run_id}", timeout=AP_MT_GET_TIMEOUT)
+                    response.raise_for_status()
+                except httpx.HTTPStatusError:
+                    raise
+                except Exception as exc:
+                    log.warning("execution index: skipped run=%s after error in %s: %s",
+                                run_id, _PHASE_AP_MT_GET_RUN, exc)
+                    _incr(f"skipped:{_PHASE_AP_MT_GET_RUN}:{type(exc).__name__}")
+                    return False
                 run = response.json()
                 if run.get("ended_at") is not None:
                     break
@@ -405,10 +442,18 @@ def index_run(run_id: str, *, config: dict | None = None,
                 sleep(delay)
                 delay = min(delay * 2, 5.0)
 
-            response = client.get(f"{base}/api/runs/{run_id}/events",
-                                  params={"limit": str(EVENTS_LIMIT)},
-                                  timeout=AP_MT_GET_TIMEOUT)
-            response.raise_for_status()
+            try:
+                response = client.get(f"{base}/api/runs/{run_id}/events",
+                                      params={"limit": str(EVENTS_LIMIT)},
+                                      timeout=AP_MT_GET_TIMEOUT)
+                response.raise_for_status()
+            except httpx.HTTPStatusError:
+                raise
+            except Exception as exc:
+                log.warning("execution index: skipped run=%s after error in %s: %s",
+                            run_id, _PHASE_AP_MT_GET_EVENTS, exc)
+                _incr(f"skipped:{_PHASE_AP_MT_GET_EVENTS}:{type(exc).__name__}")
+                return False
             events = response.json()
             if not isinstance(events, list):
                 raise ValueError("run events response is not a list")
@@ -440,6 +485,11 @@ def index_run(run_id: str, *, config: dict | None = None,
                 else:
                     log.warning("execution index: skipped run=%s after error: %s", run_id, exc)
                     _incr("skipped:http_error")
+                return False
+            except Exception as exc:
+                log.warning("execution index: skipped run=%s after error in %s: %s",
+                            run_id, _PHASE_KB_POST, exc)
+                _incr(f"skipped:{_PHASE_KB_POST}:{type(exc).__name__}")
                 return False
             log.info("execution index: indexed run=%s chunks=%d", run_id, len(chunks))
             _incr("indexed")
