@@ -32,6 +32,7 @@ import threading
 from pathlib import Path
 
 from . import agent_provisioner as agent_provisioner_mod
+from . import exec_index_service as exec_index_service_mod
 from . import execute as execute_mod
 from . import execute_secret as execute_secret_mod
 from . import execution_index as execution_index_mod
@@ -114,6 +115,12 @@ EXECUTE_SECRET_ENSURE_INTERVAL_S = 120.0
 # is why this can be short enough to converge in minutes rather than
 # waiting for the next human action.
 MCP_OTEL_ENV_REFRESH_INTERVAL_S = 120.0
+
+# ``contributes.services`` id of the exec-index service. Must match
+# aw-app.json's declaration — the supervisor keys everything on (app_id,
+# service_id), including the uninstall-time stop that keeps an uninstall from
+# leaving an orphan holding port 9408.
+EXEC_INDEX_SERVICE_ID = "exec-index"
 
 # execution-index retry-queue sweep cadence (card 3fc5bf3b-9510-81ec-8752-
 # fc06d82a8a5e): the warm-dispatch watcher (execution_index.
@@ -216,6 +223,10 @@ def write_mcp_json(package_dir: str, config: dict) -> dict:
 
 class AgentsPlatformRunnersAppPlugin:
     def __init__(self) -> None:
+        # Whether this worker got as far as registering the exec-index
+        # managed service — read by the config-save restart path, which must
+        # not call stop/start on a service id the supervisor never heard of.
+        self._exec_index_registered: bool = False
         # The exact dict object build_routes()'s /execute, /register and
         # /status closures read `cfg` from. Kept as a persistent instance
         # attribute (not a local var) so on_config_saved() below can mutate
@@ -340,6 +351,8 @@ class AgentsPlatformRunnersAppPlugin:
             self._live_config, kanban_sweep_status=self._kanban_sweep_status,
             package_dir=ctx.package_dir))
 
+        self._register_exec_index_service(ctx, self._live_config)
+
         self._register_skills_watchdog(ctx, self._live_config)
         self._register_kanban_sweep_watchdog(ctx, self._live_config)
         self._register_identity_token_watchdog(ctx, self._live_config)
@@ -407,6 +420,115 @@ class AgentsPlatformRunnersAppPlugin:
             "aw-app-agents-platform-runners activated: mcp.json servers=%s, routes mounted",
             list(mcp_doc["mcpServers"]),
         )
+
+    def _exec_index_env(self, config: dict) -> dict[str, str]:
+        """The three values the exec-index subprocess needs, as env vars.
+
+        ``src/apps/services.py`` spawns a service with ``subprocess.Popen``
+        and **no** ``env=`` argument, so the only channel from here to the
+        child is this process's own ``os.environ`` — hence
+        :meth:`_apply_exec_index_env` below rather than something passed to
+        ``register``. Deliberately NOT the command line: the shared secret
+        would then be readable in ``ps`` output by anything in this
+        container, and the supervisor keeps the command string in memory for
+        its orphan-reaping comparison.
+
+        The secret is the app's existing ``execution_index_secret`` — an
+        ``x-secret`` config field, so it already lives in the workspace
+        secret store and is already in this process's memory. Nothing new is
+        persisted anywhere: ``os.environ`` is process state, not a file, and
+        the child shares this process's trust boundary (it is spawned by it,
+        in the same container, and reaches only loopback).
+        """
+        env = {"EXEC_INDEX_PORT": str(
+            config.get("exec_index_port") or exec_index_service_mod.DEFAULT_PORT)}
+        secret = str(config.get("execution_index_secret") or "")
+        if secret:
+            env[exec_index_service_mod.SECRET_ENV] = secret
+        return env
+
+    def _apply_exec_index_env(self, config: dict) -> bool:
+        """Push :meth:`_exec_index_env` into ``os.environ``. True if changed.
+
+        A changed value is only picked up by a *new* child process, so the
+        return value is what tells :meth:`on_config_saved` whether a restart
+        is owed. Removing a value matters as much as setting one: a cleared
+        secret must close the service's write routes (503), not leave them
+        open on a stale one.
+        """
+        desired = self._exec_index_env(config)
+        changed = False
+        for key in ("EXEC_INDEX_PORT", exec_index_service_mod.SECRET_ENV):
+            want = desired.get(key)
+            if want is None:
+                if os.environ.pop(key, None) is not None:
+                    changed = True
+            elif os.environ.get(key) != want:
+                os.environ[key] = want
+                changed = True
+        return changed
+
+    def _register_exec_index_service(self, ctx, config: dict) -> None:
+        """Register the ``exec-index`` managed service — the execution
+        index's new home (docs/design/execution-index-migration-off-aw-app-
+        kb.md §3.1).
+
+        One subprocess, holding the ~520 MB fastembed model exactly once. In
+        process it would be once per ``AW_WORKSPACE_WORKERS`` worker (10 here,
+        so up to ~5 GB) for a write-rarely workload — that arithmetic is why
+        the design chose a service over the simpler in-process port.
+
+        Skipped with a warning, never fatal, when ``service:manage`` was not
+        granted: this app's other jobs (dispatch, the MCP surface, the kanban
+        sweep) have nothing to do with the index, and an app that refuses to
+        activate takes all of them down to report one missing capability. The
+        producer's own ``skipped:exec_post:*`` counters and the
+        ``/execution-index/doctor`` liveness check are what make the absence
+        loud (design §6 — "a service that was never started" is explicitly
+        not something the supervisor detects).
+        """
+        if not ctx.has("service:manage"):
+            log.warning("exec-index: 'service:manage' capability not granted — the "
+                        "execution index's own service was not registered; the "
+                        "post-run hook's exec_post counters will show every write "
+                        "failing")
+            return
+        self._apply_exec_index_env(config)
+        try:
+            ctx.services.register(
+                EXEC_INDEX_SERVICE_ID,
+                exec_index_service_mod.service_command(ctx.package_dir, config),
+                autostart=True)
+        except Exception:  # noqa: BLE001 — activation must never be blocked by this
+            # Already registered on this worker (an idempotent re-activation)
+            # raises ServiceError; so does a supervisor that declines. Either
+            # way the doctor check reports the live truth, which is better
+            # than this guessing at it.
+            log.warning("exec-index: could not register the service", exc_info=True)
+            return
+        self._exec_index_registered = True
+        log.info("exec-index: service registered (port=%s, secret=%s)",
+                 os.environ.get("EXEC_INDEX_PORT"),
+                 "set" if os.environ.get(exec_index_service_mod.SECRET_ENV) else "MISSING")
+
+    def _restart_exec_index_service(self, ctx) -> None:
+        """Bounce the service so a changed port/secret actually takes effect.
+
+        Both values are read from the environment at child-process start, so
+        a config save that changes either is inert until the child is
+        replaced. Non-fatal and best-effort: the supervisor's own restart
+        loop is the backstop, and a failed bounce leaves the OLD child
+        running rather than nothing.
+        """
+        if not self._exec_index_registered:
+            return
+        try:
+            ctx.services.stop(EXEC_INDEX_SERVICE_ID)
+            ctx.services.start(EXEC_INDEX_SERVICE_ID)
+            log.info("exec-index: service restarted after a config change")
+        except Exception:  # noqa: BLE001
+            log.warning("exec-index: could not restart the service after a config change",
+                        exc_info=True)
 
     def _register_skills_watchdog(self, ctx, config: dict) -> None:
         """Register the decentralized skills-index sync watchdog (ADR
@@ -873,6 +995,15 @@ class AgentsPlatformRunnersAppPlugin:
         config = self._refresh_derived_config(ctx)
         mcp_doc = write_mcp_json(ctx.package_dir, self._live_config)
         log.info("aw-app-agents-platform-runners config saved: mcp.json servers=%s", list(mcp_doc["mcpServers"]))
+
+        # exec_index_port / execution_index_secret are read from the
+        # environment by the service's child process at START, so a saved
+        # change is inert until that child is replaced. Only bounce it when a
+        # value actually moved — a settings save that touched something else
+        # must not drop the index's write endpoint for the seconds a restart
+        # takes (and would cost the model another cold load).
+        if self._apply_exec_index_env(self._live_config):
+            self._restart_exec_index_service(ctx)
 
         # Reassert registration IMMEDIATELY when either dispatch credential
         # actually changed — the direct fix for the 2026-09-18 aw-claude 401

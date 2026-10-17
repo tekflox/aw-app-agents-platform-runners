@@ -1,4 +1,12 @@
-"""Best-effort post-run indexing into aw-app-kb's execution index."""
+"""Best-effort post-run indexing into the execution index.
+
+Writes to EVERY configured target (``exec_index_targets`` below). As of the
+aw-app-kb migration (``docs/design/execution-index-migration-off-aw-app-kb.md``)
+that is two: aw-app-kb's bundled Postgres, which still serves reads, and the
+new ``exec-index`` managed service, which owns the index's new home in the
+shared ``aw-remote-host-postgres``. Each target has its own counters; neither
+can block the other, and neither can block run delivery.
+"""
 from __future__ import annotations
 
 import json
@@ -63,13 +71,27 @@ _config: dict = {}
 # any restart of this (Tier-1, in-process) app before it ever reaches a
 # resolution branch — a persistent, growing gap between the two is proof of
 # exactly that, and nothing else in this system can show it.
+#
+# indexed:kb / indexed:exec are the DUAL-WRITE half of the aw-app-kb
+# migration (docs/design/execution-index-migration-off-aw-app-kb.md §3.3
+# step 2): `indexed` keeps its existing meaning — the run reached at least
+# one index — while these two say which. Deliberately NOT under the
+# `skipped:` prefix, so the doctor's failure ratio (routes.py, a prefix
+# rule) ignores them; and the three pre-existing failure names below are
+# left exactly as they are so the lifetime counters behind them are never
+# reset or renamed (design §6, "never reset the existing Redis counters").
+# A failure writing to the new target gets its own
+# `skipped:exec_post:*` names, discovered by the dynamic scan.
 COUNTER_NAMES = (
     "attempted",
     "indexed",
+    "indexed:kb",
+    "indexed:exec",
     "skipped:gate",
     "skipped:finalize_timeout",
     "skipped:http_error",
     "skipped:secret_reject",
+    "skipped:no_target",
     "skipped:other",
     "warm_watchers_started",
     "warm_watchers_resolved",
@@ -117,15 +139,37 @@ _PHASE_AP_MT_GET_RUN = "apmt_get_run"
 _PHASE_AP_MT_GET_EVENTS = "apmt_get_events"
 _PHASE_KB_POST = "kb_post"
 
+# The second write target of the aw-app-kb migration (docs/design/execution-
+# index-migration-off-aw-app-kb.md §3.3 step 2): the `exec-index` managed
+# service, which owns the index's new home in the shared
+# aw-remote-host-postgres. Its own phase name, so a failure writing to the
+# new home is never confused with a failure writing to the old one — the two
+# have completely different remedies, and during the cutover both are live
+# at once.
+_PHASE_EXEC_POST = "exec_post"
+
 # Every prefix counters_snapshot()/counters_window_snapshot() must scan for
 # dynamically-named skipped:<...>:<ExceptionType> keys — the generic
-# catch-all plus the three phase-attributed buckets above.
+# catch-all plus the four phase-attributed buckets above.
 _DYNAMIC_SKIPPED_PREFIXES = (
     _SKIPPED_OTHER_PREFIX,
     f"skipped:{_PHASE_AP_MT_GET_RUN}:",
     f"skipped:{_PHASE_AP_MT_GET_EVENTS}:",
     f"skipped:{_PHASE_KB_POST}:",
+    f"skipped:{_PHASE_EXEC_POST}:",
 )
+
+# Where aw-app-kb listens — the index's OLD home, still serving reads until
+# the cutover's last step. Was inlined at the single POST call site; named
+# now that exec_index_targets() resolves two targets the same way.
+KB_DEFAULT_URL = "http://aw-app-kb:8000"
+
+# Where the exec-index service listens. Loopback inside the workspace
+# container, which is where both this producer and that service run — see
+# exec_index_service.py. Overridable via the `exec_index_url` config key;
+# setting it to "" removes the new target entirely, which is the rollback
+# for cutover step 2 and needs no deploy.
+EXEC_INDEX_DEFAULT_URL = "http://127.0.0.1:9408"
 
 # Durable retry queue (card 3fc5bf3b-9510-81ec-8752-fc06d82a8a5e): live
 # traffic loses ~19% of eligible runs to a ONE-SHOT warm watcher
@@ -436,6 +480,108 @@ def _interesting(run: dict, events: list[dict], mode: str) -> bool:
     return True
 
 
+class _Target:
+    """One execution-index write target.
+
+    ``phase`` names its counters, ``url`` is the full POST endpoint,
+    ``secret_header`` is the header its shared secret goes in (the two homes
+    disagree on the name: aw-app-kb reads ``X-KB-Exec-Secret``, the new
+    service reads ``X-Exec-Index-Secret``), and ``success_counter`` is the
+    per-target ``indexed:*`` name.
+    """
+
+    __slots__ = ("phase", "url", "secret_header", "success_counter", "legacy_names")
+
+    def __init__(self, phase: str, url: str, secret_header: str,
+                 success_counter: str, legacy_names: bool) -> None:
+        self.phase = phase
+        self.url = url
+        self.secret_header = secret_header
+        self.success_counter = success_counter
+        # aw-app-kb's 401/403 and non-2xx buckets predate this dual-write and
+        # must keep their original unprefixed names so their lifetime
+        # counters stay continuous. The new target uses phase-prefixed ones.
+        self.legacy_names = legacy_names
+
+    def counter(self, suffix: str) -> str:
+        if self.legacy_names:
+            return f"skipped:{suffix}"
+        return f"skipped:{self.phase}:{suffix}"
+
+
+def exec_index_targets(cfg: dict) -> list[_Target]:
+    """Every target ``index_run`` writes one run's chunks to.
+
+    During the cutover (design §3.3) this is BOTH homes: aw-app-kb, which is
+    still serving reads, and the new ``exec-index`` service. Either can be
+    switched off by setting its config key to an empty string — which is the
+    whole of cutover step 6 (stop writing to kb) and the whole of its
+    rollback, with no deploy either way.
+
+    For both keys, **absent means the default, explicitly blank means off**.
+    The distinction is load-bearing in both directions: a config row written
+    before ``exec_index_url`` existed must gain the new target when the app
+    updates (absent ≠ off), and blanking a key has to be a real off switch or
+    cutover step 6 would need a code change (blank ≠ default).
+    """
+    targets: list[_Target] = []
+
+    raw_kb = cfg.get("kb_base_url")
+    kb_base = (KB_DEFAULT_URL if raw_kb is None else str(raw_kb)).strip().rstrip("/")
+    if kb_base:
+        targets.append(_Target(
+            _PHASE_KB_POST, f"{kb_base}/api/kb/executions",
+            "X-KB-Exec-Secret", "indexed:kb", legacy_names=True))
+
+    raw = cfg.get("exec_index_url")
+    exec_base = (EXEC_INDEX_DEFAULT_URL if raw is None else str(raw)).strip().rstrip("/")
+    if exec_base:
+        targets.append(_Target(
+            _PHASE_EXEC_POST, f"{exec_base}/executions",
+            "X-Exec-Index-Secret", "indexed:exec", legacy_names=False))
+
+    return targets
+
+
+def _post_to_target(client: httpx.Client, target: _Target, payload: dict,
+                    secret: str, run_id: str,
+                    skip: Callable[[str], None]) -> bool:
+    """POST one payload to one target. True on success.
+
+    **Never raises.** That is the contract that makes dual-write safe: a
+    failure on either target must not block the other, and must not block run
+    delivery (the fail-open rule this whole module is built on). Every
+    failure path lands in a counter named after this target's phase, so
+    "the new home is down" and "the old home is down" are different numbers
+    in ``/execution-index/doctor`` rather than one shared bucket.
+    """
+    try:
+        response = client.post(
+            target.url, json=payload,
+            headers={target.secret_header: secret},
+            timeout=KB_POST_TIMEOUT_S,
+        )
+        response.raise_for_status()
+    except httpx.HTTPStatusError as exc:
+        # A wrong/rotated execution_index_secret answers 401/403 —
+        # distinguish it from a generic target-side error so this counter
+        # alone can name a credential mismatch without a log grep.
+        if exc.response.status_code in (401, 403):
+            log.warning("execution index: run=%s — %s rejected secret (%s)",
+                        run_id, target.phase, exc.response.status_code)
+            skip(target.counter("secret_reject"))
+        else:
+            log.warning("execution index: run=%s failed %s: %s", run_id, target.phase, exc)
+            skip(target.counter("http_error"))
+        return False
+    except Exception as exc:
+        log.warning("execution index: run=%s failed %s: %s", run_id, target.phase, exc)
+        skip(f"skipped:{target.phase}:{type(exc).__name__}")
+        return False
+    _incr(target.success_counter)
+    return True
+
+
 def index_run(run_id: str, *, config: dict | None = None,
               transport: httpx.BaseTransport | None = None,
               deadline_s: float = 60.0, sleep: Callable[[float], None] = time.sleep,
@@ -463,7 +609,9 @@ def index_run(run_id: str, *, config: dict | None = None,
 
     _incr("attempted")
     base = platform_base_mod.resolve(cfg).rstrip("/")
-    kb_base = str(cfg.get("kb_base_url") or "http://aw-app-kb:8000").rstrip("/")
+    # Both write targets are resolved below, right before the POST — see
+    # exec_index_targets(). The same shared secret authenticates both; the
+    # header name is what differs (see _Target).
     secret = str(cfg.get("execution_index_secret") or "")
     headers = ({"Authorization": f"Bearer {cfg['agents_platform_token']}"}
                if cfg.get("agents_platform_token") else {})
@@ -517,31 +665,34 @@ def index_run(run_id: str, *, config: dict | None = None,
                 "chunks": chunks,
                 "metadata_common": {"events_truncated": truncated},
             }
-            try:
-                response = client.post(
-                    f"{kb_base}/api/kb/executions", json=payload,
-                    headers={"X-KB-Exec-Secret": secret},
-                    timeout=KB_POST_TIMEOUT_S,
-                )
-                response.raise_for_status()
-            except httpx.HTTPStatusError as exc:
-                # A wrong/rotated execution_index_secret answers 401/403 —
-                # distinguish it from a generic KB-side error so this counter
-                # alone can name a credential mismatch without a log grep.
-                if exc.response.status_code in (401, 403):
-                    log.warning("execution index: skipped run=%s — kb rejected secret (%s)",
-                                run_id, exc.response.status_code)
-                    _skip("skipped:secret_reject")
-                else:
-                    log.warning("execution index: skipped run=%s after error: %s", run_id, exc)
-                    _skip("skipped:http_error")
+            # DUAL-WRITE, and deliberately HERE rather than at index_run's
+            # call sites (docs/design/execution-index-migration-off-aw-app-
+            # kb.md §3.3 step 2 + §6): this function is reached from the
+            # post-run hook, the warm-watcher thread, the retry sweep AND
+            # scripts/backfill_execution_index.py. A second target added at
+            # the call sites would silently leave three of those four
+            # single-target, and the warm-watcher path alone carries most of
+            # this workspace's live traffic.
+            #
+            # Both targets are attempted unconditionally — one failing must
+            # not cost the other its write — and the run counts as indexed
+            # if ANY target took it, keeping `indexed`'s existing meaning.
+            # Because the store upserts by chunk_id and fully replaces a run,
+            # a later retry of a partially-written run converges both sides
+            # with no bookkeeping.
+            targets = exec_index_targets(cfg)
+            if not targets:
+                log.warning("execution index: run=%s has no configured target — "
+                            "both kb_base_url and exec_index_url are blank", run_id)
+                _skip("skipped:no_target")
                 return False
-            except Exception as exc:
-                log.warning("execution index: skipped run=%s after error in %s: %s",
-                            run_id, _PHASE_KB_POST, exc)
-                _skip(f"skipped:{_PHASE_KB_POST}:{type(exc).__name__}")
+            results = [_post_to_target(client, t, payload, secret, run_id, _skip)
+                       for t in targets]
+            if not any(results):
                 return False
-            log.info("execution index: indexed run=%s chunks=%d", run_id, len(chunks))
+            log.info("execution index: indexed run=%s chunks=%d targets=%s", run_id,
+                     len(chunks),
+                     ",".join(t.phase for t, ok in zip(targets, results) if ok))
             _incr("indexed")
             return True
     except httpx.HTTPStatusError as exc:

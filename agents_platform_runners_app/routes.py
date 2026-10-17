@@ -161,6 +161,67 @@ def build_routes(config: dict | None = None, *, kanban_sweep_status: dict | None
             raise HTTPException(502, f"could not list warm containers: {exc}") from exc
         return {"warm_enabled": warm_pool.enabled(), "containers": containers}
 
+    def _exec_index_base() -> str:
+        raw = cfg.get("exec_index_url")
+        base = (execution_index_mod.EXEC_INDEX_DEFAULT_URL
+                if raw is None else str(raw))
+        return base.strip().rstrip("/")
+
+    async def _exec_index_get(path: str, timeout: float = 5.0) -> dict:
+        """GET one of the exec-index service's read routes over loopback.
+
+        Raises ``httpx.HTTPError`` — callers decide whether an unreachable
+        service is a 502 to the caller (the search proxy) or a red doctor
+        entry (the liveness check).
+        """
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            response = await client.get(f"{_exec_index_base()}{path}")
+            response.raise_for_status()
+            return response.json()
+
+    @app.post("/execution-index/search")
+    async def execution_index_search(data: dict = Body(...)) -> dict:
+        """Semantic search over the execution index — the read half of the
+        index's new home (docs/design/execution-index-migration-off-aw-app-
+        kb.md §3.1).
+
+        This route exists because of a topology detail: the
+        ``search_execution_history`` MCP tool runs as a **stdio child of the
+        mcp-gateway's own container**, where ``127.0.0.1`` is the gateway,
+        not this workspace — so it cannot reach the exec-index service
+        directly however loopback-local that service is. It comes in through
+        the published workspace API instead and this route does the last hop,
+        exactly as ``/warm-containers`` already does for
+        ``list_warm_containers``.
+
+        Thin on purpose: no grouping, no formatting. The MCP handler groups
+        chunk hits to one block per run (as aw-app-kb's did), and the
+        cutover's score-identity parity check needs the raw per-chunk scores
+        this returns, not rendered text.
+        """
+        base = _exec_index_base()
+        if not base:
+            raise HTTPException(
+                503, "exec_index_url is blank on this app's Settings — the execution "
+                     "index's own service has no address to be reached at")
+        payload = {
+            "query": (data.get("query") or "").strip(),
+            "n_results": data.get("n_results") or 5,
+            "filters": data.get("filters") or {},
+        }
+        try:
+            # Generous, and for the same reason KB_POST_TIMEOUT_S is: the
+            # service embeds the query before it can search, and an embed on
+            # a cold model is tens of seconds.
+            async with httpx.AsyncClient(timeout=60.0) as client:
+                response = await client.post(f"{base}/search", json=payload)
+        except httpx.HTTPError as exc:
+            raise HTTPException(
+                502, f"could not reach the exec-index service at {base}: {exc}") from exc
+        if response.status_code >= 400:
+            raise HTTPException(response.status_code, response.text)
+        return response.json()
+
     @app.get("/execution-index/status")
     async def execution_index_status() -> dict:
         """Observability for the post-run indexing hook (Kanban bug:
@@ -222,6 +283,36 @@ def build_routes(config: dict | None = None, *, kanban_sweep_status: dict | None
         failure_ratio = (failures / eligible) if eligible else 0.0
 
         problems = []
+
+        # Service liveness (docs/design/execution-index-migration-off-aw-app-
+        # kb.md §6, "Service activation is the known weak point"): the
+        # supervisor respawns a service that CRASHED, but "a service that was
+        # never started" is explicitly outside what it detects — its own
+        # docstring says the activation audit is not built, and there is a
+        # live known gap around activate() being skipped after a core
+        # restart. So the one thing that must not be trusted here is
+        # install-time green. This asks the service itself.
+        #
+        # Only a problem when the producer is actually CONFIGURED to write
+        # there: exec_index_url blanked out is how cutover step 2 is rolled
+        # back, and a deliberate rollback must not read as an outage.
+        exec_detail: dict = {"configured": bool(_exec_index_base())}
+        if exec_detail["configured"]:
+            try:
+                exec_detail["status"] = await _exec_index_get("/status")
+                exec_detail["reachable"] = True
+                if not exec_detail["status"].get("ok"):
+                    problems.append(
+                        "the exec-index service answers but reports its store "
+                        "unusable: " + str(exec_detail["status"].get("error")))
+            except Exception as exc:  # noqa: BLE001 — surfaced as a problem, not a 500
+                exec_detail["reachable"] = False
+                exec_detail["error"] = f"{type(exc).__name__}: {exc}"
+                problems.append(
+                    f"the producer is configured to write the execution index to "
+                    f"{_exec_index_base()} but that service does not answer /status "
+                    f"({exec_detail['error']}) — every exec_post write is being lost")
+
         if gap > _WARM_WATCHER_GAP_THRESHOLD:
             problems.append(
                 f"warm_watchers_started ({started}) exceeds warm_watchers_resolved "
@@ -244,6 +335,7 @@ def build_routes(config: dict | None = None, *, kanban_sweep_status: dict | None
             "counters": counters,
             "counters_window": window_counters,
             "window_hours": execution_index_mod.WINDOW_LOOKBACK_HOURS,
+            "exec_index_service": exec_detail,
             **detail_extra,
             "problems": problems,
         }}

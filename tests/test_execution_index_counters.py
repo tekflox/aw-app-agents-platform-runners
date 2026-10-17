@@ -5,6 +5,15 @@ warm_watchers_started/resolved pair that fingerprints the dominant root
 cause: a warm-dispatch watcher thread silently killed by a restart of this
 (Tier-1, in-process) app before it ever resolves.
 
+Every config here passes ``exec_index_url: ""``. These tests predate the
+aw-app-kb migration's dual-write (docs/design/execution-index-migration-off-
+aw-app-kb.md §3.3 step 2) and are about the OLD target's counter names and
+the doctor's failure RATIO — switching the second target off keeps each one
+measuring the one thing it was written for, instead of silently also
+counting a second failing POST into every ratio. Dual-write behaviour has
+its own module, tests/test_execution_index_dual_write.py, and the doctor's
+new service-liveness dimension has tests/test_exec_index_doctor_liveness.py.
+
 Run: .venv/aw/bin/python -m pytest tests/test_execution_index_counters.py
 """
 from __future__ import annotations
@@ -134,6 +143,7 @@ def test_attempted_and_gate_counters_increment(monkeypatch):
 
     assert idx.index_run("run-1", config={
         "agents_platform_base": "http://ap", "kb_base_url": "http://kb",
+        "exec_index_url": "",
         "execution_index_mode": "interesting",
     }, transport=httpx.MockTransport(handler)) is False
 
@@ -156,6 +166,7 @@ def test_indexed_counter_increments_on_success(monkeypatch):
 
     assert idx.index_run("run-1", config={
         "agents_platform_base": "http://ap", "kb_base_url": "http://kb",
+        "exec_index_url": "",
         "execution_index_mode": "interesting",
     }, transport=httpx.MockTransport(handler)) is True
 
@@ -194,6 +205,7 @@ def test_kb_post_gets_its_own_longer_timeout_without_touching_the_shared_client(
 
     assert idx.index_run("run-1", config={
         "agents_platform_base": "http://ap", "kb_base_url": "http://kb",
+        "exec_index_url": "",
         "execution_index_mode": "interesting",
     }, transport=httpx.MockTransport(handler)) is True
 
@@ -225,6 +237,7 @@ def test_ap_mt_gets_carry_a_30s_read_budget_but_a_5s_connect_budget(monkeypatch)
 
     assert idx.index_run("run-1", config={
         "agents_platform_base": "http://ap", "kb_base_url": "http://kb",
+        "exec_index_url": "",
         "execution_index_mode": "interesting",
     }, transport=httpx.MockTransport(handler)) is True
 
@@ -249,6 +262,7 @@ def test_finalize_timeout_counter_increments(monkeypatch):
     clock = iter([0, 61])
     assert idx.index_run("run-1", config={
         "agents_platform_base": "http://ap", "kb_base_url": "http://kb",
+        "exec_index_url": "",
         "execution_index_mode": "all",
     }, transport=httpx.MockTransport(handler), sleep=lambda _n: None,
        monotonic=lambda: next(clock)) is False
@@ -271,6 +285,7 @@ def test_secret_reject_counter_is_distinct_from_generic_http_error(monkeypatch):
 
     assert idx.index_run("run-1", config={
         "agents_platform_base": "http://ap", "kb_base_url": "http://kb",
+        "exec_index_url": "",
         "execution_index_mode": "interesting",
     }, transport=httpx.MockTransport(handler)) is False
 
@@ -292,6 +307,7 @@ def test_http_error_counter_for_a_non_secret_kb_failure(monkeypatch):
 
     assert idx.index_run("run-1", config={
         "agents_platform_base": "http://ap", "kb_base_url": "http://kb",
+        "exec_index_url": "",
         "execution_index_mode": "interesting",
     }, transport=httpx.MockTransport(handler)) is False
 
@@ -349,6 +365,7 @@ def test_two_distinct_exception_types_get_two_distinct_named_buckets(monkeypatch
     }, transport=httpx.MockTransport(handler_connect_error))
     idx.index_run("run-1", config={
         "agents_platform_base": "http://ap", "kb_base_url": "http://kb",
+        "exec_index_url": "",
         "execution_index_mode": "interesting",
     }, transport=httpx.MockTransport(handler_value_error))
 
@@ -375,6 +392,7 @@ def test_apmt_get_run_readtimeout_is_attributed_to_its_phase(monkeypatch):
 
     assert idx.index_run("run-1", config={
         "agents_platform_base": "http://ap", "kb_base_url": "http://kb",
+        "exec_index_url": "",
         "execution_index_mode": "interesting",
     }, transport=httpx.MockTransport(handler)) is False
 
@@ -390,7 +408,7 @@ def test_apmt_get_run_readtimeout_is_attributed_to_its_phase(monkeypatch):
     fake.data[_window_key("skipped:apmt_get_run:ReadTimeout")] = "3"
     fake.data[_window_key("indexed")] = "7"
 
-    client = TestClient(build_routes({}))
+    client = TestClient(build_routes({"exec_index_url": ""}))
     body = client.get("/execution-index/doctor").json()
     assert body["ok"] is False
     assert body["detail"]["counters_window"]["skipped:apmt_get_run:ReadTimeout"] == 3
@@ -409,6 +427,7 @@ def test_apmt_get_events_readtimeout_is_attributed_to_its_phase(monkeypatch):
 
     assert idx.index_run("run-1", config={
         "agents_platform_base": "http://ap", "kb_base_url": "http://kb",
+        "exec_index_url": "",
         "execution_index_mode": "interesting",
     }, transport=httpx.MockTransport(handler)) is False
 
@@ -420,7 +439,7 @@ def test_apmt_get_events_readtimeout_is_attributed_to_its_phase(monkeypatch):
     fake.data[_window_key("skipped:apmt_get_events:ReadTimeout")] = "3"
     fake.data[_window_key("indexed")] = "7"
 
-    client = TestClient(build_routes({}))
+    client = TestClient(build_routes({"exec_index_url": ""}))
     body = client.get("/execution-index/doctor").json()
     assert body["ok"] is False
     assert body["detail"]["counters_window"]["skipped:apmt_get_events:ReadTimeout"] == 3
@@ -444,6 +463,7 @@ def test_kb_post_readtimeout_is_attributed_to_its_phase(monkeypatch):
 
     assert idx.index_run("run-1", config={
         "agents_platform_base": "http://ap", "kb_base_url": "http://kb",
+        "exec_index_url": "",
         "execution_index_mode": "interesting",
     }, transport=httpx.MockTransport(handler)) is False
 
@@ -455,7 +475,7 @@ def test_kb_post_readtimeout_is_attributed_to_its_phase(monkeypatch):
     fake.data[_window_key("skipped:kb_post:ReadTimeout")] = "3"
     fake.data[_window_key("indexed")] = "7"
 
-    client = TestClient(build_routes({}))
+    client = TestClient(build_routes({"exec_index_url": ""}))
     body = client.get("/execution-index/doctor").json()
     assert body["ok"] is False
     assert body["detail"]["counters_window"]["skipped:kb_post:ReadTimeout"] == 3
@@ -477,6 +497,7 @@ def test_exception_outside_the_three_phases_still_falls_back_to_skipped_other(mo
 
     assert idx.index_run("run-1", config={
         "agents_platform_base": "http://ap", "kb_base_url": "http://kb",
+        "exec_index_url": "",
         "execution_index_mode": "interesting",
     }, transport=httpx.MockTransport(handler)) is False
 
@@ -571,7 +592,7 @@ def test_execution_index_status_endpoint_reports_the_raw_counters(monkeypatch):
     fake.data[idx._COUNTER_PREFIX + "attempted"] = "5"
     fake.data[idx._COUNTER_PREFIX + "indexed"] = "3"
 
-    client = TestClient(build_routes({}))
+    client = TestClient(build_routes({"exec_index_url": ""}))
     resp = client.get("/execution-index/status")
 
     assert resp.status_code == 200
@@ -587,7 +608,7 @@ def test_execution_index_doctor_flags_a_persistent_warm_watcher_gap(monkeypatch)
     fake.data[idx._COUNTER_PREFIX + "warm_watchers_started"] = "30"
     fake.data[idx._COUNTER_PREFIX + "warm_watchers_resolved"] = "1"
 
-    client = TestClient(build_routes({}))
+    client = TestClient(build_routes({"exec_index_url": ""}))
     resp = client.get("/execution-index/doctor")
 
     assert resp.status_code == 200
@@ -607,7 +628,7 @@ def test_execution_index_doctor_ok_with_high_gate_ratio_and_zero_failures(monkey
     fake.data[_window_key("skipped:gate")] = "94"
     fake.data[_window_key("indexed")] = "6"
 
-    client = TestClient(build_routes({}))
+    client = TestClient(build_routes({"exec_index_url": ""}))
     body = client.get("/execution-index/doctor").json()
 
     assert body["ok"] is True
@@ -624,7 +645,7 @@ def test_execution_index_doctor_flags_real_failures_above_threshold_in_the_windo
     fake.data[_window_key("skipped:http_error")] = "30"
     fake.data[_window_key("indexed")] = "70"
 
-    client = TestClient(build_routes({}))
+    client = TestClient(build_routes({"exec_index_url": ""}))
     body = client.get("/execution-index/doctor").json()
 
     assert body["ok"] is False
@@ -642,7 +663,7 @@ def test_execution_index_doctor_ignores_historical_lifetime_pollution_with_a_cle
     fake.data[_window_key("attempted")] = "10"
     fake.data[_window_key("indexed")] = "10"
 
-    client = TestClient(build_routes({}))
+    client = TestClient(build_routes({"exec_index_url": ""}))
     body = client.get("/execution-index/doctor").json()
 
     assert body["ok"] is True
@@ -658,7 +679,7 @@ def test_execution_index_doctor_counts_a_dynamic_skipped_other_bucket_in_the_win
     fake.data[_window_key("skipped:other:ReadTimeout")] = "10"
     fake.data[_window_key("indexed")] = "10"
 
-    client = TestClient(build_routes({}))
+    client = TestClient(build_routes({"exec_index_url": ""}))
     body = client.get("/execution-index/doctor").json()
 
     assert body["ok"] is False
@@ -675,7 +696,7 @@ def test_execution_index_doctor_does_not_count_in_flight_runs_as_failures(monkey
     monkeypatch.setattr(idx, "_counter_redis_client", lambda: fake)
     fake.data[_window_key("attempted")] = "10"
 
-    client = TestClient(build_routes({}))
+    client = TestClient(build_routes({"exec_index_url": ""}))
     body = client.get("/execution-index/doctor").json()
 
     assert body["ok"] is True
@@ -691,7 +712,7 @@ def test_execution_index_doctor_notes_insufficient_volume_below_min_sample(monke
     fake.data[_window_key("attempted")] = "4"
     fake.data[_window_key("skipped:http_error")] = "4"
 
-    client = TestClient(build_routes({}))
+    client = TestClient(build_routes({"exec_index_url": ""}))
     body = client.get("/execution-index/doctor").json()
 
     assert body["ok"] is True
@@ -717,7 +738,7 @@ def test_execution_index_doctor_ok_when_nothing_has_happened_yet(monkeypatch):
     fake = FakeCounterRedis()
     monkeypatch.setattr(idx, "_counter_redis_client", lambda: fake)
 
-    client = TestClient(build_routes({}))
+    client = TestClient(build_routes({"exec_index_url": ""}))
     resp = client.get("/execution-index/doctor")
 
     assert resp.status_code == 200
@@ -733,7 +754,7 @@ def test_execution_index_doctor_ok_when_nothing_has_happened_yet(monkeypatch):
 def test_execution_index_doctor_reports_not_ok_when_redis_is_unavailable():
     # No override — conftest's default _counter_redis_client already
     # returns None, matching a deployment with no discoverable Redis.
-    client = TestClient(build_routes({}))
+    client = TestClient(build_routes({"exec_index_url": ""}))
     resp = client.get("/execution-index/doctor")
 
     assert resp.status_code == 200
@@ -758,6 +779,7 @@ def test_index_and_maybe_queue_retry_queues_a_real_failure(monkeypatch):
 
     ok = idx._index_and_maybe_queue_retry("run-1", config={
         "agents_platform_base": "http://ap", "kb_base_url": "http://kb",
+        "exec_index_url": "",
         "execution_index_mode": "interesting",
     }, transport=httpx.MockTransport(handler))
 
@@ -779,6 +801,7 @@ def test_index_and_maybe_queue_retry_does_not_queue_a_gate_exclusion(monkeypatch
 
     ok = idx._index_and_maybe_queue_retry("run-1", config={
         "agents_platform_base": "http://ap", "kb_base_url": "http://kb",
+        "exec_index_url": "",
         "execution_index_mode": "interesting",
     }, transport=httpx.MockTransport(handler))
 
@@ -799,6 +822,7 @@ def test_index_and_maybe_queue_retry_does_not_queue_on_success(monkeypatch):
 
     ok = idx._index_and_maybe_queue_retry("run-1", config={
         "agents_platform_base": "http://ap", "kb_base_url": "http://kb",
+        "exec_index_url": "",
         "execution_index_mode": "interesting",
     }, transport=httpx.MockTransport(handler))
 

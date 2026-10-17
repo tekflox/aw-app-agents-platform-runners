@@ -1259,6 +1259,45 @@ async def _list_tools() -> list[Tool]:
                                                  "drained (dying, not serving). Default false."},
                           }}),
 
+        # ----- execution index -----
+        # Moved here from aw-app-kb (docs/design/execution-index-migration-off-
+        # aw-app-kb.md): the index is about RUNS, which this app owns, and it
+        # has to outlive the app whose container happened to hold its Postgres.
+        # The gateway name becomes aw__agents_platform_runners__search_execution
+        # _history; aw__kb__search_execution_history serves the same data from
+        # the old copy until the cutover's last step retires it.
+        Tool(name="search_execution_history",
+             description=(
+                 "Search indexed AP-MT execution-run dumps by semantic similarity — "
+                 "e.g. 'have we seen this tool error before, and how did it resolve'. "
+                 "Its own pgvector table, separate from any knowledge-base search: "
+                 "this never returns docs. Returns one summary block per matching run "
+                 "(status, agent, target, ended_at, cost, the excerpt that matched) — "
+                 "call get_run_detail(run_id=...) for the full record; this tool only "
+                 "finds the run, it doesn't open it.\n\n"
+                 "Covers roughly the last 30 days (the index is a digest with a "
+                 "retention sweep, not an archive — AP-MT keeps the full run record "
+                 "forever, so a miss here means 'not indexed', never 'never "
+                 "happened')."),
+             inputSchema={"type": "object",
+                          "properties": {
+                              "query": {"type": "string",
+                                  "description": "Natural language search query"},
+                              "n_results": {"type": "integer", "default": 5,
+                                  "description": "Max number of runs to return (default: 5)"},
+                              "status": {"type": "string",
+                                  "description": "Filter by run status, e.g. 'success' or 'error'"},
+                              "agent_slug": {"type": "string",
+                                  "description": "Filter by agent slug"},
+                              "target_slug": {"type": "string",
+                                  "description": "Filter by target slug"},
+                              "since_days": {"type": "integer",
+                                  "description": "Only consider runs indexed in the last N days"},
+                              "run_id": {"type": "string",
+                                  "description": "Restrict the search to one specific run id"},
+                          },
+                          "required": ["query"]}),
+
         # ----- legacy alias -----
         Tool(name="get_run",
              description="Alias for run_status — fetches a Run row by id.",
@@ -1988,6 +2027,50 @@ def _session_id_format_error(value: str) -> list[TextContent] | None:
         f"resume. Get a session_id from `list_sessions`, from `run_status(run_id)` "
         f"on a finished run, or from `$AW_SESSION_ID` for your own."
     ))
+
+
+# Several matching chunks can belong to the same run — overfetch chunk-level
+# results so grouping by run_id still surfaces n_results DISTINCT runs. Lifted
+# with its value from aw-app-kb's ``mcp_http._RUN_GROUP_OVERFETCH``: the
+# migration moves this tool's home, not its behaviour, and a caller asking for
+# 5 runs must keep getting 5.
+_RUN_GROUP_OVERFETCH = 6
+
+
+def _format_execution_history(query: str, results: list[dict], n_results: int) -> str:
+    """Group chunk hits into one block per RUN and render them.
+
+    A verbatim port of aw-app-kb's ``_search_execution_history`` tail. Kept as
+    text rather than switched to ``_ok``'s JSON like this server's other
+    tools: it is what every agent reading this tool has been trained on, and
+    the migration is explicitly not the moment to also change the answer's
+    shape. The tool finds the run; opening it is ``get_run_detail``'s job.
+    """
+    by_run: dict[str, dict] = {}
+    order: list[str] = []
+    for r in results:
+        rid = r["run_id"]
+        if rid not in by_run:
+            by_run[rid] = r
+            order.append(rid)
+    order = order[:n_results]
+
+    lines = [f"Found {len(order)} run(s) matching: {query}\n"]
+    for rid in order:
+        r = by_run[rid]
+        meta = r.get("metadata") or {}
+        excerpt = r.get("content") or ""
+        if len(excerpt) > 500:
+            excerpt = excerpt[:500] + "…"
+        lines.append(
+            f"--- Run {rid} (score: {r['score']:.3f}) ---\n"
+            f"status: {meta.get('status', '?')} | agent: {meta.get('agent_slug', '?')} | "
+            f"target: {meta.get('target_slug', '?')} | ended_at: {meta.get('ended_at', '?')} | "
+            f"cost: {meta.get('cost_usd', '?')}\n"
+            f"matched: {excerpt}\n"
+            f"→ call get_run_detail(run_id={rid!r}) for the full record\n"
+        )
+    return "\n".join(lines)
 
 
 async def _enrich_warm_containers(c, payload: dict) -> None:
@@ -2774,6 +2857,56 @@ async def _dispatch_tool(name: str, arguments: dict[str, Any] | None) -> list[Te
             # route, and why a failed join degrades instead of erroring.
             await _enrich_warm_containers(c, payload)
             return _ok(payload)
+        if name == "search_execution_history":
+            query = (args.get("query") or "").strip()
+            if not query:
+                return _err(400, "Please provide a search query.")
+            # Same two-hop route as list_warm_containers above, and for the
+            # same reason: this process is a stdio child of the mcp-gateway's
+            # OWN container, so the exec-index service's loopback address is
+            # not reachable from here. Go in through the published workspace
+            # API; this app's /execution-index/search route does the last hop.
+            own_base = kanban_dispatch.board_base_url()
+            key = (os.environ.get(kanban_dispatch.API_KEY_VAR)
+                   or kanban_dispatch._from_env_file(kanban_dispatch.API_KEY_VAR))
+            if not key:
+                return _err(500, f"{kanban_dispatch.API_KEY_VAR} is not set for this MCP "
+                                 "upstream. It is baked into the stdio env by the app's "
+                                 "plugin.build_mcp_servers() — an upstream missing it was "
+                                 "registered by an older version of this app, so restart "
+                                 "the workspace (which rewrites mcp.json) and then the "
+                                 "mcp-gateway.")
+            filters = {k: args[k] for k in
+                       ("status", "agent_slug", "target_slug", "since_days", "run_id")
+                       if args.get(k) is not None}
+            n_results = max(int(args.get("n_results") or 5), 1)
+            try:
+                r = await c.post(
+                    f"{own_base}/api/apps/agents-platform-runners/execution-index/search",
+                    json={"query": query,
+                          # Several matching chunks can belong to the same run, so
+                          # overfetch at chunk level — grouping by run_id below still
+                          # has to surface n_results DISTINCT runs. Same constant
+                          # aw-app-kb's handler used.
+                          "n_results": min(n_results * _RUN_GROUP_OVERFETCH, 200),
+                          "filters": filters},
+                    headers={"X-Api-Key": key}, timeout=90.0)
+            except httpx.HTTPError as exc:
+                return _err(502, f"could not reach this workspace's own API at {own_base}: {exc}")
+            if r.status_code != 200:
+                return _err(r.status_code, r.text)
+            payload = r.json()
+            if not payload.get("total"):
+                return _err(404, "No execution history indexed yet.")
+            results = payload.get("results") or []
+            if not results:
+                return _err(404, f"No execution history matched: {query}")
+            # Plain text, not _ok's JSON dump: the rendered blocks are the
+            # answer agents already read from aw__kb__search_execution_history,
+            # and json.dumps would hand them one escaped string instead.
+            return [TextContent(
+                type="text",
+                text=_format_execution_history(query, results, n_results))]
 
         # --- Targets ---
         if name == "list_callers":

@@ -19,7 +19,11 @@
     "pip_requires": [
       "httpx",
       "docker",
-      "redis"
+      "redis",
+      "fastembed",
+      "psycopg[binary]",
+      "fastapi",
+      "uvicorn"
     ],
     "standalone": {
       "module": "agents_platform_runners_app",
@@ -33,12 +37,19 @@
     "secrets:own",
     "containers:manage",
     "watchdog:tasks",
-    "agents:contribute"
+    "agents:contribute",
+    "service:manage"
   ],
   "contributes": {
     "routes": [
       {
         "prefix": "/api/apps/agents-platform-runners"
+      }
+    ],
+    "services": [
+      {
+        "id": "exec-index",
+        "autostart": true
       }
     ],
     "doctor": [
@@ -1146,6 +1157,16 @@
         "x-secret": true,
         "title": "OpenAI API key",
         "description": "OpenAI API key the contributed `openai-*` models below run on. Saving this panel PUTs it onto agents-platform-multitenant's own Settings.openai_api_key row (see platform_settings.py) \u2014 the platform stores it, this is just where you type it, so the models this app seeds and the key they need are configured in one place. Leave blank to leave the platform's current value alone: a blank field means \"not set here\", never \"clear it\", so saving an unrelated field on this panel cannot wipe a key entered in the platform UI. The same key also drives the platform's OpenAI TTS/STT, which read the identical setting."
+      },
+      "exec_index_url": {
+        "type": "string",
+        "default": "http://127.0.0.1:9408",
+        "description": "Base URL of this app's own exec-index service \u2014 the execution index's new home after the aw-app-kb migration (docs/design/execution-index-migration-off-aw-app-kb.md). Loopback inside the workspace container, where both the producer and that service run. The post-run hook dual-writes every run's chunks to BOTH this and kb_base_url while the cutover is in progress; set either to an empty string to stop writing to it, which needs no deploy. Blank here means the new home gets no writes; blank kb_base_url means the old one does not."
+      },
+      "exec_index_port": {
+        "type": "integer",
+        "default": 9408,
+        "description": "Port the exec-index service binds on 127.0.0.1 inside the workspace container. Must agree with the port in exec_index_url; change both together. Only one process ever binds it \u2014 the service lease makes a single AW_WORKSPACE_WORKERS worker its owner."
       }
     },
     "required": []
