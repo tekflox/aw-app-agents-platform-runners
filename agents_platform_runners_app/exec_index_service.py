@@ -54,11 +54,25 @@ DEFAULT_HOST = "127.0.0.1"
 #: deleted a task in a UI.
 PRUNE_INTERVAL_S = 24 * 3600.0
 
-#: Env var carrying the shared secret writes must present. Set by the
-#: supervisor's inherited environment is NOT enough — ``plugin.py`` passes it
-#: on the service's own command line via this var (see ``service_command``),
-#: sourced from the app's ``execution_index_secret`` config key, which is
-#: already an ``x-secret`` field held by the workspace secret store.
+#: Env var carrying the shared secret writes must present.
+#:
+#: It reaches this process by **environment inheritance**: ``plugin.py``'s
+#: ``_apply_exec_index_env`` sets this name in the *core* process's own
+#: ``os.environ`` before registering the service, and ``src/apps/services.py``
+#: spawns with ``subprocess.Popen(...)`` and no ``env=`` argument, so the child
+#: inherits it. That is the only channel the supervisor offers.
+#:
+#: **Deliberately NOT the command line** — anything in argv is readable from
+#: ``ps`` by everything else in this container, and the supervisor also keeps
+#: the command string in memory for its orphan-reaping comparison. Do not
+#: "simplify" this into a ``--secret`` flag. (An earlier version of this
+#: comment claimed argv was the mechanism; QA caught it. The code was always
+#: right, the comment was not — and a reader trusting it could have changed
+#: the code to match.)
+#:
+#: Sourced from the app's ``execution_index_secret`` config key, an
+#: ``x-secret`` field already held by the workspace secret store — so no new
+#: credential is persisted anywhere by this service.
 SECRET_ENV = "EXEC_INDEX_SECRET"
 
 
