@@ -104,9 +104,15 @@ class TestRewriteGuards:
         text = f"[[ATTACH: {f}]]"
         assert self.mod.rewrite_text(text, "") == text
 
-    def test_nonexistent_path_left_for_the_agent_to_see(self):
+    def test_nonexistent_path_becomes_a_visible_warning(self):
+        # Leaving the marker untouched here used to just move the silent
+        # drop one hop downstream (AP's os.path.exists() miss) — the exact
+        # failure mode this module exists to prevent. The agent and the user
+        # now both see why nothing arrived.
         text = "[[ATTACH: /definitely/not/here.png]]"
-        assert self.mod.rewrite_text(text, "run-1") == text
+        out = self.mod.rewrite_text(text, "run-1")
+        assert text not in out
+        assert "here.png" in out and "not found" in out
 
     def test_relative_path_left_alone(self):
         text = "[[ATTACH: relative/chart.png]]"
@@ -120,26 +126,40 @@ class TestRewriteGuards:
         text = '[[ATTACH: https://example.test/x.png caption="c"]]'
         assert self.mod.rewrite_text(text, "run-1") == text
 
-    def test_empty_file_is_not_uploaded(self, tmp_path):
+    def test_empty_file_becomes_a_visible_warning(self, tmp_path):
         f = tmp_path / "empty.png"
         f.write_bytes(b"")
         text = f"[[ATTACH: {f}]]"
-        assert self.mod.rewrite_text(text, "run-1") == text
+        out = self.mod.rewrite_text(text, "run-1")
+        assert text not in out
+        assert "empty.png" in out and "empty" in out
 
-    def test_oversized_file_is_not_uploaded(self, tmp_path, monkeypatch):
+    def test_oversized_file_becomes_a_visible_warning_with_the_size(self, tmp_path, monkeypatch):
         monkeypatch.setattr(self.mod, "MAX_ATTACH_BYTES", 4)
         f = tmp_path / "big.png"
         f.write_bytes(b"12345")
         text = f"[[ATTACH: {f}]]"
-        assert self.mod.rewrite_text(text, "run-1") == text
+        out = self.mod.rewrite_text(text, "run-1")
+        assert text not in out
+        assert "big.png" in out and "MB" in out
 
-    def test_upload_failure_leaves_the_marker_untouched(self, tmp_path, monkeypatch):
+    def test_upload_failure_becomes_a_visible_warning(self, tmp_path, monkeypatch):
         monkeypatch.setattr(self.mod, "_upload", lambda *a, **k: (_ for _ in ()).throw(OSError("boom")))
         monkeypatch.setattr(self.mod, "_uploaded", {})
         f = tmp_path / "chart.png"
         f.write_bytes(b"\x89PNG data")
         text = f"[[ATTACH: {f}]]"
-        assert self.mod.rewrite_text(text, "run-1") == text
+        out = self.mod.rewrite_text(text, "run-1")
+        assert text not in out
+        assert "chart.png" in out
+
+    def test_max_attach_bytes_covers_real_paper_to_audio_mp3s_under_telegrams_50mb_send_cap(self):
+        # The incident this fix was for: a 22.4 MB research-paper MP3 silently
+        # never arrived because the old 15 MB cutoff (sized against a
+        # misremembered "base64 eats Telegram's own cap" assumption) rejected
+        # it well under Telegram's real 50 MB sendDocument limit.
+        assert self.mod.MAX_ATTACH_BYTES > 23 * 1024 * 1024
+        assert self.mod.MAX_ATTACH_BYTES < 50 * 1024 * 1024
 
 
 class TestRewriteSuccess:

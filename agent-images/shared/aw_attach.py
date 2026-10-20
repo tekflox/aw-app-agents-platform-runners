@@ -78,10 +78,18 @@ _ATTACH_RE = re.compile(
     re.IGNORECASE,
 )
 
-# Telegram's Bot API caps uploads at 20 MB. Artefact content travels as
-# base64 (~1.34x), so refuse well before that rather than let a big file
-# bloat the runs table and then get rejected by Telegram anyway.
-MAX_ATTACH_BYTES = 15 * 1024 * 1024
+# Telegram's Bot API lets a bot SEND a document/audio/video of any type up
+# to 50 MB (sendDocument et al.) — and that cap is on the RAW bytes:
+# `_materialise_artefact` on AP's side decodes the stored artefact back out
+# of base64 before handing it to Telegram, so the base64 inflation here only
+# swells THIS process's own POST body to AP's artefact-store route, which
+# has no hard size limit of its own. The old 15 MB figure was sized as if
+# base64 inflation ate into Telegram's cap too (`15 MB * 1.34 ~= 20 MB`) —
+# it doesn't; that confusion rejected real attachments (e.g. a 22 MB
+# paper-to-audio MP3) well under Telegram's actual limit. Capped under 50 MB
+# for margin (multipart overhead, a slow network, a proxy timeout on a big
+# POST), not right at the wire.
+MAX_ATTACH_BYTES = 45 * 1024 * 1024
 
 WORKSPACE_DIR = os.environ.get("AW_WORKSPACE_CONTAINER_DIR", "/opt/aw-workspace")
 _MCP_JSON = os.path.join(WORKSPACE_DIR, "apps", "agents-platform-runners", "mcp.json")
@@ -154,11 +162,18 @@ def rewrite_text(text: str, run_id: str) -> str:
     """Return ``text`` with every resolvable local ``[[ATTACH]]`` path swapped
     for its ``artefact://`` reference.
 
-    Never raises: a failed upload leaves the marker exactly as the agent wrote
-    it, which is the pre-existing (silent-drop) behaviour rather than a new
-    failure mode. Markers whose path is already a URL/scheme, or that point at
-    a file this side can't see either, are left alone — the first is somebody
-    else's rewrite, the second is an agent bug worth surfacing as-is.
+    Never raises. A marker whose path is already a URL/scheme, or a relative
+    path, is left alone — that one is somebody else's rewrite to make, not a
+    failure here. Everything else that keeps a marker from becoming a working
+    ``artefact://`` reference (file not found, empty file, over
+    ``MAX_ATTACH_BYTES``, the artefact-store upload itself failing) used to
+    leave the marker untouched — which AP's own ``_deliver_reply`` then drops
+    SILENTLY on its ``os.path.exists()`` miss, nothing but a log line the
+    user never sees. That is the exact 2026-08-12 bug this module exists to
+    fix, just re-created for a different reason; leaving a KNOWN failure
+    untouched is not "no new failure mode," it's the same one. So each of
+    those cases is turned into a short inline warning instead — delivered as
+    plain reply text, the one path every channel already goes through.
     """
     if not text or "[[ATTACH" not in text.upper() or not run_id:
         return text
@@ -168,12 +183,21 @@ def rewrite_text(text: str, run_id: str) -> str:
         path = re.sub(r"\s+caption=.*$", "", m.group("path").strip()).strip()
         if "://" in path or not os.path.isabs(path):
             return whole
+        basename = os.path.basename(path) or path
+
+        def _warn(reason: str) -> str:
+            return f"⚠️ attachment not sent ({reason}): {basename}"
+
         try:
             if not os.path.isfile(path):
-                return whole
+                return _warn("file not found on this side")
             size = os.path.getsize(path)
-            if size == 0 or size > MAX_ATTACH_BYTES:
-                return whole
+            if size == 0:
+                return _warn("file is empty")
+            if size > MAX_ATTACH_BYTES:
+                return _warn(
+                    f"{size / (1024 * 1024):.1f} MB over the "
+                    f"{MAX_ATTACH_BYTES / (1024 * 1024):.0f} MB limit")
             key = (run_id, path)
             name = _uploaded.get(key)
             if name is None:
@@ -184,9 +208,9 @@ def rewrite_text(text: str, run_id: str) -> str:
                     _uploaded.clear()
                 _uploaded[key] = name
             if not name:
-                return whole
-        except Exception:
-            return whole
+                return _warn("upload to the artefact store failed")
+        except Exception as e:
+            return _warn(type(e).__name__)
         caption = m.group("caption")
         tail = f' caption="{caption}"' if caption else ""
         return f"[[ATTACH: artefact://{run_id}/{name}{tail}]]"
