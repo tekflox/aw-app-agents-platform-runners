@@ -151,6 +151,32 @@
           }
         },
         {
+          "slug": "codex-runner-gpt-5-6-luna",
+          "provider": "runner",
+          "model_id": "codex-runner-gpt-5-6-luna",
+          "display_name": "Codex (aw Runner, GPT-5.6 Luna)",
+          "params": {
+            "runner": "aw-codex",
+            "cli": "codex",
+            "model": "gpt-5.6-luna",
+            "dangerous_skip_permissions": true,
+            "timeout_s": 900
+          }
+        },
+        {
+          "slug": "codex-runner-gpt-5-6-terra",
+          "provider": "runner",
+          "model_id": "codex-runner-gpt-5-6-terra",
+          "display_name": "Codex (aw Runner, GPT-5.6 Terra)",
+          "params": {
+            "runner": "aw-codex",
+            "cli": "codex",
+            "model": "gpt-5.6-terra",
+            "dangerous_skip_permissions": true,
+            "timeout_s": 900
+          }
+        },
+        {
           "slug": "claude-runner-sonnet",
           "provider": "runner",
           "model_id": "claude-runner-sonnet",
