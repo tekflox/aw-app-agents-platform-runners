@@ -131,7 +131,26 @@ ISOLATED_KEEP_SECONDS = int(os.environ.get("AW_RUNNER_ISOLATED_KEEP_SECONDS") or
 #:
 #: The other three were already here: `isolated` (copying the copies),
 #: `sessions` and `cache`.
-CREDS_COPY_IGNORE = ("isolated", "sessions", "cache", ".tmp")
+#:
+#: `packages` joined them on 2026-10-21, after the same failure mode recurred
+#: an order of magnitude larger and filled a 436 GB disk to 100%. codex now
+#: ships its app-server as a versioned package tree —
+#: `packages/app-server-daemon/releases/<version>/` at ~700 MB a release, plus
+#: a `current` symlink that `copytree` DEREFERENCES into a third full copy. So
+#: a 1.3 GB source became 2.1 GB per run, held for ISOLATED_KEEP_SECONDS:
+#: 37 dirs, 94 GB, and every write on the host failing with ENOSPC — Redis
+#: dropped its AOF, postgres went into recovery mode, and the app update that
+#: happened to need the last few bytes rolled back and left its app DOWN.
+#:
+#: Excluding it is free, not a trade: the container runs with CODEX_HOME
+#: pointed at the ONE shared home (_cli_home_rel), and this staged copy is
+#: only ever read to FIRST-populate that home — a `[ -f config.toml ] ||`
+#: guard. On any host where codex has run before, config.toml is already
+#: there, so those 2.1 GB were copied, mounted read-only, and never opened.
+#: Verified on the live host: the shared home has no `packages/` at all and
+#: codex runs fine, because the binary it executes comes from the workspace's
+#: own `.aw-workspace/bin/codex`, not from a per-run creds copy.
+CREDS_COPY_IGNORE = ("isolated", "sessions", "cache", ".tmp", "packages")
 
 
 def _reap_isolated_dirs(parent: "Path") -> None:

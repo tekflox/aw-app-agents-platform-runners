@@ -12,6 +12,13 @@ copy, 97 MB was `.tmp/plugins`: a git checkout duplicated on every run.
 The reaper (ISOLATED_KEEP_SECONDS) bounds how long copies survive. This bounds
 how BIG each one is, which is the half that attacks the cause rather than the
 accumulation.
+
+It recurred on 2026-10-21, an order of magnitude larger, and took the host's
+whole disk with it: codex's `packages/app-server-daemon/` ships ~700 MB
+releases plus a `current` symlink that `copytree` dereferences into another
+full copy, so each run cost 2.1 GB. 37 of them filled a 436 GB disk, which
+cost Redis its AOF, put postgres into recovery mode, and left the app whose
+update needed the last few bytes rolled back and DOWN.
 """
 import shutil
 from pathlib import Path
@@ -33,6 +40,16 @@ def _creds_tree(root: Path) -> Path:
     (src / "isolated" / "old-run").mkdir(parents=True)
     (src / "sessions").mkdir()
     (src / "cache").mkdir()
+    # codex's app-server package tree, shaped like the real one: two pinned
+    # releases plus a `current` SYMLINK into one of them. The symlink matters —
+    # copytree dereferences it, so the copy is bigger than the source.
+    releases = src / "packages" / "app-server-daemon" / "releases"
+    for version in ("0.160.1-x86_64-unknown-linux-musl",
+                    "0.161.0-x86_64-unknown-linux-musl"):
+        (releases / version / "bin").mkdir(parents=True)
+        (releases / version / "bin" / "codex").write_text("B" * 700)
+    (src / "packages" / "app-server-daemon" / "current").symlink_to(
+        releases / "0.161.0-x86_64-unknown-linux-musl")
     (src / "skills").mkdir()
     (src / "auth.json").write_text("{}")
     (src / "config.toml").write_text("")
@@ -69,6 +86,35 @@ def test_credentials_and_state_still_travel(tmp_path):
     for name in ("auth.json", "config.toml", "state_5.sqlite"):
         assert (dst / name).is_file(), f"{name} must reach the container"
     assert (dst / "skills").is_dir()
+
+
+def test_the_codex_package_tree_is_not_copied(tmp_path):
+    """THE 2026-10-21 FIX. 2.1 of every 2.1 GB was this.
+
+    Free to drop, not a trade: the container runs with CODEX_HOME pointed at
+    the ONE shared home, and this copy is only read to FIRST-populate it,
+    behind a `[ -f config.toml ] ||` guard. Wherever codex has run before,
+    these bytes were copied, mounted read-only, and never opened.
+    """
+    src = _creds_tree(tmp_path)
+    dst = tmp_path / "copy"
+    _copy(src, dst)
+    assert not (dst / "packages").exists()
+
+
+def test_a_dereferenced_symlink_cannot_inflate_the_copy(tmp_path):
+    """Why `packages` cost 2.1 GB from a 1.3 GB source.
+
+    `copytree` follows symlinks by default, so `current` -> a 700 MB release
+    arrives as a THIRD independent copy. Pinning the outcome: no copy may be
+    larger than the directory it was made from.
+    """
+    src = _creds_tree(tmp_path)
+    dst = tmp_path / "copy"
+    _copy(src, dst)
+    before = sum(f.stat().st_size for f in src.rglob("*") if f.is_file())
+    after = sum(f.stat().st_size for f in dst.rglob("*") if f.is_file())
+    assert after <= before, f"copy is {after} bytes from {before} — a symlink was inflated"
 
 
 @pytest.mark.parametrize("name", ["isolated", "sessions", "cache"])
