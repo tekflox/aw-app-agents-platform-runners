@@ -50,6 +50,12 @@ def _creds_tree(root: Path) -> Path:
         (releases / version / "bin" / "codex").write_text("B" * 700)
     (src / "packages" / "app-server-daemon" / "current").symlink_to(
         releases / "0.161.0-x86_64-unknown-linux-musl")
+    # codex's own scratch dir — plain `tmp`, NOT `.tmp`. It extracts its
+    # launcher here per invocation and deletes it again, so a copy taken
+    # mid-extraction keeps ~1 GB forever while the source reads as ~100 KB.
+    for slot in ("arg0", "arg0-linux"):
+        (src / "tmp" / slot / "codex-arg0fV11dV").mkdir(parents=True)
+        (src / "tmp" / slot / "codex-arg0fV11dV" / "codex").write_text("A" * 1100)
     (src / "skills").mkdir()
     (src / "auth.json").write_text("{}")
     (src / "config.toml").write_text("")
@@ -100,6 +106,22 @@ def test_the_codex_package_tree_is_not_copied(tmp_path):
     dst = tmp_path / "copy"
     _copy(src, dst)
     assert not (dst / "packages").exists()
+
+
+def test_codex_scratch_is_not_copied_even_though_it_lacks_a_dot(tmp_path):
+    """`.tmp` is claude's staging dir; codex's is plain `tmp`.
+
+    The 2026-09-13 exclusion only ever matched the dotted one, so codex's
+    launcher scratch kept travelling — and it was the bigger half of the
+    2026-10-21 incident. Asserted as its own case because the two names are
+    one character apart and a future tidy-up could plausibly drop this as a
+    duplicate of the `.tmp` test above.
+    """
+    src = _creds_tree(tmp_path)
+    dst = tmp_path / "copy"
+    _copy(src, dst)
+    assert not (dst / "tmp").exists()
+    assert not (dst / ".tmp").exists()
 
 
 def test_a_dereferenced_symlink_cannot_inflate_the_copy(tmp_path):

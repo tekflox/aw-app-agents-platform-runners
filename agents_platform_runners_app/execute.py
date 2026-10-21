@@ -150,7 +150,21 @@ ISOLATED_KEEP_SECONDS = int(os.environ.get("AW_RUNNER_ISOLATED_KEEP_SECONDS") or
 #: Verified on the live host: the shared home has no `packages/` at all and
 #: codex runs fine, because the binary it executes comes from the workspace's
 #: own `.aw-workspace/bin/codex`, not from a per-run creds copy.
-CREDS_COPY_IGNORE = ("isolated", "sessions", "cache", ".tmp", "packages")
+#:
+#: `tmp` — no leading dot — joined on the same day, and it was the BIGGER
+#: half. `.tmp` above is claude's staging dir; codex's is plain `tmp`, so the
+#: 2026-09-13 entry never matched it. It holds `tmp/arg0/codex-arg0XXXXXX`:
+#: codex extracts its own ~850 MB-1.1 GB launcher there per invocation and
+#: deletes it again, so the SOURCE measures 100 KB most of the time and the
+#: per-run copy freezes whatever happened to be mid-extraction forever.
+#:
+#: That transience is why this was so hard to see and why the disk filled all
+#: at once rather than drifting: sampled live, run dirs were 41 MB, 2.1 GB,
+#: 6.3 GB and 7.5 GB — same code, same CLI, only the instant of the copy
+#: differing. Averaging the directory sizes hides it; it is a 180x spread.
+#: Scratch by definition, recreated on demand, and the shared home's own
+#: `tmp` sits at 28 KB — nothing reads the copied one.
+CREDS_COPY_IGNORE = ("isolated", "sessions", "cache", ".tmp", "tmp", "packages")
 
 
 def _reap_isolated_dirs(parent: "Path") -> None:
