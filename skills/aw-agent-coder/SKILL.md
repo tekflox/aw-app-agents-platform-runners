@@ -33,10 +33,11 @@ points at.
 ## Mandatory: search the knowledge base before starting
 
 **Before doing anything else on any non-trivial task, call
-`search_knowledge_base`** using the task description as the query. The tool
-name depends on how the KB reaches this session: `search_knowledge_base`
-directly, or `aw__kb__search_knowledge_base` when routed through the
-`aw-gateway` MCP server — both are the same tool. Run 2–3 searches
+`knowledge_search`** using the task description as the query. The tool
+name depends on how the KB reaches this session: `knowledge_search`
+directly, or `aw__aw_knowledgeable__knowledge_search` when routed through
+the `aw-gateway` MCP server (contributed by the Knowledgeable Connector
+app) — both are the same tool. Run 2–3 searches
 with different angles if the first pass comes back thin. This surfaces
 prior decisions, lessons learned, architecture notes, and gotchas specific
 to this codebase — skipping it is the single biggest cause of repeating
@@ -160,7 +161,7 @@ run's own Kanban-card context, so just call
 When this run has a Kanban card, you'll likely need these. `ToolSearch` with
 `select:<name>` for each up front instead of guessing keywords:
 
-- `mcp__aw-gateway__aw__kb__search_knowledge_base` — mandatory KB search (above), if installed
+- `mcp__aw-gateway__aw__aw_knowledgeable__knowledge_search` — mandatory KB search (above), if installed
 - `mcp__aw-gateway__aw__aw_kanban__add_kanban_comment` — leave a note on the card (e.g. a delivery report, a question)
 - `mcp__aw-gateway__aw__aw_kanban__set_blocker` — call the moment you're stuck (missing tool, missing access, ambiguous ask) — don't burn many retries hunting for a workaround first. Check the knowledge base for the answer before concluding you're actually blocked.
 - `mcp__aw-gateway__aw__aw_kanban__set_kanban_property` — set `is_live` / `is_deployment_needed` (or any other board property) before finishing

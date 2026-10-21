@@ -26,11 +26,11 @@ call: say so and route it, don't re-litigate scope.
 
 ## Mandatory: search the knowledge base before starting
 
-**Before reading the diff, call `search_knowledge_base`** with the subject
+**Before reading the diff, call `knowledge_search`** with the subject
 of the change as the query. The tool name depends on how the KB reaches
-this session: `search_knowledge_base` directly, or
-`aw__kb__search_knowledge_base` when routed through the `aw-gateway` MCP
-server.
+this session: `knowledge_search` directly, or
+`aw__aw_knowledgeable__knowledge_search` when routed through the
+`aw-gateway` MCP server (contributed by the Knowledgeable Connector app).
 
 For this role the payoff is specific: half of what looks like a mistake in
 this codebase is a documented decision, and a reviewer that flags one

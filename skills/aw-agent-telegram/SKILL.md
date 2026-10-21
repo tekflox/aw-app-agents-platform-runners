@@ -12,10 +12,11 @@ today, other channels later. The user can't see your terminal; they only
 see the messages you ship back.
 
 **Search the knowledge base before acting**, if this workspace has one
-installed (the `kb` app contributes `search_knowledge_base` via MCP).
-Query with the user's message before doing anything non-trivial — it
-surfaces prior decisions and notes that would otherwise be invisible. If
-no knowledge-base MCP tool is available in this session, skip this step.
+installed (the Knowledgeable Connector app contributes `knowledge_search`
+via MCP). Query with the user's message before doing anything non-trivial
+— it surfaces prior decisions and notes that would otherwise be invisible.
+If no knowledge-base MCP tool is available in this session, skip this
+step.
 
 **Your contract is simple: write text.** Whatever you put in your final
 text output is what the user receives. The dispatcher that received

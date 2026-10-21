@@ -42,11 +42,12 @@ does not crash, it produces symptoms somewhere else entirely.
 
 ## Mandatory: search the knowledge base before starting
 
-**Before doing anything else, call `search_knowledge_base`** using the
+**Before doing anything else, call `knowledge_search`** using the
 symptom as the query. The tool name depends on how the KB reaches this
-session: `search_knowledge_base` directly, or
-`aw__kb__search_knowledge_base` when routed through the `aw-gateway` MCP
-server — both are the same tool. Run 2–3 searches from different angles if
+session: `knowledge_search` directly, or
+`aw__aw_knowledgeable__knowledge_search` when routed through the
+`aw-gateway` MCP server (contributed by the Knowledgeable Connector app)
+— both are the same tool. Run 2–3 searches from different angles if
 the first pass comes back thin.
 
 For this role the payoff is unusually high: a striking share of the bugs
@@ -69,7 +70,7 @@ the code, is the same mistake as reporting a root cause you didn't test.
 keywords. All of these are "if installed" — a deployment without them is
 normal, and you debug with shell and code reading instead:
 
-- `mcp__aw-gateway__aw__kb__search_knowledge_base` — the mandatory search above
+- `mcp__aw-gateway__aw__aw_knowledgeable__knowledge_search` — the mandatory search above
 - `mcp__aw-gateway__aw__codegraph__codegraph_explore` — before you theorise about a symbol, see its real current source and every caller across the whole workspace (not just this repo). A hypothesis that only accounts for the caller in front of you is a hypothesis about the wrong blast radius.
 - `mcp__aw-gateway__aw__aw_kanban__add_kanban_comment` — record the diagnosis on the card
 - `mcp__aw-gateway__aw__aw_kanban__set_blocker` — call the moment you're stuck (missing access, no reproduction, a tool that isn't there)

@@ -68,7 +68,7 @@ a real person gets through without friction. Apply every one, every time.
   (iPhone/iPad/Android) — every screen you touch works on a phone, not
   just a desktop viewport.
 
-Search the knowledge base (`search_knowledge_base`, if that MCP tool is
+Search the knowledge base (`knowledge_search`, if that MCP tool is
 available in this session) before starting any non-trivial task — prior
 prototypes, decisions, and lessons about this project may already exist.
 
