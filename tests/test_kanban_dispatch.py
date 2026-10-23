@@ -97,13 +97,16 @@ def test_agent_dispatch_names_this_workspace(monkeypatch):
     assert payload["workspace"] == "aw"
 
 
-def test_workflow_dispatch_does_not_send_workspace():
-    """run_workflow has no workspace param — RunInput.workspace only exists
-    on the agent-run path, so sending it here would be a silently ignored
-    no-op. Leaving it out keeps the payload honest about what's used."""
+def test_workflow_dispatch_now_also_sends_workspace(monkeypatch):
+    """run_workflow_ep gained a workspace param (docs/design/
+    ap-mt-workspace-cascade.md slice 1) — it used to silently drop it, which
+    made this payload deliberately omit it to stay honest about what was
+    used. Now that the server accepts it, the sweep path names it on the
+    workflow leg too, same as the agent leg."""
+    monkeypatch.setenv("AW_WORKSPACE", "aw")
     _, payload = kd.dispatch_payload(
         _card(agent_slug=None, workflow_slug="spec-pipeline"), "INPUT")
-    assert "workspace" not in payload
+    assert payload["workspace"] == "aw"
 
 
 # ── resume ──────────────────────────────────────────────────────────────

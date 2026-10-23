@@ -247,12 +247,11 @@ def dispatch_payload(card: dict, input_text: str) -> tuple[str, dict] | None:
         "input": {"input": input_text},
         "target_slug": (card.get("target_slug") or "").strip() or DEFAULT_TARGET_SLUG,
         "notion_task_id": card.get("page_id", ""),
+        # AP-MT now accepts workspace on both the agent-run AND the
+        # workflow-run path (docs/design/ap-mt-workspace-cascade.md,
+        # slice 1 — run_workflow_ep used to silently drop it).
+        "workspace": _this_workspace(),
     }
-    # workspace is only accepted on the agent-run path (RunInput.workspace) —
-    # run_workflow has no such param, so sending it there would be a silently
-    # ignored no-op.
-    if agent_slug:
-        payload["workspace"] = _this_workspace()
     path = (f"/api/agents/{agent_slug}/run" if agent_slug
             else f"/api/workflows/{workflow_slug}/run")
     return path, payload

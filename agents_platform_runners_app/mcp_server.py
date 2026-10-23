@@ -99,6 +99,7 @@ def _agents_base_transport() -> httpx.AsyncHTTPTransport:
 # lazily-ish (module-level is fine; it is stdlib-only) so this file keeps its
 # "no third-party imports" property.
 from . import kanban_dispatch  # noqa: E402
+from . import platform_base  # noqa: E402
 
 # The Agents Platform image gallery. Same split as kanban_dispatch above and
 # for the same reason: the network logic does not belong in this file, the
@@ -2301,6 +2302,17 @@ def _caller_run_id(args: dict) -> str | None:
     return args.get("_gateway_caller_run_id") or os.environ.get("AW_RUN_ID")
 
 
+def _own_workspace() -> str:
+    """This workspace's own slug — same source kanban_dispatch.py's
+    ``_this_workspace()`` and runner_registration use
+    (bug:runner-execute-401-monitor-shell-dispatch). Server-side only, like
+    ``_caller_run_id`` above: injected via ``body.setdefault(...)`` on every
+    dispatch POST below, never exposed on an LLM-facing ``inputSchema`` — a
+    hallucinated workspace slug would be a new outage class, not a
+    convenience (see docs/design/ap-mt-workspace-cascade.md §4.3)."""
+    return platform_base.workspace_env("AW_WORKSPACE") or "aw"
+
+
 async def _poll_run(c: httpx.AsyncClient, run_id: str, *, timeout_s: int = 900) -> dict:
     for _ in range(timeout_s):
         await asyncio.sleep(1.0)
@@ -2435,6 +2447,11 @@ async def _dispatch_tool(name: str, arguments: dict[str, Any] | None) -> list[Te
             # answer straight to A.
             if args.get("call_me_back_on"):
                 body["call_me_back_on"] = args["call_me_back_on"]
+            # This workspace's own runners app dispatching this run is, by
+            # construction, FROM this workspace — tier 1 of the resolver,
+            # never inference. setdefault: never clobber an explicit
+            # workspace= the caller already set.
+            body.setdefault("workspace", _own_workspace())
             r = await c.post(f"{BASE}/api/agents/{args['slug']}/run", json=body)
             return _err(r.status_code, r.text) if r.status_code != 200 else _ok(r.json())
         if name == "run_workflow_async":
@@ -2456,6 +2473,7 @@ async def _dispatch_tool(name: str, arguments: dict[str, Any] | None) -> list[Te
             body["call_me_back"] = args.get("call_me_back") is not False
             if args.get("call_me_back_on"):
                 body["call_me_back_on"] = args["call_me_back_on"]
+            body.setdefault("workspace", _own_workspace())
             r = await c.post(f"{BASE}/api/workflows/{args['slug']}/run", json=body)
             return _err(r.status_code, r.text) if r.status_code != 200 else _ok(r.json())
         if name == "run_monitor_async":
@@ -2485,6 +2503,7 @@ async def _dispatch_tool(name: str, arguments: dict[str, Any] | None) -> list[Te
             body["call_me_back"] = args.get("call_me_back") is not False
             if args.get("call_me_back_on"):
                 body["call_me_back_on"] = args["call_me_back_on"]
+            body.setdefault("workspace", _own_workspace())
             r = await c.post(f"{BASE}/api/monitor/run", json=body)
             return _err(r.status_code, r.text) if r.status_code != 200 else _ok(r.json())
         if name == "run_monitor_sync":
@@ -2510,6 +2529,7 @@ async def _dispatch_tool(name: str, arguments: dict[str, Any] | None) -> list[Te
                 body["notion_task_id"] = args["notion_task_id"]
             if _rid := _caller_run_id(args):
                 body["caller_run_id"] = _rid
+            body.setdefault("workspace", _own_workspace())
             r = await c.post(f"{BASE}/api/monitor/run", json=body)
             if r.status_code != 200:
                 return _err(r.status_code, r.text)
@@ -2850,6 +2870,7 @@ async def _dispatch_tool(name: str, arguments: dict[str, Any] | None) -> list[Te
             body["call_me_back"] = args.get("call_me_back") is not False
             if args.get("call_me_back_on"):
                 body["call_me_back_on"] = args["call_me_back_on"]
+            body.setdefault("workspace", _own_workspace())
             r = await c.post(f"{BASE}/api/runs/parallel", json=body)
             return _err(r.status_code, r.text) if r.status_code != 200 else _ok(r.json())
         if name == "cancel_run":
