@@ -88,6 +88,24 @@ def test_card_without_a_target_gets_the_monolith_default():
     assert payload["target_slug"] == kd.DEFAULT_TARGET_SLUG == "system-investigations"
 
 
+def test_agent_dispatch_names_this_workspace(monkeypatch):
+    """bug:runner-execute-401-monitor-shell-dispatch: naming the workspace
+    explicitly lets AP-MT resolve the SAME workspace's Runner row instead of
+    depending on inheritance alone."""
+    monkeypatch.setenv("AW_WORKSPACE", "aw")
+    _, payload = kd.dispatch_payload(_card(), "INPUT")
+    assert payload["workspace"] == "aw"
+
+
+def test_workflow_dispatch_does_not_send_workspace():
+    """run_workflow has no workspace param — RunInput.workspace only exists
+    on the agent-run path, so sending it here would be a silently ignored
+    no-op. Leaving it out keeps the payload honest about what's used."""
+    _, payload = kd.dispatch_payload(
+        _card(agent_slug=None, workflow_slug="spec-pipeline"), "INPUT")
+    assert "workspace" not in payload
+
+
 # ── resume ──────────────────────────────────────────────────────────────
 
 def test_resume_reuses_the_runs_own_agent_and_session():
@@ -105,6 +123,13 @@ def test_resume_omits_target_id_when_the_run_has_none():
     _, payload = kd.resume_payload(
         {"source_slug": "a", "session_id": "s"}, "page-1", "x")
     assert "target_id" not in payload
+
+
+def test_resume_also_names_this_workspace(monkeypatch):
+    monkeypatch.setenv("AW_WORKSPACE", "aw")
+    _, payload = kd.resume_payload(
+        {"source_slug": "coder-sonnet", "session_id": "sess-1"}, "page-1", "x")
+    assert payload["workspace"] == "aw"
 
 
 def test_a_run_with_no_session_explains_itself_instead_of_failing():

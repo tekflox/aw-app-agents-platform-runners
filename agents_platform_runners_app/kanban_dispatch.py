@@ -41,6 +41,8 @@ import urllib.parse
 import urllib.request
 import uuid
 
+from . import platform_base as platform_base_mod
+
 log = logging.getLogger("aw_apps.agents_platform_runners.kanban")
 
 NOTION_PREFIX = "/api/apps/notion"
@@ -225,6 +227,14 @@ def build_run_input(card: dict) -> str:
     return "\n\n".join(parts)
 
 
+def _this_workspace() -> str:
+    """This workspace's own slug — same source runner_registration.py uses
+    to register its Runner rows (bug:runner-execute-401-monitor-shell-
+    dispatch): naming it explicitly on dispatch lets AP-MT resolve the
+    Runner row directly instead of depending on inheritance alone."""
+    return platform_base_mod.workspace_env("AW_WORKSPACE") or "aw"
+
+
 def dispatch_payload(card: dict, input_text: str) -> tuple[str, dict] | None:
     """``(path, body)`` for the platform call, or None when the card names
     neither an agent nor a workflow — which is not an error, just a card that
@@ -238,6 +248,11 @@ def dispatch_payload(card: dict, input_text: str) -> tuple[str, dict] | None:
         "target_slug": (card.get("target_slug") or "").strip() or DEFAULT_TARGET_SLUG,
         "notion_task_id": card.get("page_id", ""),
     }
+    # workspace is only accepted on the agent-run path (RunInput.workspace) —
+    # run_workflow has no such param, so sending it there would be a silently
+    # ignored no-op.
+    if agent_slug:
+        payload["workspace"] = _this_workspace()
     path = (f"/api/agents/{agent_slug}/run" if agent_slug
             else f"/api/workflows/{workflow_slug}/run")
     return path, payload
@@ -255,7 +270,7 @@ def resume_payload(run: dict, page_id: str, message: str) -> tuple[str, dict] | 
         return ("the latest run for this card has no session_id — it never opened a "
                 "resumable CLI session, so there is nothing to send a message to")
     payload = {"input": {"input": message}, "session_id": session_id,
-               "notion_task_id": page_id}
+               "notion_task_id": page_id, "workspace": _this_workspace()}
     if run.get("target_id"):
         payload["target_id"] = run["target_id"]
     return f"/api/agents/{agent_slug}/run", payload
