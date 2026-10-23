@@ -288,4 +288,7 @@ A third sibling, `run_monitor_async` (`core.monitor_run`, see the `aw-agents`
 skill), is level-trigger like `register_agent_callback` but for a RAW SHELL
 COMMAND with no agent/LLM in it at all — use that (not this Supervisor tool,
 and not the harness's own flaky `Monitor` tool) when you just need to watch
-a long-running command and get woken on its exit code.
+a long-running command and get woken on its exit code. Its sibling
+`run_monitor_sync` does the same dispatch but blocks the same tool call
+instead — prefer it for a short/bounded wait with nothing else to do
+meanwhile.

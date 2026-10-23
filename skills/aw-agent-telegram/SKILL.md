@@ -547,7 +547,9 @@ session with the exit code when it's done — same "no polling" property as
 Reach for it when: you (or a coder you dispatched) kicked off a CI/CD run
 and you want to know when it goes green, or the user directly asks you to
 run something long and tell them when it finishes ("kick off the deploy
-and let me know").
+and let me know"). For a short/bounded wait you'd otherwise just sit on
+anyway, `run_monitor_sync` exists too — it blocks the same tool call
+instead of calling you back.
 
 ```
 run_monitor_async(

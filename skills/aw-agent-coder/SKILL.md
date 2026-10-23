@@ -122,6 +122,14 @@ Two things follow from that:
   deployed until that exit code is actually 0 — a push you fired and walked
   away from is not verified.
 
+  **Short/bounded wait → `run_monitor_sync`, not `run_monitor_async`.** If
+  the wait is something you'll do nothing else during — a CI run, a deploy,
+  typically ≤10 min — call `run_monitor_sync` instead: it BLOCKS this same
+  tool call until the command exits and hands you the exit code directly,
+  so there is no async gap for the next turn to narrate instead of act on.
+  Reach for `run_monitor_async` only when the wait is longer, or you
+  genuinely want to keep working in parallel while it runs.
+
   If the repo doesn't have a CI/CD pipeline yet and needs one for this kind
   of change to ever be reviewable, that's a real finding — say so on the
   card rather than working around the gap by hand every time.
@@ -201,6 +209,14 @@ When this run has a Kanban card, you'll likely need these. `ToolSearch` with
   (`agents_platform_runners`) rather than trusting something else to
   resume you — a narrating sentence with no tool call after it strands the
   run exactly like it stranded a Telegram session once already.
+  **A sentence describing a background wait with no tool call behind it IS
+  an unfinished action** — confirmed live twice on 2026-10-23 (runs
+  `f81ab893fc474a99810591e741ce1512` and
+  `ea516299f511449c959c0a4a863b1a64`), both ending their turn on "I'll wait
+  for the background watcher to notify me" with zero `run_monitor_async` (or
+  any other tool) call anywhere in the run. The fix is `run_monitor_sync`:
+  it blocks in the SAME tool call, so there's nothing left mid-promise for
+  the next turn to narrate instead of act on.
 
 ## Bootstrap context block
 

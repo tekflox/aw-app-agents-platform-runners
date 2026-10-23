@@ -582,6 +582,10 @@ async def _list_tools() -> list[Tool]:
                           "**Redirect the callback (`call_me_back_on`):** same as "
                           "`run_agent_async` — pass a session_id to wake a different session "
                           "instead of your own once the command finishes.\n\n"
+                          "**For a short/bounded wait you'll do nothing else during "
+                          "(typically ≤10 min — a CI run, a deploy), prefer "
+                          "`run_monitor_sync` instead:** it blocks in the same tool call, so "
+                          "there's nothing left mid-promise for the next turn to abandon.\n\n"
                           "**`target_slug` is REQUIRED.** Create a Target first with "
                           "`create_target` if none exists."),
              inputSchema={"type": "object",
@@ -601,6 +605,42 @@ async def _list_tools() -> list[Tool]:
                                                           "description": "Default true: when the command finishes, your own session gets woken up with exit_code + output instructions. Set false for pure fire-and-forget."},
                                          "call_me_back_on": {"type": ["string", "null"],
                                                              "description": "Optional session_id to redirect the callback to instead of your own session."}},
+                          "required": ["command", "target_slug"]}),
+        Tool(name="run_monitor_sync",
+             description=("Like `run_monitor_async`, but BLOCKS this tool call until the "
+                          "command exits — same isolated container, same NO-LLM-in-the-loop "
+                          "execution, no callback and nothing left to abandon mid-promise. "
+                          "Use this for a short/bounded wait you'll do nothing else during "
+                          "(typically ≤10 min — a CI run, a deploy); for anything longer, "
+                          "or work you want to do in parallel, use `run_monitor_async` "
+                          "instead.\n\n"
+                          "Returns the finished run snapshot (status, exit code, output tail) "
+                          "plus `run_id` — fetch the full stdout/stderr with "
+                          "`get_run_artefact(run_id, name=\"monitor_output\")`.\n\n"
+                          "**Timing out is not a failure.** If `timeout_s` elapses before the "
+                          "command exits, the command is NOT abandoned — you get back the "
+                          "run's current snapshot (typically `status: \"running\"`) plus "
+                          "`run_id`, so you can pick it back up later with "
+                          "`wait_run(run_id=...)` or `register_callback(run_id=...)`. The same "
+                          "recovery path applies if the wait leg itself errors after dispatch "
+                          "already succeeded: the error response still carries `run_id` and "
+                          "says so explicitly — a failure here never means the command didn't "
+                          "run, only that this tool call stopped watching it.\n\n"
+                          "**`target_slug` is REQUIRED.** Create a Target first with "
+                          "`create_target` if none exists."),
+             inputSchema={"type": "object",
+                          "properties": {"command": {"type": "string",
+                                                      "description": "Shell command to execute (runs as `bash -lc \"<command>\"` inside an isolated container, dispatched through the same Runner a CLI-agent run uses)."},
+                                         "target_slug": {"type": "string",
+                                                         "description": "Slug of the Target this run is delivering against. REQUIRED."},
+                                         "target_id": {"type": ["string", "null"]},
+                                         "cwd": {"type": ["string", "null"],
+                                                 "description": "Working directory, relative to the workspace root (e.g. 'repos/agents-platform'). Omit to run from the workspace root."},
+                                         "timeout_s": {"type": "integer", "default": 600,
+                                                       "description": "Hard cap, in seconds, on BOTH how long this tool call blocks AND how long the command is allowed to run before being killed (1..3600 — the wait endpoint's own ceiling). For a longer watch, use run_monitor_async instead of raising this."},
+                                         "label": {"type": ["string", "null"],
+                                                   "description": "Optional human-readable name for this monitor run, shown in the Runs list."},
+                                         "notion_task_id": {"type": ["string", "null"]}},
                           "required": ["command", "target_slug"]}),
         Tool(name="return_to_caller_agent",
              description=("Agentic-flow action: send `message` back to whoever called YOU "
@@ -1937,6 +1977,13 @@ async def _list_tools() -> list[Tool]:
     # Dynamic per-resource runners (blocking; poll variants live above).
     dynamic: list[Tool] = []
     for a in agents:
+        # monitor-shell has no model_slug and is dispatched ONLY via
+        # /api/monitor/run (core.monitor_run) — the generic agent-run path
+        # this dynamic wrapper POSTs to resolves it to provider="echo",
+        # which fabricates a nonzero-token "[echo] (no input)" fake success
+        # without ever running the command. Use run_monitor_sync/_async.
+        if a["slug"] == "monitor-shell":
+            continue
         dynamic.append(Tool(
             name=f"agent_{a['slug'].replace('-', '_')}",
             description=(f"Run agent **{a['name']}** and wait for the result. "
@@ -1987,9 +2034,10 @@ def _ok(data: Any) -> list[TextContent]:
     return [TextContent(type="text", text=json.dumps(data, indent=2, default=str))]
 
 
-def _err(status: int, text: str) -> list[TextContent]:
-    return [TextContent(type="text",
-                        text=json.dumps({"error": True, "status": status, "message": text}, indent=2))]
+def _err(status: int, text: str, **extra: Any) -> list[TextContent]:
+    payload = {"error": True, "status": status, "message": text}
+    payload.update(extra)
+    return [TextContent(type="text", text=json.dumps(payload, indent=2))]
 
 
 # Structural UUID shape only — 36 chars, 5 hyphenated hex groups (8-4-4-4-12).
@@ -2439,6 +2487,60 @@ async def _dispatch_tool(name: str, arguments: dict[str, Any] | None) -> list[Te
                 body["call_me_back_on"] = args["call_me_back_on"]
             r = await c.post(f"{BASE}/api/monitor/run", json=body)
             return _err(r.status_code, r.text) if r.status_code != 200 else _ok(r.json())
+        if name == "run_monitor_sync":
+            if not args.get("target_slug") and not args.get("target_id"):
+                return _err(400, "target_slug is required. Use list_targets to find an existing Target or create_target to make one, then pass target_slug.")
+            if not args.get("command"):
+                return _err(400, "command is required")
+            # Single timeout budget drives both legs — the kill-if-not-exited
+            # clock on dispatch AND the HTTP wait clock below — capped at the
+            # wait endpoint's own ceiling (AP-MT backend/app/api/runs.py:149).
+            timeout_s = max(1, min(int(args.get("timeout_s") or 600), 3600))
+            body = {"command": args["command"], "call_me_back": False,
+                    "timeout_seconds": timeout_s}
+            if args.get("target_id"):
+                body["target_id"] = args["target_id"]
+            if args.get("target_slug"):
+                body["target_slug"] = args["target_slug"]
+            if args.get("cwd"):
+                body["cwd"] = args["cwd"]
+            if args.get("label"):
+                body["label"] = args["label"]
+            if args.get("notion_task_id"):
+                body["notion_task_id"] = args["notion_task_id"]
+            if _rid := _caller_run_id(args):
+                body["caller_run_id"] = _rid
+            r = await c.post(f"{BASE}/api/monitor/run", json=body)
+            if r.status_code != 200:
+                return _err(r.status_code, r.text)
+            run_id = r.json()["run_id"]
+            # Two-leg error contract: dispatch already succeeded by this point,
+            # so EVERY failure/timeout from here on must carry run_id + a
+            # recovery line — a lost WAIT must never read as "didn't run".
+            recovery = (f"the monitor run (run_id={run_id}) was dispatched and is still "
+                        f"alive — recover it with wait_run(run_id=\"{run_id}\") or "
+                        f"register_callback(run_id=\"{run_id}\"); this failure is only in "
+                        f"the wait leg, it does NOT mean the command never ran.")
+            try:
+                # Dedicated client, NOT the shared timeout=120 one above — that
+                # one would kill any wait longer than 120s regardless of
+                # timeout_s. Same pattern as wait_run's handler.
+                async with httpx.AsyncClient(timeout=timeout_s + 30, headers=AUTH_HEADERS,
+                                              transport=_agents_base_transport()) as wc:
+                    wr = await wc.get(f"{BASE}/api/runs/{run_id}/wait",
+                                       params={"timeout_s": str(timeout_s)})
+            except httpx.HTTPError as exc:
+                return _err(504, f"wait leg transport error: {exc}. {recovery}", run_id=run_id)
+            if wr.status_code != 200:
+                return _err(wr.status_code, f"{wr.text} {recovery}", run_id=run_id)
+            snapshot = wr.json()
+            if snapshot.get("status") not in ("success", "error", "cancelled"):
+                # The wait endpoint returns the row as-is on timeout without
+                # raising — timing out is not success; say so explicitly.
+                snapshot["_sync_wait_note"] = (
+                    f"timed out after {timeout_s}s — the run is still "
+                    f"{snapshot.get('status')!r}, NOT finished. {recovery}")
+            return _ok(snapshot)
         if name == "return_to_caller_agent":
             own_run_id = _caller_run_id(args)
             if not own_run_id:
@@ -3138,9 +3240,16 @@ async def _dispatch_tool(name: str, arguments: dict[str, Any] | None) -> list[Te
 
         # --- dynamic per-resource runners (blocking) ---
         if name.startswith("agent_"):
+            slug = _slug_from("agent_", name)
+            if slug == "monitor-shell":
+                return _err(400, "agent_monitor_shell is retired — it never ran your "
+                                  "command, it silently returned a fake "
+                                  "\"[echo] (no input)\" success (monitor-shell has no "
+                                  "model_slug; this generic path resolves it to the echo "
+                                  "provider). Use run_monitor_sync for a blocking wait, or "
+                                  "run_monitor_async for a background one.")
             if not args.get("target_slug") and not args.get("target_id"):
                 return _err(400, "target_slug is required. Use list_targets to find an existing Target or create_target to make one, then pass target_slug.")
-            slug = _slug_from("agent_", name)
             body: dict[str, Any] = {"input": {"input": args.get("input", "")}}
             if args.get("target_slug"):
                 body["target_slug"] = args["target_slug"]

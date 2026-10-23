@@ -540,7 +540,7 @@ state. Anything that mutates the user's work belongs to an agent.
 | **Rescue an orphaned run** | `link_run_to_target(run_id=..., target_slug=...)` |
 | Run (block) | `agent_<slug>`, `workflow_<slug>` |
 | **Run (background) — MUST pass `target_slug`** | `run_agent_async(slug, input, target_slug=...)`, `run_workflow_async(slug, input, target_slug=...)`, `run_agents_parallel(..., target_slug=...)` |
-| **Watch a long-running shell command, no LLM in the loop** | `run_monitor_async(command, target_slug=...)` — see below, NOT the harness's own `Monitor` tool |
+| **Watch a long-running shell command, no LLM in the loop** | `run_monitor_async(command, target_slug=...)` — see below, NOT the harness's own `Monitor` tool. For a short/bounded wait (≤10 min), `run_monitor_sync` blocks the same call instead of calling back |
 | **Watch a whole dispatched chain go idle, no polling** | `supervise(session_id=...)` — see below; not the same as `call_me_back`, which only covers the one run you dispatched |
 | **Turn off / inspect a supervision** | `stop_supervisor`, `supervisor_status`, `list_supervisors` (everyone's, not just yours) — see the `aw-supervisor-tool` skill |
 | Observe | `run_status`, `run_events`, `run_tree` |
