@@ -2513,7 +2513,10 @@ def mint_warm_session_id(job: dict) -> bool:
             # agent_id is the other half of the container name — without one
             # every agent's first turns would share `aw-warm-None-<uuid>`.
             and job.get("agent_id")
-            and not job.get("session_id")):
+            and not job.get("session_id")
+            # one_shot: the caller already knows this job never gets a
+            # turn 2 — minting a session it will never resume is pure waste.
+            and not job.get("one_shot")):
         return False
     job["session_id"] = str(uuid.uuid4())
     # Read back by _build_warm_kwargs: this session does not exist yet, so its
@@ -2972,7 +2975,11 @@ def _run_job_blocking(job: dict, redis_url: str) -> None:
     # turn 1 still goes cold, same as before; turn 2 onward — once a real
     # session_id exists — is warmable exactly like claude.
     if (warm_pool.enabled() and (job.get("cli") or "claude") in WARM_CAPABLE_CLIS
-            and job.get("agent_id") and job.get("session_id")):
+            and job.get("agent_id") and job.get("session_id")
+            # one_shot forces cold even with a session_id present (e.g. a
+            # resumed-but-stateless job) — never create warm capacity for a
+            # job that told us up front it won't be back for a turn 2.
+            and not job.get("one_shot")):
         pool_full = False
         try:
             try:

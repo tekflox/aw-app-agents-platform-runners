@@ -700,6 +700,11 @@ def build_routes(config: dict | None = None, *, kanban_sweep_status: dict | None
             # it recycles exists solely on this side. Absent on every
             # ordinary turn, which is what keeps the warm pool warm.
             "warm_recycle": body.get("warm_recycle"),
+            # Caller states a fact it already knows — "this job will never
+            # get a turn 2" — so execute.py skips the warm mint/dispatch and
+            # takes the cold/ephemeral path. Absent -> False -> today's
+            # behaviour (deploy-order free).
+            "one_shot": bool(body.get("one_shot")),
         }
         # "duplicate" = this run_id was already dispatched by this process, so
         # nothing new was spawned. A retried handshake (RunnerLLM._dispatch
