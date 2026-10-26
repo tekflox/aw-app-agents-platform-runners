@@ -96,6 +96,14 @@ def _read(path: str, default: str = "") -> str:
 # here specifically because this failure happens before codex ever
 # processes the prompt — nothing has been double-applied.
 _ROLLOUT_ERROR_SIGNATURE = "no rollout found for thread id"
+
+# Card 4055bf3b-9510-8179 (2026-10-26): under concurrent codex spawns a warm
+# turn sometimes dies having emitted nothing but its own CLI startup banner —
+# no rollout-contention message at all — which the signature-only check
+# above never retried. Mirrors execute.py's own copy of this list (same
+# "duplicated rather than imported" reason as _ROLLOUT_ERROR_SIGNATURE).
+_PREAMBLE_SIGNATURES = ("Reading additional input from stdin",)
+
 _MAX_RESUME_ATTEMPTS = 3  # 1 initial + 2 retries
 _RETRY_BACKOFF_S = (0.3, 0.6)  # indexed by retry number, last value repeats
 _HOSTNAME = socket.gethostname()
@@ -131,10 +139,12 @@ def _publish_line(r, stream_key: str, run_id: str, line: str) -> None:
 
 def _run_codex_turn(argv: list, cwd: str, env: dict, r, stream_key: str, run_id: str
                      ) -> tuple[int, int, str, bool]:
-    """Run one `codex exec resume` subprocess, retrying a resume that fails
-    with the known "no rollout found for thread id ... (code -32600)" error
-    before any real turn content was produced (see the module-level note on
-    _ROLLOUT_ERROR_SIGNATURE for why that's a safe thing to retry).
+    """Run one `codex exec resume` subprocess, retrying an attempt that exits
+    nonzero having never produced a line of real turn content — whether it
+    hit the known "no rollout found for thread id ... (code -32600)" error,
+    printed only its own startup banner (_PREAMBLE_SIGNATURES), or emitted
+    nothing at all (see the module-level note on _ROLLOUT_ERROR_SIGNATURE for
+    why retrying the whole subprocess is safe).
 
     Buffers only the first attempt's lines until either the error signature
     or real output appears, so a normal turn's live streaming is unaffected
@@ -164,7 +174,6 @@ def _run_codex_turn(argv: list, cwd: str, env: dict, r, stream_key: str, run_id:
 
         buffered: list[str] = []
         live = False
-        saw_signature = False
         for out_line in proc.stdout:
             out_line = out_line.rstrip("\n")
             if not out_line:
@@ -175,8 +184,8 @@ def _run_codex_turn(argv: list, cwd: str, env: dict, r, stream_key: str, run_id:
             if live:
                 _publish_line(r, stream_key, run_id, out_line)
                 continue
-            if _ROLLOUT_ERROR_SIGNATURE in out_line:
-                saw_signature = True
+            if (_ROLLOUT_ERROR_SIGNATURE in out_line
+                    or any(sig in out_line for sig in _PREAMBLE_SIGNATURES)):
                 buffered.append(out_line)
                 continue
             # Real content arrived — this attempt is not hitting the
@@ -188,13 +197,13 @@ def _run_codex_turn(argv: list, cwd: str, env: dict, r, stream_key: str, run_id:
             _publish_line(r, stream_key, run_id, out_line)
         rc = proc.wait()
 
-        retryable = not live and saw_signature and rc != 0
+        retryable = not live and rc != 0
         if retryable and attempt < _MAX_RESUME_ATTEMPTS:
             backoff = _RETRY_BACKOFF_S[min(attempt - 1, len(_RETRY_BACKOFF_S) - 1)]
-            print(f"aw-warm-relay-codex[{_HOSTNAME}] {_utc_now()}: resume hit "
-                  f"'{_ROLLOUT_ERROR_SIGNATURE}' (attempt {attempt}/{_MAX_RESUME_ATTEMPTS}, "
-                  f"rc={rc}) — likely shared-$CODEX_HOME SQLite contention, retrying "
-                  f"after {backoff}s", file=sys.stderr)
+            print(f"aw-warm-relay-codex[{_HOSTNAME}] {_utc_now()}: resume produced no "
+                  f"real output (attempt {attempt}/{_MAX_RESUME_ATTEMPTS}, rc={rc}, "
+                  f"tail={list(last_tail)}) — likely shared-$CODEX_HOME contention, "
+                  f"retrying after {backoff}s", file=sys.stderr)
             time.sleep(backoff)
             continue
 

@@ -14,6 +14,15 @@ the whole subprocess is safe because this failure happens before codex ever
 processes the prompt, and the tests here pin that the retry is INVISIBLE
 (no error line reaches the run's Redis stream) unless every attempt fails.
 
+Card 4055bf3b-9510-8179 (2026-10-26): live-reproduced against the deployed
+cold-path fix — a `knowledgeable-playground` synthesize turn (which runs
+through THIS warm relay, not the cold path) still died with zero tokens
+after only emitting the codex CLI startup banner ("Reading additional input
+from stdin..."), because this file duplicates the same signature-only check
+and was not fixed alongside execute.py. _run_codex_turn's retry trigger is
+now "attempt exited nonzero without any real output", not only a rollout
+signature match.
+
 Run: .venv/aw/bin/python -m pytest tests/test_warm_relay_codex_retry.py
 """
 from __future__ import annotations
@@ -126,10 +135,57 @@ def test_retries_are_bounded_and_the_last_error_is_still_visible(monkeypatch):
     assert r.lines == [ROLLOUT_ERROR]
 
 
+BANNER_LINE = "Reading additional input from stdin..."
+
+
+def test_banner_only_death_is_retried(monkeypatch):
+    """The actual production failure (card 4055bf3b-9510-8179): codex prints
+    only its own startup banner then dies, under concurrent warm-turn load —
+    no rollout signature anywhere, but still retryable."""
+    relay = _load_relay()
+    _popen_sequence(monkeypatch, relay, [
+        ([BANNER_LINE], 1),
+        (['{"type":"thread.started"}', '{"type":"turn.completed"}'], 0),
+    ])
+    r = _FakeRedis()
+    rc, attempts, tail, _auth_revoked = relay._run_codex_turn(["codex"], "/", {}, r, "run:x:events", "x")
+    assert rc == 0
+    assert attempts == 2
+    assert r.lines == ['{"type":"thread.started"}', '{"type":"turn.completed"}']
+    assert not any(BANNER_LINE in l for l in r.lines)
+
+
+def test_banner_only_death_exhausts_retries_and_still_publishes(monkeypatch):
+    relay = _load_relay()
+    _popen_sequence(monkeypatch, relay, [
+        ([BANNER_LINE], 1),
+        ([BANNER_LINE], 1),
+        ([BANNER_LINE], 1),
+    ])
+    r = _FakeRedis()
+    rc, attempts, tail, _auth_revoked = relay._run_codex_turn(["codex"], "/", {}, r, "run:x:events", "x")
+    assert rc == 1
+    assert attempts == relay._MAX_RESUME_ATTEMPTS
+    assert r.lines == [BANNER_LINE]
+
+
+def test_silent_attempt_with_no_output_at_all_is_retried(monkeypatch):
+    relay = _load_relay()
+    _popen_sequence(monkeypatch, relay, [
+        ([], 1),
+        (['{"type":"turn.completed"}'], 0),
+    ])
+    r = _FakeRedis()
+    rc, attempts, tail, _auth_revoked = relay._run_codex_turn(["codex"], "/", {}, r, "run:x:events", "x")
+    assert rc == 0
+    assert attempts == 2
+    assert r.lines == ['{"type":"turn.completed"}']
+
+
 def test_a_different_failure_is_not_retried(monkeypatch):
-    """Only the specific rollout-contention signature is retryable — any
-    other failure must surface on the first attempt, same as before this
-    change existed."""
+    """A failure that prints real (non-boilerplate) content must surface on
+    the first attempt, same as before this change existed — only an attempt
+    producing NO real output at all is retryable."""
     relay = _load_relay()
     _popen_sequence(monkeypatch, relay, [
         (["error: unexpected argument '--foo' found"], 2),
