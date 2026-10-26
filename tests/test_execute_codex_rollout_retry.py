@@ -172,20 +172,62 @@ def test_banner_then_real_content_is_not_contention(monkeypatch):
     banner line must still reach the stream, in order, same flush contract
     as a rollout-signature line followed by real content."""
     published = _publish_capture(monkeypatch)
-    container = _FakeContainer([BANNER_LINE, '{"type":"thread.started"}'], 0)
+    container = _FakeContainer([BANNER_LINE, '{"type":"turn.completed"}'], 0)
     rc, contention_hit = execute_mod._stream_cold_attempt(container, _FakeRedis(), "run-x", True)
     assert rc == 0
     assert contention_hit is False
-    assert published == [BANNER_LINE, '{"type":"thread.started"}']
+    assert published == [BANNER_LINE, '{"type":"turn.completed"}']
 
 
 def test_signature_after_real_content_is_not_contention(monkeypatch):
     published = _publish_capture(monkeypatch)
-    container = _FakeContainer(['{"type":"thread.started"}', ROLLOUT_ERROR], 0)
+    container = _FakeContainer(['{"type":"turn.completed"}', ROLLOUT_ERROR], 0)
     rc, contention_hit = execute_mod._stream_cold_attempt(container, _FakeRedis(), "run-x", True)
     assert rc == 0
     assert contention_hit is False
-    assert published == ['{"type":"thread.started"}', ROLLOUT_ERROR]
+    assert published == ['{"type":"turn.completed"}', ROLLOUT_ERROR]
+
+
+def test_thread_started_only_death_is_retryable(monkeypatch):
+    """Card 4055bf3b-9510-8179 follow-up (2026-10-26): the actual production
+    failure against search-knowledge's synthesize node under a large (~58KB)
+    context — codex starts a session (thread.started) then dies CLEANLY
+    (returncode 0), no real turn content ever following. Confirmed live via
+    run_events: node_start -> cli.first_byte -> thread.started ->
+    finalizing(tokens=0) -> node_end, ~3.4s, no retry/backoff pattern,
+    exactly because the old code treated thread.started as "real" output
+    regardless of exit code."""
+    published = _publish_capture(monkeypatch)
+    container = _FakeContainer([BANNER_LINE, '{"type":"thread.started"}'], 0)
+    rc, contention_hit = execute_mod._stream_cold_attempt(
+        container, _FakeRedis(), "run-x", True, is_last_attempt=False)
+    assert rc == 0
+    assert contention_hit is True
+    assert published == []
+
+
+def test_thread_started_only_death_on_last_attempt_still_publishes(monkeypatch):
+    published = _publish_capture(monkeypatch)
+    container = _FakeContainer([BANNER_LINE, '{"type":"thread.started"}'], 0)
+    rc, contention_hit = execute_mod._stream_cold_attempt(
+        container, _FakeRedis(), "run-x", True, is_last_attempt=True)
+    assert rc == 0
+    assert contention_hit is True
+    assert published == [BANNER_LINE, '{"type":"thread.started"}']
+
+
+def test_rollout_signature_alone_with_clean_exit_is_still_not_contention(monkeypatch):
+    """Belt-and-braces (mirrors aw-warm-relay-codex.py's own test): unlike
+    the thread-started/preamble widening above, the rollout-error text alone
+    must still require a nonzero returncode to count as contention — that
+    text could plausibly appear as genuine quoted model output."""
+    published = _publish_capture(monkeypatch)
+    container = _FakeContainer([ROLLOUT_ERROR], 0)
+    rc, contention_hit = execute_mod._stream_cold_attempt(
+        container, _FakeRedis(), "run-x", True, is_last_attempt=False)
+    assert rc == 0
+    assert contention_hit is False
+    assert published == [ROLLOUT_ERROR]
 
 
 def test_retry_loop_respawns_and_hides_failed_attempts(monkeypatch):

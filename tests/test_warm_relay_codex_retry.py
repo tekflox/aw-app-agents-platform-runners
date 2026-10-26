@@ -205,19 +205,22 @@ def test_signature_arriving_after_real_content_is_not_retried(monkeypatch):
     doomed-attempt retry — the turn already succeeded."""
     relay = _load_relay()
     _popen_sequence(monkeypatch, relay, [
-        (['{"type":"thread.started"}', ROLLOUT_ERROR], 0),
+        (['{"type":"turn.completed"}', ROLLOUT_ERROR], 0),
     ])
     r = _FakeRedis()
     rc, attempts, tail, _auth_revoked = relay._run_codex_turn(["codex"], "/", {}, r, "run:x:events", "x")
     assert rc == 0
     assert attempts == 1
-    assert r.lines == ['{"type":"thread.started"}', ROLLOUT_ERROR]
+    assert r.lines == ['{"type":"turn.completed"}', ROLLOUT_ERROR]
 
 
 def test_signature_with_zero_returncode_is_not_treated_as_contention(monkeypatch):
-    """Belt-and-braces: the signature alone isn't enough to retry — codex
-    would have to both print it AND exit non-zero. A line that happens to
-    contain the phrase but a clean exit must not spin up retries."""
+    """Belt-and-braces: the rollout-error text alone isn't enough to retry —
+    codex would have to both print it AND exit non-zero, since that text
+    could plausibly appear as genuine quoted model output. A line that
+    happens to contain the phrase but a clean exit must not spin up
+    retries (unlike _THREAD_STARTED_SIGNATURE/_PREAMBLE_SIGNATURES below,
+    which retry regardless of exit code)."""
     relay = _load_relay()
     _popen_sequence(monkeypatch, relay, [
         ([ROLLOUT_ERROR], 0),
@@ -227,3 +230,38 @@ def test_signature_with_zero_returncode_is_not_treated_as_contention(monkeypatch
     assert rc == 0
     assert attempts == 1
     assert r.lines == [ROLLOUT_ERROR]
+
+
+def test_thread_started_only_death_is_retried_even_with_clean_exit(monkeypatch):
+    """Card 4055bf3b-9510-8179 follow-up (2026-10-26): the actual production
+    failure against search-knowledge's synthesize node under a large (~58KB)
+    context — codex starts a session (thread.started) then dies CLEANLY
+    (exit 0), no real turn content ever following. Confirmed live via
+    run_events: node_start -> cli.first_byte -> thread.started ->
+    finalizing(tokens=0) -> node_end, ~3.4s, no retry/backoff pattern,
+    exactly because the old code treated thread.started as "real" output."""
+    relay = _load_relay()
+    _popen_sequence(monkeypatch, relay, [
+        ([BANNER_LINE, '{"type":"thread.started"}'], 0),
+        (['{"type":"turn.completed"}'], 0),
+    ])
+    r = _FakeRedis()
+    rc, attempts, tail, _auth_revoked = relay._run_codex_turn(["codex"], "/", {}, r, "run:x:events", "x")
+    assert rc == 0
+    assert attempts == 2
+    assert r.lines == ['{"type":"turn.completed"}']
+    assert not any("thread.started" in l for l in r.lines)
+
+
+def test_thread_started_only_death_exhausts_retries_and_still_publishes(monkeypatch):
+    relay = _load_relay()
+    _popen_sequence(monkeypatch, relay, [
+        ([BANNER_LINE, '{"type":"thread.started"}'], 0),
+        ([BANNER_LINE, '{"type":"thread.started"}'], 0),
+        ([BANNER_LINE, '{"type":"thread.started"}'], 0),
+    ])
+    r = _FakeRedis()
+    rc, attempts, tail, _auth_revoked = relay._run_codex_turn(["codex"], "/", {}, r, "run:x:events", "x")
+    assert rc == 0
+    assert attempts == relay._MAX_RESUME_ATTEMPTS
+    assert r.lines == [BANNER_LINE, '{"type":"thread.started"}']
