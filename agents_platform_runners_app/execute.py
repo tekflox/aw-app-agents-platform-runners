@@ -750,6 +750,22 @@ _CODEX_PREAMBLE_SIGNATURES = ("Reading additional input from stdin",)
 # own session handshake.
 _CODEX_SESSION_HANDSHAKE_SIGNATURES = ("thread.started", "turn.started")
 
+# NOT fixed here — flagging rather than silently absorbing it. A third round
+# of live DIAG instrumentation (card 4055bf3b-9510-8179, 2026-10-26) found a
+# DIFFERENT root cause producing the exact same user-visible "zero tokens"
+# symptom under the same concurrent codex-runner-gpt-5 load: codex's own
+# internal HTTP client exhausting its retry budget against a genuine OpenAI
+# 429 ("Too Many Requests"), surfaced as a real, non-boilerplate
+# `{"type":"error","message":"exceeded retry limit, last status: 429 Too
+# Many Requests"}` event — confirmed live on 3 separate
+# knowledgeable-search-planner failures (08:36:47-08:37:07 UTC). This is NOT
+# a silent dead-end this file's buffer/retry mechanism is designed for: the
+# line is genuinely informative, correctly sets `live=True`, and retrying
+# the whole container spawn would just resubmit into the same exhausted
+# account-level quota — plausibly making concurrent-load storms worse, not
+# better. Needs its own design (backoff-and-retry scoped to 429 specifically,
+# capping fan-out concurrency, or something else), not a mechanical widening
+# of contention_hit.
 _CODEX_ROLLOUT_MAX_ATTEMPTS = 3  # 1 initial + 2 retries
 _CODEX_ROLLOUT_RETRY_BACKOFF_S = (0.3, 0.6)
 
@@ -840,12 +856,6 @@ def _stream_cold_attempt(container, r, run_id: str, codex_retryable: bool,
                     or any(sig in line for sig in _CODEX_PREAMBLE_SIGNATURES)):
                 buffered_lines.append(line)
                 continue
-            # TEMP DIAGNOSTIC (card 4055bf3b-9510-8179 follow-up, round 3):
-            # thread.started + turn.started are both covered now but the
-            # production symptom still recurred once more — confirm exactly
-            # what line is flipping `live` this time.
-            log.warning("execute: DIAG3 run=%s live_trigger_line=%r",
-                        run_id, line[:300])
             live = True
             for held in buffered_lines:
                 _publish_line(r, run_id, held)
@@ -859,10 +869,6 @@ def _stream_cold_attempt(container, r, run_id: str, codex_retryable: bool,
 
     contention_hit = codex_retryable and not live and (
         returncode != 0 or (bool(buffered_lines) and not saw_rollout_signature))
-    log.warning(
-        "execute: DIAG3b run=%s live=%s returncode=%s contention_hit=%s "
-        "buffered_lines=%d", run_id, live, returncode, contention_hit,
-        len(buffered_lines))
     if not contention_hit or is_last_attempt:
         # Flush whatever never got published so a real failure is still
         # visible, never silently swallowed — including a contention hit on
