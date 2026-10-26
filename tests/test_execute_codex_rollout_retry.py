@@ -12,6 +12,16 @@ openai/codex#20213 and #35555). _stream_cold_attempt buffers only until it
 can tell whether an attempt is doomed, exactly like the warm relay does, so
 a retry never reaches the run's Redis stream.
 
+Card 4055bf3b-9510-8179 (2026-10-26) widened the trigger: under heavier
+concurrent codex-spawn load (confirmed across two unrelated consumers,
+search-knowledge and literature-review, hitting bursts of 5 simultaneous
+spawns failing 100%) the process sometimes dies having emitted only its own
+CLI startup banner ("Reading additional input from stdin...") — no rollout
+signature at all — which the original signature-only check never retried.
+contention_hit is now True whenever a codex attempt exits nonzero without
+ever producing a line of real output, not only when every line matched the
+rollout signature.
+
 Run: .venv/aw/bin/python -m pytest tests/test_execute_codex_rollout_retry.py
 """
 from __future__ import annotations
@@ -104,6 +114,69 @@ def test_non_codex_job_never_treats_it_as_retryable(monkeypatch):
     assert rc == 1
     assert contention_hit is False
     assert published == [ROLLOUT_ERROR]
+
+
+BANNER_LINE = "Reading additional input from stdin..."
+
+
+def test_banner_only_death_is_retryable(monkeypatch):
+    """The actual production failure signature (card 4055bf3b-9510-8179):
+    codex prints only its own startup banner, then dies — no rollout
+    signature anywhere — under concurrent spawn load."""
+    published = _publish_capture(monkeypatch)
+    container = _FakeContainer([BANNER_LINE], 1)
+    rc, contention_hit = execute_mod._stream_cold_attempt(
+        container, _FakeRedis(), "run-x", True, is_last_attempt=False)
+    assert rc == 1
+    assert contention_hit is True
+    assert published == []
+
+
+def test_banner_only_death_on_last_attempt_still_publishes(monkeypatch):
+    published = _publish_capture(monkeypatch)
+    container = _FakeContainer([BANNER_LINE], 1)
+    rc, contention_hit = execute_mod._stream_cold_attempt(
+        container, _FakeRedis(), "run-x", True, is_last_attempt=True)
+    assert rc == 1
+    assert contention_hit is True
+    assert published == [BANNER_LINE]
+
+
+def test_silent_death_with_no_lines_at_all_is_retryable(monkeypatch):
+    """Even a process that never emits a single line (not even the banner)
+    before dying must be retryable — the common thread is "no real output",
+    not any specific string."""
+    published = _publish_capture(monkeypatch)
+    container = _FakeContainer([], 1)
+    rc, contention_hit = execute_mod._stream_cold_attempt(
+        container, _FakeRedis(), "run-x", True, is_last_attempt=False)
+    assert rc == 1
+    assert contention_hit is True
+    assert published == []
+
+
+def test_non_codex_banner_only_death_is_not_retryable(monkeypatch):
+    """codex_retryable=False must never treat a banner-only death as
+    contention — byte-for-byte the pre-retry behavior for every non-codex
+    CLI, same contract as test_non_codex_job_never_treats_it_as_retryable."""
+    published = _publish_capture(monkeypatch)
+    container = _FakeContainer([BANNER_LINE], 1)
+    rc, contention_hit = execute_mod._stream_cold_attempt(container, _FakeRedis(), "run-x", False)
+    assert rc == 1
+    assert contention_hit is False
+    assert published == [BANNER_LINE]
+
+
+def test_banner_then_real_content_is_not_contention(monkeypatch):
+    """The banner is buffered, not dropped — once real output follows, the
+    banner line must still reach the stream, in order, same flush contract
+    as a rollout-signature line followed by real content."""
+    published = _publish_capture(monkeypatch)
+    container = _FakeContainer([BANNER_LINE, '{"type":"thread.started"}'], 0)
+    rc, contention_hit = execute_mod._stream_cold_attempt(container, _FakeRedis(), "run-x", True)
+    assert rc == 0
+    assert contention_hit is False
+    assert published == [BANNER_LINE, '{"type":"thread.started"}']
 
 
 def test_signature_after_real_content_is_not_contention(monkeypatch):

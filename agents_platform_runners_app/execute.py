@@ -715,6 +715,15 @@ def _refresh_stale_gateway_auth(mcp_servers: dict) -> dict:
 # imported because that file ships into a different container image and is
 # loaded by path, not as a package (see its own module docstring).
 _CODEX_ROLLOUT_ERROR_SIGNATURE = "no rollout found for thread id"
+
+# Card 4055bf3b-9510-8179 (2026-10-26): under concurrent codex spawns the
+# process sometimes dies having emitted nothing but its own CLI startup
+# banner — no rollout-contention message at all — which the signature-only
+# check above never retried. This is CLI boilerplate, never a genuine model
+# turn, so a line matching it must not count as "real" output either. See
+# _stream_cold_attempt.
+_CODEX_PREAMBLE_SIGNATURES = ("Reading additional input from stdin",)
+
 _CODEX_ROLLOUT_MAX_ATTEMPTS = 3  # 1 initial + 2 retries
 _CODEX_ROLLOUT_RETRY_BACKOFF_S = (0.3, 0.6)
 
@@ -738,12 +747,18 @@ def _stream_cold_attempt(container, r, run_id: str, codex_retryable: bool,
     the run's Redis stream. Returns (returncode, contention_hit).
 
     Lines are held back (not published) only while it is still undecided
-    whether this is a doomed codex rollout-contention attempt — the same
-    "peek before publishing" contract as aw-warm-relay-codex.py's own
-    _run_codex_turn. contention_hit is True only when EVERY line seen before
-    the process exited matched _CODEX_ROLLOUT_ERROR_SIGNATURE and the process
-    failed — the caller decides whether to retry; this function never
-    retries or respawns anything itself, so it needs no image/argv/kwargs.
+    whether this is a doomed codex-contention attempt — the same "peek
+    before publishing" contract as aw-warm-relay-codex.py's own
+    _run_codex_turn. contention_hit is True whenever the process exited
+    nonzero having never produced a single line of REAL output — every line
+    it did emit, if any, matched either _CODEX_ROLLOUT_ERROR_SIGNATURE or
+    _CODEX_PREAMBLE_SIGNATURES (CLI startup chatter, never a genuine model
+    turn), or it emitted nothing at all. Card 4055bf3b-9510-8179: the
+    narrower "must match the rollout signature" check never retried a
+    process that died after printing only its own startup banner, which is
+    the failure signature actually observed under concurrent codex-runner
+    load — the caller decides whether to retry; this function never retries
+    or respawns anything itself, so it needs no image/argv/kwargs.
 
     `is_last_attempt` must be True whenever the caller is NOT going to retry
     — the caller doesn't know contention_hit until this function returns, so
@@ -762,7 +777,6 @@ def _stream_cold_attempt(container, r, run_id: str, codex_retryable: bool,
     """
     buf = ""
     live = False
-    saw_signature = False
     auth_revoked_logged = False
     buffered_lines: list[str] = []
     for raw in container.logs(stream=True, follow=True):
@@ -783,8 +797,9 @@ def _stream_cold_attempt(container, r, run_id: str, codex_retryable: bool,
             if live:
                 _publish_line(r, run_id, line)
                 continue
-            if codex_retryable and _CODEX_ROLLOUT_ERROR_SIGNATURE in line:
-                saw_signature = True
+            if codex_retryable and (
+                    _CODEX_ROLLOUT_ERROR_SIGNATURE in line
+                    or any(sig in line for sig in _CODEX_PREAMBLE_SIGNATURES)):
                 buffered_lines.append(line)
                 continue
             live = True
@@ -798,7 +813,7 @@ def _stream_cold_attempt(container, r, run_id: str, codex_retryable: bool,
     except Exception:
         returncode = 0
 
-    contention_hit = not live and saw_signature and returncode != 0
+    contention_hit = codex_retryable and not live and returncode != 0
     if not contention_hit or is_last_attempt:
         # Flush whatever never got published so a real failure is still
         # visible, never silently swallowed — including a contention hit on
@@ -1120,7 +1135,20 @@ def _resync_shared_cli_home_auth(shared_home: Path, staged_creds_dir: Path,
         dst = shared_home / auth_filename
         lock_path = shared_home / f".{auth_filename}.lock"
         with open(lock_path, "a+") as lockfile:
+            _lock_wait_start = time.monotonic()
             fcntl.flock(lockfile.fileno(), fcntl.LOCK_EX)
+            _lock_wait_s = time.monotonic() - _lock_wait_start
+            if _lock_wait_s > 0.5:
+                # Card 4055bf3b-9510-8179: this runs on EVERY codex spawn
+                # (cold or warm) against the one shared $CODEX_HOME. Under
+                # concurrent load, successful retrievers were observed
+                # taking 25-36s instead of the ~5-10s baseline — this line
+                # is the evidence needed to confirm or refute that THIS lock
+                # is what's serializing them, rather than guessing.
+                log.warning(
+                    "execute: shared-home auth resync waited %.2fs for the "
+                    "$CODEX_HOME lock (%s) — possible spawn-serialization "
+                    "contention under concurrent codex load", _lock_wait_s, lock_path)
             try:
                 if not dst.is_file():
                     shutil.copy2(src, dst)
