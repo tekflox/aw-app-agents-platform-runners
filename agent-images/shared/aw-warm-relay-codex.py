@@ -198,6 +198,11 @@ def _run_codex_turn(argv: list, cwd: str, env: dict, r, stream_key: str, run_id:
         rc = proc.wait()
 
         retryable = not live and rc != 0
+        # TEMP DIAGNOSTIC (card 4055bf3b-9510-8179 follow-up) — remove once the
+        # large-context synthesize failure's real returncode is confirmed.
+        print(f"aw-warm-relay-codex[{_HOSTNAME}] {_utc_now()}: DIAG run={run_id} "
+              f"attempt={attempt}/{_MAX_RESUME_ATTEMPTS} live={live} rc={rc} "
+              f"retryable={retryable} buffered={len(buffered)}", file=sys.stderr)
         if retryable and attempt < _MAX_RESUME_ATTEMPTS:
             backoff = _RETRY_BACKOFF_S[min(attempt - 1, len(_RETRY_BACKOFF_S) - 1)]
             print(f"aw-warm-relay-codex[{_HOSTNAME}] {_utc_now()}: resume produced no "

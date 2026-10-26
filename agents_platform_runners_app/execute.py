@@ -814,6 +814,13 @@ def _stream_cold_attempt(container, r, run_id: str, codex_retryable: bool,
         returncode = 0
 
     contention_hit = codex_retryable and not live and returncode != 0
+    # TEMP DIAGNOSTIC (card 4055bf3b-9510-8179 follow-up) — remove once the
+    # large-context synthesize failure's real returncode is confirmed.
+    log.warning(
+        "execute: DIAG run=%s codex_retryable=%s live=%s returncode=%s "
+        "contention_hit=%s is_last_attempt=%s buffered_lines=%d",
+        run_id, codex_retryable, live, returncode, contention_hit,
+        is_last_attempt, len(buffered_lines))
     if not contention_hit or is_last_attempt:
         # Flush whatever never got published so a real failure is still
         # visible, never silently swallowed — including a contention hit on
