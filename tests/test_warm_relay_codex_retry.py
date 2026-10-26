@@ -265,3 +265,42 @@ def test_thread_started_only_death_exhausts_retries_and_still_publishes(monkeypa
     assert rc == 0
     assert attempts == relay._MAX_RESUME_ATTEMPTS
     assert r.lines == [BANNER_LINE, '{"type":"thread.started"}']
+
+
+def test_turn_started_only_death_is_retried_even_with_clean_exit(monkeypatch):
+    """Round 2 of the same card (2026-10-26): the thread-started fix alone
+    deployed clean but the production symptom persisted — live DIAG2
+    instrumentation caught `{"type":"turn.started"}` as the actual line
+    flipping `live` on every single codex invocation observed, success or
+    failure alike (codex's own handshake is thread.started -> turn.started
+    -> item.*). A process that dies right after turn.started is exactly as
+    uninformative as one that dies right after thread.started — confirmed
+    live against 3 separate knowledgeable-search-planner failures at
+    08:26:11-17 UTC, same batch as a synthesize call that happened to
+    succeed."""
+    relay = _load_relay()
+    _popen_sequence(monkeypatch, relay, [
+        ([BANNER_LINE, '{"type":"thread.started"}', '{"type":"turn.started"}'], 0),
+        (['{"type":"turn.completed"}'], 0),
+    ])
+    r = _FakeRedis()
+    rc, attempts, tail, _auth_revoked = relay._run_codex_turn(["codex"], "/", {}, r, "run:x:events", "x")
+    assert rc == 0
+    assert attempts == 2
+    assert r.lines == ['{"type":"turn.completed"}']
+    assert not any("started" in l for l in r.lines)
+
+
+def test_turn_started_only_death_exhausts_retries_and_still_publishes(monkeypatch):
+    relay = _load_relay()
+    _popen_sequence(monkeypatch, relay, [
+        ([BANNER_LINE, '{"type":"thread.started"}', '{"type":"turn.started"}'], 0),
+        ([BANNER_LINE, '{"type":"thread.started"}', '{"type":"turn.started"}'], 0),
+        ([BANNER_LINE, '{"type":"thread.started"}', '{"type":"turn.started"}'], 0),
+    ])
+    r = _FakeRedis()
+    rc, attempts, tail, _auth_revoked = relay._run_codex_turn(["codex"], "/", {}, r, "run:x:events", "x")
+    assert rc == 0
+    assert attempts == relay._MAX_RESUME_ATTEMPTS
+    assert r.lines == [
+        BANNER_LINE, '{"type":"thread.started"}', '{"type":"turn.started"}']

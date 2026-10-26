@@ -105,18 +105,23 @@ _ROLLOUT_ERROR_SIGNATURE = "no rollout found for thread id"
 _PREAMBLE_SIGNATURES = ("Reading additional input from stdin",)
 
 # Card 4055bf3b-9510-8179 follow-up (2026-10-26): a resume can also die
-# having published nothing but the CLI banner AND a bare `thread.started`
-# session-init frame — no real turn content ever follows — and still exit 0,
-# a CLEAN exit. The previous generalization treated ANY non-preamble line as
-# proof of real output, so this line alone flipped `live` True regardless of
-# exit code. Mirrors execute.py's own _CODEX_THREAD_STARTED_SIGNATURE (same
-# "duplicated rather than imported" reason). Unlike _ROLLOUT_ERROR_SIGNATURE
-# (which stays gated on a nonzero exit — see saw_rollout_signature below,
-# because that text could plausibly appear as genuine quoted model output),
-# a stream consisting only of this and/or the preamble is contention
+# having published nothing but the CLI banner AND one or both of codex's own
+# session-handshake frames (`{"type":"thread.started",...}` and
+# `{"type":"turn.started"}`) — no real turn content ever follows — and still
+# exit 0, a CLEAN exit. turn.started in particular showed up on EVERY single
+# codex invocation observed (success or failure alike, confirmed via live
+# DIAG instrumentation) — it is normal boilerplate that just happens to
+# always precede the real content on a successful turn. The previous
+# generalization treated ANY non-preamble line as proof of real output, so
+# either line alone flipped `live` True regardless of exit code. Mirrors
+# execute.py's own _CODEX_SESSION_HANDSHAKE_SIGNATURES (same "duplicated
+# rather than imported" reason). Unlike _ROLLOUT_ERROR_SIGNATURE (which
+# stays gated on a nonzero exit — see saw_rollout_signature below, because
+# that text could plausibly appear as genuine quoted model output), a
+# stream consisting only of these and/or the preamble is contention
 # regardless of exit code — codex cannot legitimately "succeed" having
 # produced nothing beyond its own session handshake.
-_THREAD_STARTED_SIGNATURE = "thread.started"
+_SESSION_HANDSHAKE_SIGNATURES = ("thread.started", "turn.started")
 
 _MAX_RESUME_ATTEMPTS = 3  # 1 initial + 2 retries
 _RETRY_BACKOFF_S = (0.3, 0.6)  # indexed by retry number, last value repeats
@@ -157,10 +162,11 @@ def _run_codex_turn(argv: list, cwd: str, env: dict, r, stream_key: str, run_id:
     produced a line of real turn content — whether it hit the known "no
     rollout found for thread id ... (code -32600)" error (only retryable
     alongside a nonzero exit — see saw_rollout_signature), printed only its
-    own startup banner and/or a bare `thread.started` session-init frame
-    (_PREAMBLE_SIGNATURES / _THREAD_STARTED_SIGNATURE — retryable regardless
-    of exit code), or emitted nothing at all (see the module-level note on
-    _ROLLOUT_ERROR_SIGNATURE for why retrying the whole subprocess is safe).
+    own startup banner and/or codex's own thread/turn-start handshake frames
+    (_PREAMBLE_SIGNATURES / _SESSION_HANDSHAKE_SIGNATURES — retryable
+    regardless of exit code), or emitted nothing at all (see the
+    module-level note on _ROLLOUT_ERROR_SIGNATURE for why retrying the whole
+    subprocess is safe).
 
     Buffers only the first attempt's lines until either the error signature
     or real output appears, so a normal turn's live streaming is unaffected
@@ -205,7 +211,7 @@ def _run_codex_turn(argv: list, cwd: str, env: dict, r, stream_key: str, run_id:
                 saw_rollout_signature = True
                 buffered.append(out_line)
                 continue
-            if (_THREAD_STARTED_SIGNATURE in out_line
+            if (any(sig in out_line for sig in _SESSION_HANDSHAKE_SIGNATURES)
                     or any(sig in out_line for sig in _PREAMBLE_SIGNATURES)):
                 buffered.append(out_line)
                 continue
@@ -220,12 +226,6 @@ def _run_codex_turn(argv: list, cwd: str, env: dict, r, stream_key: str, run_id:
 
         retryable = not live and (
             rc != 0 or (bool(buffered) and not saw_rollout_signature))
-        # TEMP DIAGNOSTIC (card 4055bf3b-9510-8179 follow-up) — remove once the
-        # large-context synthesize failure's real returncode is confirmed.
-        print(f"aw-warm-relay-codex[{_HOSTNAME}] {_utc_now()}: DIAG run={run_id} "
-              f"attempt={attempt}/{_MAX_RESUME_ATTEMPTS} live={live} rc={rc} "
-              f"saw_rollout_signature={saw_rollout_signature} "
-              f"retryable={retryable} buffered={len(buffered)}", file=sys.stderr)
         if retryable and attempt < _MAX_RESUME_ATTEMPTS:
             backoff = _RETRY_BACKOFF_S[min(attempt - 1, len(_RETRY_BACKOFF_S) - 1)]
             print(f"aw-warm-relay-codex[{_HOSTNAME}] {_utc_now()}: resume produced no "

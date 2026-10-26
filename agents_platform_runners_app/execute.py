@@ -725,24 +725,30 @@ _CODEX_ROLLOUT_ERROR_SIGNATURE = "no rollout found for thread id"
 _CODEX_PREAMBLE_SIGNATURES = ("Reading additional input from stdin",)
 
 # Card 4055bf3b-9510-8179 follow-up (2026-10-26): a codex attempt can also
-# die having published nothing but the CLI banner AND a bare `thread.started`
-# session-init event (codex's own `{"type":"thread.started",...}` --json
-# frame) — no real turn content (item.started/item.completed/turn.completed)
-# ever follows — and still exit 0, a CLEAN exit. Confirmed live against
-# search-knowledge's synthesize node under a large (~58KB) context: codex
-# starts a session and then simply never completes a turn. The previous
-# generalization treated ANY non-preamble line as proof of real output, so
-# this line alone flipped `live` True and the retry loop never saw it as
-# contention regardless of returncode. A bare thread-started line is exactly
-# as uninformative as the CLI banner — every codex turn, successful or not,
-# emits it before any real content — so it is buffered the same way, and
-# (unlike _CODEX_ROLLOUT_ERROR_SIGNATURE, which stays gated on a nonzero
-# returncode — see saw_rollout_signature below — because that text could
-# plausibly appear as genuine quoted model output) a stream consisting of
-# only this and/or the preamble is treated as contention regardless of exit
-# code: codex cannot legitimately "succeed" having produced nothing beyond
-# its own session handshake.
-_CODEX_THREAD_STARTED_SIGNATURE = "thread.started"
+# die having published nothing but the CLI banner AND one or both of codex's
+# own session-handshake events (`{"type":"thread.started",...}` and
+# `{"type":"turn.started"}` --json frames) — no real turn content
+# (item.started/item.completed/turn.completed) ever follows — and still
+# exit 0, a CLEAN exit. Confirmed live against search-knowledge's synthesize
+# node under a large (~58KB) context: codex starts a session and a turn,
+# then simply never completes it. First confirmed for thread.started alone;
+# a second live round turned up turn.started doing the identical thing —
+# DIAG2 (`live_trigger_line='{"type":"turn.started"}'`) caught it on every
+# single codex invocation observed, success or failure alike, because
+# turn.started is normal boilerplate that just happens to always precede
+# the real content on a successful turn. The previous generalization
+# treated ANY non-preamble line as proof of real output, so either line
+# alone flipped `live` True and the retry loop never saw it as contention
+# regardless of returncode. Both are exactly as uninformative as the CLI
+# banner — every codex turn, successful or not, emits them before any real
+# content — so they are buffered the same way, and (unlike
+# _CODEX_ROLLOUT_ERROR_SIGNATURE, which stays gated on a nonzero returncode
+# — see saw_rollout_signature below — because that text could plausibly
+# appear as genuine quoted model output) a stream consisting of only these
+# and/or the preamble is treated as contention regardless of exit code:
+# codex cannot legitimately "succeed" having produced nothing beyond its
+# own session handshake.
+_CODEX_SESSION_HANDSHAKE_SIGNATURES = ("thread.started", "turn.started")
 
 _CODEX_ROLLOUT_MAX_ATTEMPTS = 3  # 1 initial + 2 retries
 _CODEX_ROLLOUT_RETRY_BACKOFF_S = (0.3, 0.6)
@@ -771,17 +777,19 @@ def _stream_cold_attempt(container, r, run_id: str, codex_retryable: bool,
     before publishing" contract as aw-warm-relay-codex.py's own
     _run_codex_turn. contention_hit is True whenever the process never
     produced a single line of REAL output — every line it did emit, if any,
-    matched _CODEX_PREAMBLE_SIGNATURES and/or _CODEX_THREAD_STARTED_SIGNATURE
-    (CLI startup chatter, never a genuine model turn), or it emitted nothing
-    at all — AND EITHER the exit was nonzero OR none of those lines were the
-    _CODEX_ROLLOUT_ERROR_SIGNATURE (which alone still requires a nonzero
-    exit, see saw_rollout_signature). Card 4055bf3b-9510-8179: the narrower
-    "must match the rollout signature" check never retried a process that
-    died after printing only its own startup banner (under concurrent
-    codex-runner load), and its 2026-10-26 follow-up found a second gap: a
-    process that starts a session (thread.started) and then dies CLEANLY
-    (exit 0) without ever completing a turn also slipped through, because
-    thread.started itself was counted as "real" output. The caller decides
+    matched _CODEX_PREAMBLE_SIGNATURES and/or
+    _CODEX_SESSION_HANDSHAKE_SIGNATURES (CLI startup chatter and codex's own
+    thread/turn-start handshake, never a genuine model turn), or it emitted
+    nothing at all — AND EITHER the exit was nonzero OR none of those lines
+    were the _CODEX_ROLLOUT_ERROR_SIGNATURE (which alone still requires a
+    nonzero exit, see saw_rollout_signature). Card 4055bf3b-9510-8179: the
+    narrower "must match the rollout signature" check never retried a
+    process that died after printing only its own startup banner (under
+    concurrent codex-runner load), and its 2026-10-26 follow-up found two
+    more gaps of the same shape: a process that starts a session
+    (thread.started) and/or a turn (turn.started) and then dies CLEANLY
+    (exit 0) without ever completing it also slipped through, because
+    either line alone was counted as "real" output. The caller decides
     whether to retry; this function never retries or respawns anything
     itself, so it needs no image/argv/kwargs.
 
@@ -828,15 +836,10 @@ def _stream_cold_attempt(container, r, run_id: str, codex_retryable: bool,
                 buffered_lines.append(line)
                 continue
             if codex_retryable and (
-                    _CODEX_THREAD_STARTED_SIGNATURE in line
+                    any(sig in line for sig in _CODEX_SESSION_HANDSHAKE_SIGNATURES)
                     or any(sig in line for sig in _CODEX_PREAMBLE_SIGNATURES)):
                 buffered_lines.append(line)
                 continue
-            # TEMP DIAGNOSTIC (card 4055bf3b-9510-8179 follow-up, round 2):
-            # confirm exactly what line is flipping `live` when the
-            # thread-started fix alone still leaves zero real tokens.
-            log.warning("execute: DIAG2 run=%s live_trigger_line=%r",
-                        run_id, line[:300])
             live = True
             for held in buffered_lines:
                 _publish_line(r, run_id, held)
@@ -850,14 +853,6 @@ def _stream_cold_attempt(container, r, run_id: str, codex_retryable: bool,
 
     contention_hit = codex_retryable and not live and (
         returncode != 0 or (bool(buffered_lines) and not saw_rollout_signature))
-    # TEMP DIAGNOSTIC (card 4055bf3b-9510-8179 follow-up) — remove once the
-    # large-context synthesize failure's real returncode is confirmed.
-    log.warning(
-        "execute: DIAG run=%s codex_retryable=%s live=%s returncode=%s "
-        "saw_rollout_signature=%s contention_hit=%s is_last_attempt=%s "
-        "buffered_lines=%d",
-        run_id, codex_retryable, live, returncode, saw_rollout_signature,
-        contention_hit, is_last_attempt, len(buffered_lines))
     if not contention_hit or is_last_attempt:
         # Flush whatever never got published so a real failure is still
         # visible, never silently swallowed — including a contention hit on

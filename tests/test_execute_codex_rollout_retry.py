@@ -216,6 +216,38 @@ def test_thread_started_only_death_on_last_attempt_still_publishes(monkeypatch):
     assert published == [BANNER_LINE, '{"type":"thread.started"}']
 
 
+def test_turn_started_only_death_is_retryable(monkeypatch):
+    """Round 2 of the same card (2026-10-26): the thread-started fix alone
+    deployed clean but the production symptom persisted — live DIAG2
+    instrumentation caught `{"type":"turn.started"}` as the actual line
+    flipping `live` on every single codex invocation observed, success or
+    failure alike. codex's own session handshake is thread.started ->
+    turn.started -> item.*, so a process that dies right after turn.started
+    (confirmed live against 3 separate knowledgeable-search-planner failures
+    at 08:26:11-17 UTC, same run batch) is exactly as uninformative as one
+    that dies right after thread.started."""
+    published = _publish_capture(monkeypatch)
+    container = _FakeContainer(
+        [BANNER_LINE, '{"type":"thread.started"}', '{"type":"turn.started"}'], 0)
+    rc, contention_hit = execute_mod._stream_cold_attempt(
+        container, _FakeRedis(), "run-x", True, is_last_attempt=False)
+    assert rc == 0
+    assert contention_hit is True
+    assert published == []
+
+
+def test_turn_started_only_death_on_last_attempt_still_publishes(monkeypatch):
+    published = _publish_capture(monkeypatch)
+    container = _FakeContainer(
+        [BANNER_LINE, '{"type":"thread.started"}', '{"type":"turn.started"}'], 0)
+    rc, contention_hit = execute_mod._stream_cold_attempt(
+        container, _FakeRedis(), "run-x", True, is_last_attempt=True)
+    assert rc == 0
+    assert contention_hit is True
+    assert published == [
+        BANNER_LINE, '{"type":"thread.started"}', '{"type":"turn.started"}']
+
+
 def test_rollout_signature_alone_with_clean_exit_is_still_not_contention(monkeypatch):
     """Belt-and-braces (mirrors aw-warm-relay-codex.py's own test): unlike
     the thread-started/preamble widening above, the rollout-error text alone
