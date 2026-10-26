@@ -840,6 +840,12 @@ def _stream_cold_attempt(container, r, run_id: str, codex_retryable: bool,
                     or any(sig in line for sig in _CODEX_PREAMBLE_SIGNATURES)):
                 buffered_lines.append(line)
                 continue
+            # TEMP DIAGNOSTIC (card 4055bf3b-9510-8179 follow-up, round 3):
+            # thread.started + turn.started are both covered now but the
+            # production symptom still recurred once more — confirm exactly
+            # what line is flipping `live` this time.
+            log.warning("execute: DIAG3 run=%s live_trigger_line=%r",
+                        run_id, line[:300])
             live = True
             for held in buffered_lines:
                 _publish_line(r, run_id, held)
@@ -853,6 +859,10 @@ def _stream_cold_attempt(container, r, run_id: str, codex_retryable: bool,
 
     contention_hit = codex_retryable and not live and (
         returncode != 0 or (bool(buffered_lines) and not saw_rollout_signature))
+    log.warning(
+        "execute: DIAG3b run=%s live=%s returncode=%s contention_hit=%s "
+        "buffered_lines=%d", run_id, live, returncode, contention_hit,
+        len(buffered_lines))
     if not contention_hit or is_last_attempt:
         # Flush whatever never got published so a real failure is still
         # visible, never silently swallowed — including a contention hit on
