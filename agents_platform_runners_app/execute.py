@@ -66,6 +66,7 @@ import fcntl
 import json
 import logging
 import os
+import random
 import re
 import shutil
 import stat
@@ -750,24 +751,42 @@ _CODEX_PREAMBLE_SIGNATURES = ("Reading additional input from stdin",)
 # own session handshake.
 _CODEX_SESSION_HANDSHAKE_SIGNATURES = ("thread.started", "turn.started")
 
-# NOT fixed here — flagging rather than silently absorbing it. A third round
-# of live DIAG instrumentation (card 4055bf3b-9510-8179, 2026-10-26) found a
-# DIFFERENT root cause producing the exact same user-visible "zero tokens"
-# symptom under the same concurrent codex-runner-gpt-5 load: codex's own
-# internal HTTP client exhausting its retry budget against a genuine OpenAI
-# 429 ("Too Many Requests"), surfaced as a real, non-boilerplate
-# `{"type":"error","message":"exceeded retry limit, last status: 429 Too
-# Many Requests"}` event — confirmed live on 3 separate
-# knowledgeable-search-planner failures (08:36:47-08:37:07 UTC). This is NOT
-# a silent dead-end this file's buffer/retry mechanism is designed for: the
-# line is genuinely informative, correctly sets `live=True`, and retrying
-# the whole container spawn would just resubmit into the same exhausted
-# account-level quota — plausibly making concurrent-load storms worse, not
-# better. Needs its own design (backoff-and-retry scoped to 429 specifically,
-# capping fan-out concurrency, or something else), not a mechanical widening
-# of contention_hit.
+# Card 4055bf3b-9510-8179 (2026-10-26), follow-up design (see
+# docs/design/codex-runner-429-rate-limit-handling.md for the full decision
+# record): a third round of live DIAG instrumentation found a DIFFERENT root
+# cause producing the exact same user-visible "zero tokens" symptom under the
+# same concurrent codex-runner-gpt-5 load — codex's own internal HTTP client
+# exhausting its retry budget against a genuine OpenAI 429 ("Too Many
+# Requests"), surfaced as a real, non-boilerplate `{"type":"error","message":
+# "exceeded retry limit, last status: 429 Too Many Requests"}` event
+# (confirmed live on 3 separate knowledgeable-search-planner failures,
+# 08:36:47-08:37:07 UTC). Handled as a SECOND retry class, distinct from
+# rollout-contention above: a long, jittered schedule (never the contention
+# one — by the time this event surfaces, codex has already burned its own
+# internal retries against the same quota, so a sub-second reattempt is a
+# guaranteed-wasted spawn), coordinated through a shared Redis cooldown
+# (below) so a storm on one consumer doesn't pour fresh spawns into an
+# already-exhausted account-level quota from every other consumer at once.
 _CODEX_ROLLOUT_MAX_ATTEMPTS = 3  # 1 initial + 2 retries
 _CODEX_ROLLOUT_RETRY_BACKOFF_S = (0.3, 0.6)
+
+_CODEX_RATE_LIMIT_SIGNATURE_PARTS = ("exceeded retry limit", "429")
+_CODEX_RATE_LIMIT_MAX_ATTEMPTS = 3  # 1 initial + 2 retries
+_CODEX_RATE_LIMIT_RETRY_BACKOFF_S = (20, 60)
+_CODEX_RATE_LIMIT_JITTER = 0.25  # ±25%
+
+# One shared cooldown lane per codex identity (today there is exactly one —
+# see _cli_home_rel) so a future second account/home gets its own lane
+# without a migration. Any process that sees the 429-exhaustion signature —
+# any of the 10 uvicorn workers' cold paths, or any warm relay in any agent
+# container — arms this key; every codex attempt (cold attempt 1, cold
+# respawns, every warm-relay attempt) waits for it to clear first.
+_CODEX_429_COOLDOWN_KEY = "apr:codex:429-cooldown:" + CLI_SPECS["codex"]["creds_dir"].lstrip(".")
+_CODEX_429_COOLDOWN_BASE_S = 30
+_CODEX_429_COOLDOWN_MAX_S = 120
+_CODEX_429_COOLDOWN_WAIT_POLL_S = 1
+_CODEX_429_COOLDOWN_WAIT_BOUND_S = 150  # fail-open past this — a stuck key must never freeze the fleet
+_CODEX_429_COOLDOWN_RELEASE_JITTER_S = (0, 5)
 
 # codex_login::auth::manager's own error codes when the OAuth refresh_token
 # stored in $CODEX_HOME/auth.json has been revoked/invalidated server-side —
@@ -783,39 +802,171 @@ _CODEX_ROLLOUT_RETRY_BACKOFF_S = (0.3, 0.6)
 _CODEX_AUTH_REVOKED_SIGNATURES = ("refresh_token_invalidated", "token_revoked")
 
 
+def _is_codex_rate_limit_exhaustion(line: str) -> bool:
+    """Structural match on codex's own terminal 429-exhaustion event, NOT a
+    substring match: a model turn's first real content could plausibly quote
+    this exact text (same reasoning as _CODEX_ROLLOUT_ERROR_SIGNATURE's own
+    nonzero-returncode gate), so this requires the line to parse as JSON with
+    a top-level ``"type": "error"`` and a ``message`` containing BOTH
+    signature fragments. Unlike the rollout signature, this is NEVER gated
+    on returncode — round 2 of card 4055bf3b-9510-8179 proved codex can die
+    cleanly, so gating on a nonzero exit would miss a real exhaustion."""
+    try:
+        evt = json.loads(line)
+    except (TypeError, ValueError):
+        return False
+    if not isinstance(evt, dict) or evt.get("type") != "error":
+        return False
+    message = evt.get("message")
+    return isinstance(message, str) and all(
+        part in message for part in _CODEX_RATE_LIMIT_SIGNATURE_PARTS)
+
+
+def _codex_429_cooldown_arm(r) -> None:
+    """Arm (or re-arm) the shared codex 429 cooldown — called the instant any
+    process sees the 429-exhaustion signature. TTL starts at
+    _CODEX_429_COOLDOWN_BASE_S and doubles on each re-arm seen while the
+    previous cooldown is still active, capped at _CODEX_429_COOLDOWN_MAX_S.
+    The key's own value (the TTL it was last armed with) is the only state
+    this needs — no separate counter to keep in sync across every worker and
+    warm relay that might call this concurrently."""
+    if r is None:
+        return
+    try:
+        prev = r.get(_CODEX_429_COOLDOWN_KEY)
+        ttl = min(int(prev) * 2, _CODEX_429_COOLDOWN_MAX_S) if prev else _CODEX_429_COOLDOWN_BASE_S
+        r.set(_CODEX_429_COOLDOWN_KEY, str(ttl), ex=ttl)
+    except Exception:
+        log.warning("execute: could not arm the shared codex 429 cooldown", exc_info=True)
+
+
+def _codex_429_cooldown_wait(r, run_id: str) -> bool:
+    """Block until the shared codex 429 cooldown clears, before a codex
+    attempt is spawned — cold attempt 1, every cold respawn, and (mirrored in
+    aw-warm-relay-codex.py) every warm-relay attempt. Costs nothing when no
+    cooldown is armed: a single GET that comes back empty returns
+    immediately — no sleep, no notice, no jitter. Bounded at
+    _CODEX_429_COOLDOWN_WAIT_BOUND_S total (polling every
+    _CODEX_429_COOLDOWN_WAIT_POLL_S) and fails OPEN past that — a stuck key
+    must never freeze the fleet, and the key's own TTL guarantees it expires
+    regardless. Publishes a run-stream notice line the moment it finds the
+    cooldown actually armed: this is what feeds the 600s no-activity
+    watchdog (replay_stream_into_queue's idle timer resets on ANY new stream
+    entry, not on recognized content) and answers "why is this slow" without
+    needing AP-MT's codex parser to understand the line — a type it already
+    silently ignores (see _run_cold_agent_with_retry's own notice for why
+    this deliberately avoids the "result"/"cli.stderr" shapes).
+
+    Returns False only if this run was aborted mid-wait (the caller must not
+    spawn); True otherwise, including the fail-open and already-clear paths.
+    """
+    if r is None:
+        return True
+    try:
+        waited = 0.0
+        notified = False
+        cleared = False
+        while True:
+            try:
+                armed = bool(r.get(_CODEX_429_COOLDOWN_KEY))
+            except Exception:
+                log.warning("execute: codex 429 cooldown check failed for run=%s — "
+                            "proceeding without waiting", run_id, exc_info=True)
+                return True
+            if not armed:
+                cleared = notified  # only a real wait counts as "cleared"
+                break
+            if not notified:
+                notified = True
+                log.warning("execute: run=%s waiting on the shared codex 429 "
+                            "cooldown before spawning", run_id)
+                _publish_line(r, run_id, json.dumps({
+                    "type": "runner.notice",
+                    "text": "codex rate-limited by OpenAI — waiting for the shared "
+                            "cooldown to clear before spawning",
+                }))
+            if is_aborted(r, run_id):
+                return False
+            if waited >= _CODEX_429_COOLDOWN_WAIT_BOUND_S:
+                log.warning("execute: run=%s proceeding past the codex 429 cooldown "
+                            "after waiting %ds (fail-open)", run_id, int(waited))
+                break
+            time.sleep(_CODEX_429_COOLDOWN_WAIT_POLL_S)
+            waited += _CODEX_429_COOLDOWN_WAIT_POLL_S
+        if cleared:
+            # Only a waiter whose cooldown actually CLEARED gets the extra
+            # release jitter, not one that gave up via fail-open — a cooldown
+            # that was never armed must cost nothing, and the jitter's whole
+            # point is to stop a just-cleared cooldown releasing a thundering
+            # herd straight back into the same quota.
+            time.sleep(random.uniform(*_CODEX_429_COOLDOWN_RELEASE_JITTER_S))
+        return True
+    except Exception:
+        log.warning("execute: codex 429 cooldown wait failed for run=%s — proceeding",
+                    run_id, exc_info=True)
+        return True
+
+
+def _sleep_abortable(r, run_id: str, seconds: float, slice_s: float = 1.0) -> bool:
+    """Sleep ~seconds in ~slice_s slices, checking the abort flag between
+    each one — a rate-limit backoff can run tens of seconds (unlike the
+    existing 0.3s/0.6s contention backoff, short enough that no one ever
+    needed to slice it), and an abort landing mid-sleep must not be undone
+    by respawning once it ends (same reasoning as the existing is_aborted
+    check at the top of each retry attempt). Returns True if aborted
+    mid-sleep — the caller must not respawn in that case."""
+    end = time.monotonic() + seconds
+    while True:
+        remaining = end - time.monotonic()
+        if remaining <= 0:
+            return False
+        if is_aborted(r, run_id):
+            return True
+        time.sleep(min(slice_s, remaining))
+
+
 def _stream_cold_attempt(container, r, run_id: str, codex_retryable: bool,
-                          is_last_attempt: bool = False) -> tuple[int, bool]:
+                          is_last_attempt: bool = False) -> tuple[int, str | None]:
     """Stream one cold container's log output, publishing complete lines to
-    the run's Redis stream. Returns (returncode, contention_hit).
+    the run's Redis stream. Returns (returncode, reason) where reason is
+    "contention" | "rate_limit" | None — None means a real attempt (success
+    or a genuine failure), the caller only retries on a non-None reason.
 
     Lines are held back (not published) only while it is still undecided
-    whether this is a doomed codex-contention attempt — the same "peek
-    before publishing" contract as aw-warm-relay-codex.py's own
-    _run_codex_turn. contention_hit is True whenever the process never
-    produced a single line of REAL output — every line it did emit, if any,
-    matched _CODEX_PREAMBLE_SIGNATURES and/or
-    _CODEX_SESSION_HANDSHAKE_SIGNATURES (CLI startup chatter and codex's own
-    thread/turn-start handshake, never a genuine model turn), or it emitted
-    nothing at all — AND EITHER the exit was nonzero OR none of those lines
-    were the _CODEX_ROLLOUT_ERROR_SIGNATURE (which alone still requires a
-    nonzero exit, see saw_rollout_signature). Card 4055bf3b-9510-8179: the
-    narrower "must match the rollout signature" check never retried a
-    process that died after printing only its own startup banner (under
-    concurrent codex-runner load), and its 2026-10-26 follow-up found two
-    more gaps of the same shape: a process that starts a session
-    (thread.started) and/or a turn (turn.started) and then dies CLEANLY
-    (exit 0) without ever completing it also slipped through, because
-    either line alone was counted as "real" output. The caller decides
-    whether to retry; this function never retries or respawns anything
-    itself, so it needs no image/argv/kwargs.
+    whether this is a doomed attempt — the same "peek before publishing"
+    contract as aw-warm-relay-codex.py's own _run_codex_turn. reason ==
+    "contention" whenever the process never produced a single line of REAL
+    output — every line it did emit, if any, matched
+    _CODEX_PREAMBLE_SIGNATURES and/or _CODEX_SESSION_HANDSHAKE_SIGNATURES
+    (CLI startup chatter and codex's own thread/turn-start handshake, never
+    a genuine model turn), or it emitted nothing at all — AND EITHER the
+    exit was nonzero OR none of those lines were the
+    _CODEX_ROLLOUT_ERROR_SIGNATURE (which alone still requires a nonzero
+    exit, see saw_rollout_signature). Card 4055bf3b-9510-8179: the narrower
+    "must match the rollout signature" check never retried a process that
+    died after printing only its own startup banner (under concurrent
+    codex-runner load), and its 2026-10-26 follow-up found two more gaps of
+    the same shape: a process that starts a session (thread.started) and/or
+    a turn (turn.started) and then dies CLEANLY (exit 0) without ever
+    completing it also slipped through, because either line alone was
+    counted as "real" output.
+
+    reason == "rate_limit" whenever _is_codex_rate_limit_exhaustion matched
+    a buffered line, regardless of returncode or anything else seen —
+    codex's internal HTTP client exhausting its own retry budget against a
+    real OpenAI 429 is unconditionally retryable on its own (long, jittered)
+    schedule; see the follow-up design at card 4055bf3b-9510-8179
+    (docs/design/codex-runner-429-rate-limit-handling.md). The caller
+    decides whether to retry and on what schedule; this function never
+    retries or respawns anything itself, so it needs no image/argv/kwargs.
 
     `is_last_attempt` must be True whenever the caller is NOT going to retry
-    — the caller doesn't know contention_hit until this function returns, so
-    it passes "this is the last attempt I'm willing to make regardless of
-    outcome" up front. Without it, an exhausted-retries contention hit would
-    never be published at all: contention_hit alone stayed True on the final
-    attempt exactly like every prior one, and nothing downstream of this
-    function gets a second chance to flush what it withheld (caught live by
+    — the caller doesn't know `reason` until this function returns, so it
+    passes "this is the last attempt I'm willing to make regardless of
+    outcome" up front. Without it, an exhausted-retries hit would never be
+    published at all: `reason` alone stayed non-None on the final attempt
+    exactly like every prior one, and nothing downstream of this function
+    gets a second chance to flush what it withheld (caught live by
     test_execute_codex_rollout_retry.py::test_retry_loop_gives_up_after_max_attempts,
     2026-09-04 — the withheld error vanished instead of surfacing after
     retries ran out).
@@ -829,6 +980,7 @@ def _stream_cold_attempt(container, r, run_id: str, codex_retryable: bool,
     auth_revoked_logged = False
     buffered_lines: list[str] = []
     saw_rollout_signature = False
+    saw_rate_limit_signature = False
     for raw in container.logs(stream=True, follow=True):
         buf += raw.decode("utf-8", errors="replace")
         while "\n" in buf:
@@ -846,6 +998,10 @@ def _stream_cold_attempt(container, r, run_id: str, codex_retryable: bool,
                     "offending line: %s", run_id, line[:500])
             if live:
                 _publish_line(r, run_id, line)
+                continue
+            if codex_retryable and _is_codex_rate_limit_exhaustion(line):
+                saw_rate_limit_signature = True
+                buffered_lines.append(line)
                 continue
             if codex_retryable and _CODEX_ROLLOUT_ERROR_SIGNATURE in line:
                 saw_rollout_signature = True
@@ -867,36 +1023,51 @@ def _stream_cold_attempt(container, r, run_id: str, codex_retryable: bool,
     except Exception:
         returncode = 0
 
-    contention_hit = codex_retryable and not live and (
-        returncode != 0 or (bool(buffered_lines) and not saw_rollout_signature))
-    if not contention_hit or is_last_attempt:
+    if codex_retryable and not live and saw_rate_limit_signature:
+        reason = "rate_limit"
+    elif codex_retryable and not live and (
+            returncode != 0 or (bool(buffered_lines) and not saw_rollout_signature)):
+        reason = "contention"
+    else:
+        reason = None
+    if reason is None or is_last_attempt:
         # Flush whatever never got published so a real failure is still
-        # visible, never silently swallowed — including a contention hit on
-        # the final attempt, once the caller has given up retrying it.
+        # visible, never silently swallowed — including a hit on the final
+        # attempt, once the caller has given up retrying it.
         for held in buffered_lines:
             _publish_line(r, run_id, held)
         if buf.strip():
             _publish_line(r, run_id, buf)
-    return returncode, contention_hit
+    return returncode, reason
 
 
 def _run_cold_agent_with_retry(client, image, kwargs: dict, container, run_id: str, r,
                                 codex_retryable: bool) -> int:
     """Own the cold-path attempt loop: stream `container` (already spawned
-    by the caller for attempt 1), and on a codex rollout-contention hit
-    (_stream_cold_attempt) respawn a fresh container from the same
-    image/kwargs and try again, up to _CODEX_ROLLOUT_MAX_ATTEMPTS. Returns
-    the final returncode.
+    by the caller for attempt 1), and on a retryable hit (_stream_cold_attempt
+    returning reason "contention" or "rate_limit") respawn a fresh container
+    from the same image/kwargs and try again. Returns the final returncode.
 
-    Reusing the same image/argv/kwargs on a retry is safe: a contention hit
-    means codex never got past its own resume lookup, so nothing was
-    appended to the rollout being resumed.
+    Two independent retry classes share one combined attempt budget — sized
+    to the larger of _CODEX_ROLLOUT_MAX_ATTEMPTS/_CODEX_RATE_LIMIT_MAX_ATTEMPTS
+    (both 3 today) — rather than each getting its own, because the backoff
+    schedule (picked per-attempt from whichever reason the PRIOR attempt
+    returned) already differs by class; a shared cap just bounds the total
+    number of container spawns one run is willing to pay for.
+
+    Reusing the same image/argv/kwargs on a retry is safe for both classes:
+    a contention hit means codex never got past its own resume lookup, and a
+    rate_limit hit means codex's own HTTP client exhausted retries before
+    ever touching the rollout — in both cases nothing was appended to the
+    session being resumed.
 
     Non-codex jobs (`codex_retryable=False`) get exactly one attempt,
     byte-for-byte the loop that existed before retry support did.
     """
-    max_attempts = _CODEX_ROLLOUT_MAX_ATTEMPTS if codex_retryable else 1
+    max_attempts = (max(_CODEX_ROLLOUT_MAX_ATTEMPTS, _CODEX_RATE_LIMIT_MAX_ATTEMPTS)
+                     if codex_retryable else 1)
     returncode = 1
+    reason = None
     for attempt in range(1, max_attempts + 1):
         if attempt > 1:
             # An abort that landed while attempt N-1 was being killed must not
@@ -904,18 +1075,44 @@ def _run_cold_agent_with_retry(client, image, kwargs: dict, container, run_id: s
             # kill (see mark_aborted) precisely so it is already visible here,
             # and it is read through Redis because the abort arrives on
             # whichever of the ten workers the tunnel picked, not necessarily
-            # this one.
+            # this one. `reason` here is whatever the PRIOR attempt (just
+            # streamed below) returned — it picks which backoff schedule
+            # this respawn uses.
             if is_aborted(r, run_id):
                 log.info("execute: run=%s was aborted — not respawning after the "
-                         "codex rollout-contention hit", run_id)
+                         "codex %s hit", run_id,
+                         "429 rate-limit exhaustion" if reason == "rate_limit"
+                         else "rollout-contention")
                 break
             # The previous attempt's container already exited (self-removes,
             # remove=True for a non-raw_command job).
-            backoff = _CODEX_ROLLOUT_RETRY_BACKOFF_S[
-                min(attempt - 2, len(_CODEX_ROLLOUT_RETRY_BACKOFF_S) - 1)]
-            log.warning("execute: run=%s hit codex rollout-contention on attempt %d/%d "
-                        "— respawning in %.1fs", run_id, attempt - 1, max_attempts, backoff)
-            time.sleep(backoff)
+            if reason == "rate_limit":
+                _codex_429_cooldown_arm(r)
+                backoff = _CODEX_RATE_LIMIT_RETRY_BACKOFF_S[
+                    min(attempt - 2, len(_CODEX_RATE_LIMIT_RETRY_BACKOFF_S) - 1)]
+                backoff *= 1 + random.uniform(-_CODEX_RATE_LIMIT_JITTER, _CODEX_RATE_LIMIT_JITTER)
+                log.warning("execute: run=%s hit codex 429 rate-limit exhaustion on "
+                            "attempt %d/%d — retrying in %.1fs", run_id, attempt - 1,
+                            max_attempts, backoff)
+                _publish_line(r, run_id, json.dumps({
+                    "type": "runner.notice",
+                    "text": f"codex rate-limited by OpenAI — waiting {backoff:.0f}s "
+                             f"before retry (attempt {attempt}/{_CODEX_RATE_LIMIT_MAX_ATTEMPTS})",
+                }))
+                if _sleep_abortable(r, run_id, backoff):
+                    log.info("execute: run=%s was aborted during the 429 backoff "
+                             "sleep — not respawning", run_id)
+                    break
+            else:
+                backoff = _CODEX_ROLLOUT_RETRY_BACKOFF_S[
+                    min(attempt - 2, len(_CODEX_ROLLOUT_RETRY_BACKOFF_S) - 1)]
+                log.warning("execute: run=%s hit codex rollout-contention on attempt %d/%d "
+                            "— respawning in %.1fs", run_id, attempt - 1, max_attempts, backoff)
+                time.sleep(backoff)
+            if not _codex_429_cooldown_wait(r, run_id):
+                log.info("execute: run=%s was aborted while waiting on the codex 429 "
+                         "cooldown — not respawning", run_id)
+                break
             try:
                 container = client.containers.run(image, **kwargs)
             except Exception as e:
@@ -927,13 +1124,13 @@ def _run_cold_agent_with_retry(client, image, kwargs: dict, container, run_id: s
                 return 1
 
         try:
-            returncode, contention_hit = _stream_cold_attempt(
+            returncode, reason = _stream_cold_attempt(
                 container, r, run_id, codex_retryable, is_last_attempt=(attempt == max_attempts))
         except Exception:
             log.exception("execute: log-stream failed run=%s", run_id)
             return 1
 
-        if contention_hit and attempt < max_attempts:
+        if reason and attempt < max_attempts:
             continue
         break
     return returncode
@@ -3133,6 +3330,8 @@ def _run_job_blocking(job: dict, redis_url: str) -> None:
             # would have been followed by this spawn. Starting the agent
             # anyway is the exact silent "the abort did nothing" this endpoint
             # exists to remove.
+            raise _AbortedBeforeSpawn()
+        if (job.get("cli") or "claude") == "codex" and not _codex_429_cooldown_wait(r, run_id):
             raise _AbortedBeforeSpawn()
         container = client.containers.run(image, **kwargs)
         # Record it before a single line is streamed: an abort arriving on any

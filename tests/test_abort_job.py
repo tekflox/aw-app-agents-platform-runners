@@ -388,6 +388,49 @@ def test_the_codex_retry_loop_does_not_respawn_an_aborted_run(monkeypatch):
     assert returncode == 1
 
 
+def test_the_codex_retry_loop_does_not_respawn_after_an_abort_mid_429_backoff(monkeypatch):
+    """Card 4055bf3b-9510-8179 follow-up: the rate-limit backoff can run tens
+    of seconds (unlike the 0.3s/0.6s contention one trap 2 above guards), so
+    it's sliced into abortable chunks (_sleep_abortable) rather than one
+    unguarded time.sleep — an abort landing mid-backoff must not be undone by
+    respawning once the sleep ends.
+
+    Mutation: swap _sleep_abortable for a plain time.sleep in the rate_limit
+    branch of _run_cold_agent_with_retry and this test's `must not respawn`
+    assertion fires.
+    """
+    from tests.test_execute_codex_rollout_retry import (  # noqa: PLC0415
+        RATE_LIMIT_ERROR, _FakeContainer as _RetryContainer, _publish_capture)
+
+    _publish_capture(monkeypatch)
+    monkeypatch.setattr(execute_mod.time, "monotonic", lambda: 0.0)
+    r = _FakeRedis()
+    spawned = {"count": 0}
+
+    def _sleep_marks_aborted(_s):
+        # The abort lands WHILE the backoff sleep is in flight, not before
+        # it starts — mark_aborted here, not above, is what actually
+        # exercises the mid-sleep check rather than the earlier one.
+        execute_mod.mark_aborted(r, "run-429-abort")
+
+    monkeypatch.setattr(execute_mod.time, "sleep", _sleep_marks_aborted)
+
+    class _Containers:
+        def run(self, _image, **_kwargs):
+            spawned["count"] += 1
+            return _RetryContainer([RATE_LIMIT_ERROR], 1)
+
+    class _Client:
+        containers = _Containers()
+
+    returncode = execute_mod._run_cold_agent_with_retry(
+        _Client(), "img", {}, _RetryContainer([RATE_LIMIT_ERROR], 1),
+        "run-429-abort", r, True)
+
+    assert spawned["count"] == 0, "an aborted run must not be respawned"
+    assert returncode == 1
+
+
 def test_an_unaborted_codex_run_still_respawns(monkeypatch):
     """The guard above must not break the retry it guards — same setup, no
     abort flag, and the respawn happens as before."""

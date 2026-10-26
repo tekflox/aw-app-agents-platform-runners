@@ -197,10 +197,10 @@ def test_cold_path_logs_auth_revoked_once(monkeypatch, caplog):
     lines = [AUTH_REVOKED_ERROR] * 5 + ["another unrelated cascade line"]
     container = _FakeContainer(lines, 1)
     with caplog.at_level(logging.WARNING, logger="aw_apps.agents_platform_runners.execute"):
-        rc, contention_hit = execute_mod._stream_cold_attempt(
+        rc, reason = execute_mod._stream_cold_attempt(
             container, _FakeRedis(), "run-auth-x", False)
     assert rc == 1
-    assert contention_hit is False
+    assert reason is None
     warnings = [r for r in caplog.records if "revoked/invalidated" in r.getMessage()]
     assert len(warnings) == 1, "must log exactly once even though codex repeats the line"
     assert "run-auth-x" in warnings[0].getMessage()

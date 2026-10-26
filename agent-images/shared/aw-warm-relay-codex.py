@@ -42,6 +42,7 @@ from __future__ import annotations
 
 import json
 import os
+import random
 import shlex
 import socket
 import subprocess
@@ -127,6 +128,36 @@ _MAX_RESUME_ATTEMPTS = 3  # 1 initial + 2 retries
 _RETRY_BACKOFF_S = (0.3, 0.6)  # indexed by retry number, last value repeats
 _HOSTNAME = socket.gethostname()
 
+# Card 4055bf3b-9510-8179 follow-up (2026-10-26, see
+# docs/design/codex-runner-429-rate-limit-handling.md in
+# aw-app-agents-platform-runners for the full decision record): codex's own
+# internal HTTP client can exhaust its retry budget against a genuine OpenAI
+# 429, surfaced as a real, non-boilerplate `{"type":"error","message":
+# "exceeded retry limit, last status: 429 Too Many Requests"}` event. A
+# SECOND retry class, distinct from the contention one above: a long,
+# jittered schedule (never the 0.3s/0.6s contention one — codex has already
+# burned its own internal retries against the same quota by the time this
+# surfaces, so a sub-second reattempt is a guaranteed-wasted spawn),
+# coordinated through the SAME shared Redis cooldown key execute.py's cold
+# path uses — any process that sees this signature (any cold worker, any
+# warm relay) arms it, and every codex attempt waits for it to clear first.
+_RATE_LIMIT_SIGNATURE_PARTS = ("exceeded retry limit", "429")
+_RATE_LIMIT_MAX_ATTEMPTS = 3  # 1 initial + 2 retries
+_RATE_LIMIT_RETRY_BACKOFF_S = (20, 60)
+_RATE_LIMIT_JITTER = 0.25  # ±25%
+
+# Duplicated from execute.py's own _CODEX_429_COOLDOWN_KEY (this file ships
+# into a different container image, loaded by path — same "duplicated
+# rather than imported" rule as every signature above). Hardcoded "codex"
+# rather than derived: this file only ever relays codex turns, so there is
+# only ever one identity to key on from here.
+_COOLDOWN_KEY = "apr:codex:429-cooldown:codex"
+_COOLDOWN_BASE_S = 30
+_COOLDOWN_MAX_S = 120
+_COOLDOWN_WAIT_POLL_S = 1
+_COOLDOWN_WAIT_BOUND_S = 150  # fail-open past this — a stuck key must never freeze the fleet
+_COOLDOWN_RELEASE_JITTER_S = (0, 5)
+
 # codex_login::auth::manager's own error codes when the OAuth refresh_token
 # in the shared $CODEX_HOME/auth.json has been revoked/invalidated
 # server-side — duplicated from execute.py's own copy of this list for the
@@ -156,6 +187,96 @@ def _publish_line(r, stream_key: str, run_id: str, line: str) -> None:
         print(f"aw-warm-relay-codex: XADD failed ({e})", file=sys.stderr)
 
 
+def _is_rate_limit_exhaustion(line: str) -> bool:
+    """Structural match on codex's own terminal 429-exhaustion event, NOT a
+    substring match — mirrors execute.py's own
+    _is_codex_rate_limit_exhaustion (same "duplicated rather than imported"
+    reason as every signature in this file). Requires the line to parse as
+    JSON with a top-level ``"type": "error"`` and a ``message`` containing
+    BOTH signature fragments; never gated on returncode, unlike
+    _ROLLOUT_ERROR_SIGNATURE — codex can die cleanly either way."""
+    try:
+        evt = json.loads(line)
+    except (TypeError, ValueError):
+        return False
+    if not isinstance(evt, dict) or evt.get("type") != "error":
+        return False
+    message = evt.get("message")
+    return isinstance(message, str) and all(
+        part in message for part in _RATE_LIMIT_SIGNATURE_PARTS)
+
+
+def _cooldown_arm(r) -> None:
+    """Arm (or re-arm) the shared codex 429 cooldown — mirrors execute.py's
+    own _codex_429_cooldown_arm against the SAME Redis key, so a storm seen
+    by a warm relay gates every cold spawn too, and vice versa. TTL starts
+    at _COOLDOWN_BASE_S and doubles on each re-arm seen while the previous
+    cooldown is still active, capped at _COOLDOWN_MAX_S."""
+    if r is None:
+        return
+    try:
+        prev = r.get(_COOLDOWN_KEY)
+        ttl = min(int(prev) * 2, _COOLDOWN_MAX_S) if prev else _COOLDOWN_BASE_S
+        r.set(_COOLDOWN_KEY, str(ttl), ex=ttl)
+    except Exception as e:
+        print(f"aw-warm-relay-codex: could not arm the shared 429 cooldown ({e})",
+              file=sys.stderr)
+
+
+def _cooldown_wait(r, stream_key: str, run_id: str) -> None:
+    """Block until the shared codex 429 cooldown clears, before this warm
+    turn's codex subprocess is spawned — mirrors execute.py's own
+    _codex_429_cooldown_wait against the SAME key. Costs nothing when no
+    cooldown is armed. Bounded at _COOLDOWN_WAIT_BOUND_S total (fail-open
+    past that — a stuck key must never freeze a warm container) and
+    publishes a run-stream notice the moment it finds the cooldown actually
+    armed, both so the watchdog sees activity and so the wait is visible.
+    No abort check: this relay has no abort channel for an in-flight turn
+    today (nothing here does), so there is nothing to mirror — same as the
+    unguarded contention backoff sleep below."""
+    if r is None:
+        return
+    try:
+        waited = 0.0
+        notified = False
+        cleared = False
+        while True:
+            try:
+                armed = bool(r.get(_COOLDOWN_KEY))
+            except Exception as e:
+                print(f"aw-warm-relay-codex: 429 cooldown check failed ({e}) — "
+                      "proceeding without waiting", file=sys.stderr)
+                return
+            if not armed:
+                cleared = notified  # only a real wait counts as "cleared"
+                break
+            if not notified:
+                notified = True
+                print(f"aw-warm-relay-codex[{_HOSTNAME}] {_utc_now()}: run={run_id} "
+                      "waiting on the shared codex 429 cooldown before spawning",
+                      file=sys.stderr)
+                _publish_line(r, stream_key, run_id, json.dumps({
+                    "type": "runner.notice",
+                    "text": "codex rate-limited by OpenAI — waiting for the shared "
+                            "cooldown to clear before spawning",
+                }))
+            if waited >= _COOLDOWN_WAIT_BOUND_S:
+                print(f"aw-warm-relay-codex[{_HOSTNAME}] {_utc_now()}: run={run_id} "
+                      f"proceeding past the codex 429 cooldown after waiting "
+                      f"{waited:.0f}s (fail-open)", file=sys.stderr)
+                break
+            time.sleep(_COOLDOWN_WAIT_POLL_S)
+            waited += _COOLDOWN_WAIT_POLL_S
+        if cleared:
+            # Only a waiter whose cooldown actually cleared gets the extra
+            # release jitter, not one that gave up via fail-open — a cooldown
+            # that was never armed costs nothing.
+            time.sleep(random.uniform(*_COOLDOWN_RELEASE_JITTER_S))
+    except Exception as e:
+        print(f"aw-warm-relay-codex: 429 cooldown wait failed ({e}) — proceeding",
+              file=sys.stderr)
+
+
 def _run_codex_turn(argv: list, cwd: str, env: dict, r, stream_key: str, run_id: str
                      ) -> tuple[int, int, str, bool]:
     """Run one `codex exec resume` subprocess, retrying an attempt that never
@@ -173,6 +294,13 @@ def _run_codex_turn(argv: list, cwd: str, env: dict, r, stream_key: str, run_id:
     — the added latency is confined to attempts that actually hit the
     transient error.
 
+    A second, independent retry class (card 4055bf3b-9510-8179 follow-up)
+    handles codex's own 429-exhaustion event the same way, on its own long,
+    jittered schedule (_RATE_LIMIT_RETRY_BACKOFF_S), coordinated through the
+    shared Redis cooldown key _cooldown_wait/_cooldown_arm set and read —
+    every attempt, including the very first, waits for it to clear before
+    spawning.
+
     Returns (returncode, attempts_made, tail_text, auth_revoked) — the first
     three feed main()'s resume_end diagnostics line (attempt count and exact
     trailing output survive a single-attempt view of the run's Redis stream);
@@ -183,7 +311,32 @@ def _run_codex_turn(argv: list, cwd: str, env: dict, r, stream_key: str, run_id:
     """
     last_tail: deque = deque(maxlen=5)
     auth_revoked = False
-    for attempt in range(1, _MAX_RESUME_ATTEMPTS + 1):
+    max_attempts = max(_MAX_RESUME_ATTEMPTS, _RATE_LIMIT_MAX_ATTEMPTS)
+    reason = None
+    for attempt in range(1, max_attempts + 1):
+        if attempt > 1:
+            if reason == "rate_limit":
+                _cooldown_arm(r)
+                backoff = _RATE_LIMIT_RETRY_BACKOFF_S[
+                    min(attempt - 2, len(_RATE_LIMIT_RETRY_BACKOFF_S) - 1)]
+                backoff *= 1 + random.uniform(-_RATE_LIMIT_JITTER, _RATE_LIMIT_JITTER)
+                print(f"aw-warm-relay-codex[{_HOSTNAME}] {_utc_now()}: run={run_id} "
+                      f"hit codex 429 rate-limit exhaustion on attempt {attempt - 1}/"
+                      f"{max_attempts} — retrying in {backoff:.1f}s", file=sys.stderr)
+                _publish_line(r, stream_key, run_id, json.dumps({
+                    "type": "runner.notice",
+                    "text": f"codex rate-limited by OpenAI — waiting {backoff:.0f}s "
+                             f"before retry (attempt {attempt}/{_RATE_LIMIT_MAX_ATTEMPTS})",
+                }))
+                time.sleep(backoff)
+            else:
+                backoff = _RETRY_BACKOFF_S[min(attempt - 2, len(_RETRY_BACKOFF_S) - 1)]
+                print(f"aw-warm-relay-codex[{_HOSTNAME}] {_utc_now()}: resume produced no "
+                      f"real output (attempt {attempt - 1}/{max_attempts}, rc={rc}, "
+                      f"tail={list(last_tail)}) — likely shared-$CODEX_HOME contention, "
+                      f"retrying after {backoff}s", file=sys.stderr)
+                time.sleep(backoff)
+        _cooldown_wait(r, stream_key, run_id)
         try:
             proc = subprocess.Popen(argv, cwd=cwd, stdin=subprocess.DEVNULL,
                                     stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
@@ -197,6 +350,7 @@ def _run_codex_turn(argv: list, cwd: str, env: dict, r, stream_key: str, run_id:
         buffered: list[str] = []
         live = False
         saw_rollout_signature = False
+        saw_rate_limit_signature = False
         for out_line in proc.stdout:
             out_line = out_line.rstrip("\n")
             if not out_line:
@@ -206,6 +360,10 @@ def _run_codex_turn(argv: list, cwd: str, env: dict, r, stream_key: str, run_id:
                 auth_revoked = True
             if live:
                 _publish_line(r, stream_key, run_id, out_line)
+                continue
+            if _is_rate_limit_exhaustion(out_line):
+                saw_rate_limit_signature = True
+                buffered.append(out_line)
                 continue
             if _ROLLOUT_ERROR_SIGNATURE in out_line:
                 saw_rollout_signature = True
@@ -224,15 +382,13 @@ def _run_codex_turn(argv: list, cwd: str, env: dict, r, stream_key: str, run_id:
             _publish_line(r, stream_key, run_id, out_line)
         rc = proc.wait()
 
-        retryable = not live and (
-            rc != 0 or (bool(buffered) and not saw_rollout_signature))
-        if retryable and attempt < _MAX_RESUME_ATTEMPTS:
-            backoff = _RETRY_BACKOFF_S[min(attempt - 1, len(_RETRY_BACKOFF_S) - 1)]
-            print(f"aw-warm-relay-codex[{_HOSTNAME}] {_utc_now()}: resume produced no "
-                  f"real output (attempt {attempt}/{_MAX_RESUME_ATTEMPTS}, rc={rc}, "
-                  f"tail={list(last_tail)}) — likely shared-$CODEX_HOME contention, "
-                  f"retrying after {backoff}s", file=sys.stderr)
-            time.sleep(backoff)
+        if not live and saw_rate_limit_signature:
+            reason = "rate_limit"
+        elif not live and (rc != 0 or (bool(buffered) and not saw_rollout_signature)):
+            reason = "contention"
+        else:
+            reason = None
+        if reason and attempt < max_attempts:
             continue
 
         # Final attempt (succeeded, hit a different error, or retries
@@ -240,13 +396,13 @@ def _run_codex_turn(argv: list, cwd: str, env: dict, r, stream_key: str, run_id:
         # is still visible, never silently swallowed.
         for held in buffered:
             _publish_line(r, stream_key, run_id, held)
-        if retryable:
+        if reason:
             print(f"aw-warm-relay-codex[{_HOSTNAME}] {_utc_now()}: resume still failing "
-                  f"after {_MAX_RESUME_ATTEMPTS} attempts, giving up — tail: "
+                  f"after {attempt} attempts, giving up — tail: "
                   f"{list(last_tail)}", file=sys.stderr)
         return rc, attempt, "\n".join(last_tail), auth_revoked
 
-    return 1, _MAX_RESUME_ATTEMPTS, "", auth_revoked  # unreachable — loop always returns
+    return 1, max_attempts, "", auth_revoked  # unreachable — loop always returns
 
 
 def _turn_env(rundir: str) -> dict:
