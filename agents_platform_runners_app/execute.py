@@ -832,6 +832,11 @@ def _stream_cold_attempt(container, r, run_id: str, codex_retryable: bool,
                     or any(sig in line for sig in _CODEX_PREAMBLE_SIGNATURES)):
                 buffered_lines.append(line)
                 continue
+            # TEMP DIAGNOSTIC (card 4055bf3b-9510-8179 follow-up, round 2):
+            # confirm exactly what line is flipping `live` when the
+            # thread-started fix alone still leaves zero real tokens.
+            log.warning("execute: DIAG2 run=%s live_trigger_line=%r",
+                        run_id, line[:300])
             live = True
             for held in buffered_lines:
                 _publish_line(r, run_id, held)
