@@ -1827,7 +1827,15 @@ def _build_container_kwargs(job: dict, client=None) -> tuple[str, list[str], dic
     if mcp_servers and spec.get("mcp_config_flag"):
         claude_mcp = {
             "mcpServers": {
+                # Claude Code's own per-tool-call default (MCP_TOOL_TIMEOUT,
+                # 60s) kills any approval-gated tool — e.g. aw-crispal's
+                # backup_database, which blocks on a Telegram approval tap
+                # plus a long-running mysqldump/rsync — long before a human
+                # can plausibly respond. Measured twice at exactly 60.00s
+                # (card 406c4132-9691-81e4-b587-d447bad1f527). 30 min covers
+                # the worst case documented there.
                 name: {"type": cfg.get("type", "streamable-http"), "url": cfg["url"],
+                       "timeout": 1_800_000,
                        **({"headers": h} if (h := _strip_stale_identity_headers(cfg.get("headers"))) else {})}
                 for name, cfg in mcp_servers.items() if cfg.get("url")
             }
