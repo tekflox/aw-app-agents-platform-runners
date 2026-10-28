@@ -97,8 +97,9 @@ class _FakeStdout:
 
 
 class _FakeProc:
-    def __init__(self, lines: list[str], rc: int):
+    def __init__(self, lines: list[str], rc: int, stderr_lines: list[str] | None = None):
         self.stdout = _FakeStdout(lines)
+        self.stderr = _FakeStdout(stderr_lines or [])
         self._rc = rc
 
     def wait(self):
@@ -127,6 +128,64 @@ def test_ordinary_turn_streams_live_no_retry(monkeypatch):
     assert rc == 0
     assert attempts == 1
     assert r.lines == ['{"type":"thread.started"}', '{"type":"turn.completed"}']
+
+
+def test_stderr_is_metadata_not_assistant_text(monkeypatch):
+    """Regression for the Telegram leak seen on 2026-10-28: warm codex used
+    stderr=STDOUT, so a models-cache warning became an llm_token and was
+    delivered verbatim before the agent's answer."""
+    relay = _load_relay()
+    warning = ("2026-10-28T15:21:47Z ERROR codex_models_manager::manager: "
+               "failed to renew cache TTL: missing field "
+               "`supports_parallel_tool_calls`")
+
+    def _fake_popen(*_a, **kw):
+        assert kw["stderr"] is relay.subprocess.PIPE
+        return _FakeProc(['{"type":"turn.completed"}'], 0, [warning])
+
+    monkeypatch.setattr(relay.subprocess, "Popen", _fake_popen)
+    monkeypatch.setattr(relay, "aw_attach", None)
+    r = _FakeRedis()
+    rc, attempts, _tail, _auth_revoked = relay._run_codex_turn(
+        ["codex"], "/", {}, r, "run:x:events", "x")
+
+    assert rc == 0
+    assert attempts == 1
+    assert warning not in r.lines
+    stderr_events = [json.loads(line) for line in r.lines
+                     if json.loads(line).get("type") == "cli.stderr"]
+    assert stderr_events == [{"type": "cli.stderr", "text": warning}]
+    assert '{"type":"turn.completed"}' in r.lines
+
+
+def test_incompatible_models_cache_is_invalidated(tmp_path):
+    relay = _load_relay()
+    codex_home = tmp_path / ".codex"
+    codex_home.mkdir()
+    cache = codex_home / "models_cache.json"
+    cache.write_text(json.dumps({
+        "client_version": "0.146.0",
+        "models": [{"slug": "gpt-5"}],
+    }))
+
+    assert relay._invalidate_incompatible_models_cache(
+        {"CODEX_HOME": str(codex_home)}) is True
+    assert not cache.exists()
+
+
+def test_compatible_models_cache_is_preserved(tmp_path):
+    relay = _load_relay()
+    codex_home = tmp_path / ".codex"
+    codex_home.mkdir()
+    cache = codex_home / "models_cache.json"
+    cache.write_text(json.dumps({
+        "client_version": "0.147.0",
+        "models": [{"slug": "gpt-5", "supports_parallel_tool_calls": True}],
+    }))
+
+    assert relay._invalidate_incompatible_models_cache(
+        {"CODEX_HOME": str(codex_home)}) is False
+    assert cache.exists()
 
 
 def test_contention_then_success_hides_the_failed_attempts(monkeypatch):

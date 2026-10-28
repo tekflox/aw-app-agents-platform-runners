@@ -42,11 +42,13 @@ from __future__ import annotations
 
 import json
 import os
+import queue
 import random
 import shlex
 import socket
 import subprocess
 import sys
+import threading
 import time
 from collections import deque
 from datetime import datetime, timezone
@@ -185,6 +187,86 @@ def _publish_line(r, stream_key: str, run_id: str, line: str) -> None:
         r.xadd(stream_key, {"type": "stdout", "line": line}, maxlen=50_000, approximate=True)
     except Exception as e:
         print(f"aw-warm-relay-codex: XADD failed ({e})", file=sys.stderr)
+
+
+def _publish_stderr_line(r, stream_key: str, run_id: str, line: str) -> None:
+    """Publish codex diagnostics as metadata, never as assistant text.
+
+    The cold connector has always wrapped subprocess stderr in this exact
+    ``cli.stderr`` event shape.  The warm relay used ``stderr=STDOUT``
+    instead, so warnings from codex (including models-cache schema errors)
+    entered the JSON stdout parser as plain assistant deltas and were sent
+    verbatim to Telegram.  Keep stderr observable without letting it become
+    an ``llm_token``.
+    """
+    _publish_line(r, stream_key, run_id, json.dumps({
+        "type": "cli.stderr",
+        "text": line[:20000],
+    }))
+
+
+def _iter_process_output(proc):
+    """Yield ``(source, line)`` from stdout and stderr without deadlocking.
+
+    Both pipes must be drained concurrently: codex can be verbose on stderr
+    while it is still producing JSON events on stdout.  A thread per pipe is
+    deliberately small and local to one subprocess attempt.
+    """
+    out: queue.Queue = queue.Queue()
+    streams = [
+        ("stdout", getattr(proc, "stdout", None)),
+        ("stderr", getattr(proc, "stderr", None)),
+    ]
+    streams = [(source, stream) for source, stream in streams if stream is not None]
+
+    def _pump(source, stream):
+        try:
+            for line in stream:
+                out.put((source, line))
+        finally:
+            out.put((source, None))
+
+    for source, stream in streams:
+        threading.Thread(target=_pump, args=(source, stream), daemon=True).start()
+
+    open_streams = len(streams)
+    while open_streams:
+        source, line = out.get()
+        if line is None:
+            open_streams -= 1
+            continue
+        yield source, line
+
+
+def _invalidate_incompatible_models_cache(env: dict) -> bool:
+    """Delete the reconstructible cache written by an older codex schema.
+
+    codex 0.147 requires ``supports_parallel_tool_calls`` on every cached
+    model.  An older cache lacks it, and codex otherwise logs the same parse
+    failure on startup and every TTL renewal.  Only delete a cache proven to
+    have that incompatible shape; malformed/in-flight files and unrelated
+    future schemas are left alone for codex to handle.
+    """
+    home = env.get("CODEX_HOME")
+    if not home:
+        process_home = env.get("HOME")
+        if not process_home:
+            return False
+        home = os.path.join(process_home, ".codex")
+    path = os.path.join(home, "models_cache.json")
+    try:
+        with open(path, encoding="utf-8") as fh:
+            payload = json.load(fh)
+        models = payload.get("models") if isinstance(payload, dict) else None
+        if not isinstance(models, list) or not any(
+                isinstance(model, dict)
+                and "supports_parallel_tool_calls" not in model
+                for model in models):
+            return False
+        os.unlink(path)
+        return True
+    except (FileNotFoundError, PermissionError, OSError, TypeError, ValueError):
+        return False
 
 
 def _is_rate_limit_exhaustion(line: str) -> bool:
@@ -337,9 +419,13 @@ def _run_codex_turn(argv: list, cwd: str, env: dict, r, stream_key: str, run_id:
                       f"retrying after {backoff}s", file=sys.stderr)
                 time.sleep(backoff)
         _cooldown_wait(r, stream_key, run_id)
+        if _invalidate_incompatible_models_cache(env):
+            print(f"aw-warm-relay-codex[{_HOSTNAME}] {_utc_now()}: removed an "
+                  "incompatible codex models cache; codex will rebuild it",
+                  file=sys.stderr)
         try:
             proc = subprocess.Popen(argv, cwd=cwd, stdin=subprocess.DEVNULL,
-                                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                     text=True, bufsize=1, env=env)
         except Exception as e:
             print(f"aw-warm-relay-codex: could not start codex ({e})", file=sys.stderr)
@@ -347,11 +433,11 @@ def _run_codex_turn(argv: list, cwd: str, env: dict, r, stream_key: str, run_id:
                 "type": "cli.stderr", "text": f"warm codex failed to start: {e}"}))
             return 1, attempt, f"spawn failed: {e}", auth_revoked
 
-        buffered: list[str] = []
+        buffered: list[tuple[str, str]] = []
         live = False
         saw_rollout_signature = False
         saw_rate_limit_signature = False
-        for out_line in proc.stdout:
+        for source, out_line in _iter_process_output(proc):
             out_line = out_line.rstrip("\n")
             if not out_line:
                 continue
@@ -359,25 +445,34 @@ def _run_codex_turn(argv: list, cwd: str, env: dict, r, stream_key: str, run_id:
             if any(sig in out_line for sig in _AUTH_REVOKED_SIGNATURES):
                 auth_revoked = True
             if live:
-                _publish_line(r, stream_key, run_id, out_line)
+                if source == "stderr":
+                    _publish_stderr_line(r, stream_key, run_id, out_line)
+                else:
+                    _publish_line(r, stream_key, run_id, out_line)
                 continue
             if _is_rate_limit_exhaustion(out_line):
                 saw_rate_limit_signature = True
-                buffered.append(out_line)
+                buffered.append((source, out_line))
                 continue
             if _ROLLOUT_ERROR_SIGNATURE in out_line:
                 saw_rollout_signature = True
-                buffered.append(out_line)
+                buffered.append((source, out_line))
+                continue
+            if source == "stderr":
+                buffered.append((source, out_line))
                 continue
             if (any(sig in out_line for sig in _SESSION_HANDSHAKE_SIGNATURES)
                     or any(sig in out_line for sig in _PREAMBLE_SIGNATURES)):
-                buffered.append(out_line)
+                buffered.append((source, out_line))
                 continue
             # Real content arrived — this attempt is not hitting the
             # transient error. Flush what we held and stream live from here.
             live = True
-            for held in buffered:
-                _publish_line(r, stream_key, run_id, held)
+            for held_source, held in buffered:
+                if held_source == "stderr":
+                    _publish_stderr_line(r, stream_key, run_id, held)
+                else:
+                    _publish_line(r, stream_key, run_id, held)
             buffered = []
             _publish_line(r, stream_key, run_id, out_line)
         rc = proc.wait()
@@ -394,8 +489,11 @@ def _run_codex_turn(argv: list, cwd: str, env: dict, r, stream_key: str, run_id:
         # Final attempt (succeeded, hit a different error, or retries
         # exhausted) — publish whatever never got flushed so a real failure
         # is still visible, never silently swallowed.
-        for held in buffered:
-            _publish_line(r, stream_key, run_id, held)
+        for held_source, held in buffered:
+            if held_source == "stderr":
+                _publish_stderr_line(r, stream_key, run_id, held)
+            else:
+                _publish_line(r, stream_key, run_id, held)
         if reason:
             print(f"aw-warm-relay-codex[{_HOSTNAME}] {_utc_now()}: resume still failing "
                   f"after {attempt} attempts, giving up — tail: "
