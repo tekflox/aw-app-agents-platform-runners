@@ -185,11 +185,16 @@ class _FakeContainer:
         self._chunks = [(l + "\n").encode() for l in lines]
         self._rc = rc
 
-    def logs(self, stream=True, follow=True):
-        return iter(self._chunks)
+    def logs(self, stream=True, follow=True, stdout=True, stderr=False):
+        if stream:
+            return iter(self._chunks)
+        return b""
 
     def wait(self):
         return {"StatusCode": self._rc}
+
+    def remove(self, force=False):
+        pass
 
 
 def test_cold_path_logs_auth_revoked_once(monkeypatch, caplog):

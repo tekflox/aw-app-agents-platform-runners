@@ -976,19 +976,25 @@ def _stream_cold_attempt(container, r, run_id: str, codex_retryable: bool,
     support existed.
 
     Stderr (card 4085bf3b-9510-8181-93e0-c0eab7f88bce): unlike the warm
-    relay's own subprocess, this path has no second OS pipe to split —
-    `container.logs(stream=True, follow=True)` merges stdout+stderr and
-    docker-py discards the per-frame stream-type tag once both are
-    requested together, so there is no way to recover which bytes were
-    stderr out of THAT call. Instead, live stdout streaming above is left
-    untouched, and once the container has exited this fetches stderr ONCE
-    more via a plain non-streaming, source-filtered `container.logs()` call
-    (the same historical-fetch shape the `raw_command` branch already uses
-    against this same podman socket) and publishes it as `cli.stderr`
-    metadata — never concatenated into a line a caller might treat as reply
-    text. This trades away *live* stderr (acceptable: nothing was reading it
-    live, and today it actively corrupts the reply) for *recoverable*
-    stderr on a normal exit. The one case this does NOT cover is a
+    relay's own subprocess, this path has no second OS pipe to split, and
+    `container.logs(stream=True, follow=True)` defaults to BOTH streams
+    (`stdout=True, stderr=True`) — once requested together like that,
+    docker-py discards the per-frame stream-type tag, so there is no way to
+    recover which bytes were stderr out of a call shaped that way. The fix
+    is NOT two concurrent follow streams (real risk against this podman
+    socket, and unverified) — it's narrowing this ONE live call to
+    `stdout=True, stderr=False` so the engine filters server-side and
+    stderr frames never reach it at all, while every buffering/retry-
+    signature line below keeps operating on whatever bytes arrive, same as
+    before. Once the container has exited, a second, non-streaming,
+    source-filtered `container.logs(stdout=False, stderr=True)` call (the
+    same historical-fetch shape the `raw_command` branch already uses
+    against this same podman socket) picks up what the live call just
+    excluded, and publishes it as `cli.stderr` metadata — never
+    concatenated into a line a caller might treat as reply text. This
+    trades away *live* stderr (acceptable: nothing was reading it live, and
+    today it actively corrupts the reply) for *recoverable* stderr on a
+    normal exit. The one case this does NOT cover is a
     hard-killed container: this app's own kill path is `abort_job`, which
     runs synchronously in the HTTP-handler thread and removes the container
     right after signalling it — usually before this function (running in a
@@ -1011,7 +1017,7 @@ def _stream_cold_attempt(container, r, run_id: str, codex_retryable: bool,
     saw_rollout_signature = False
     saw_rate_limit_signature = False
     try:
-        for raw in container.logs(stream=True, follow=True):
+        for raw in container.logs(stdout=True, stderr=False, stream=True, follow=True):
             buf += raw.decode("utf-8", errors="replace")
             while "\n" in buf:
                 line, buf = buf.split("\n", 1)

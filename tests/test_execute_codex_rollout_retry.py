@@ -124,6 +124,31 @@ def test_ordinary_attempt_streams_live(monkeypatch):
     assert published == ['{"type":"thread.started"}', '{"type":"turn.completed"}']
 
 
+def test_live_log_call_excludes_stderr_server_side(monkeypatch):
+    """The actual fix, not just the post-exit fetch: without
+    `stdout=True, stderr=False` on the LIVE call, docker-py's default
+    (both streams) means the banner still reaches the live stream
+    unfiltered regardless of what the post-exit fetch does afterward —
+    caught live on 2026-10-29 when the first version of this fix shipped
+    the post-exit fetch alone and the banner kept leaking."""
+    published = _publish_capture(monkeypatch)
+    calls: list[dict] = []
+
+    class _SpyContainer(_FakeContainer):
+        def logs(self, stream=True, follow=True, stdout=True, stderr=False):
+            calls.append({"stream": stream, "follow": follow,
+                          "stdout": stdout, "stderr": stderr})
+            return super().logs(stream=stream, follow=follow, stdout=stdout, stderr=stderr)
+
+    container = _SpyContainer(['{"type":"turn.completed"}'], 0)
+    execute_mod._stream_cold_attempt(container, _FakeRedis(), "run-x", True)
+
+    live_calls = [c for c in calls if c["stream"]]
+    assert len(live_calls) == 1
+    assert live_calls[0]["stdout"] is True
+    assert live_calls[0]["stderr"] is False
+
+
 def test_stderr_is_fetched_once_after_exit_as_metadata_not_reply_text(monkeypatch):
     """Card 4085bf3b-9510-8181-93e0-c0eab7f88bce: mirrors 5d54968's warm-relay
     fix onto the cold path. `container.logs(stream=True, follow=True)` can't
