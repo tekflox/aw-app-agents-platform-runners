@@ -974,6 +974,35 @@ def _stream_cold_attempt(container, r, run_id: str, codex_retryable: bool,
     A `codex_retryable=False` caller (any non-codex CLI) streams unbuffered
     from the first line, byte for byte what this loop did before retry
     support existed.
+
+    Stderr (card 4085bf3b-9510-8181-93e0-c0eab7f88bce): unlike the warm
+    relay's own subprocess, this path has no second OS pipe to split —
+    `container.logs(stream=True, follow=True)` merges stdout+stderr and
+    docker-py discards the per-frame stream-type tag once both are
+    requested together, so there is no way to recover which bytes were
+    stderr out of THAT call. Instead, live stdout streaming above is left
+    untouched, and once the container has exited this fetches stderr ONCE
+    more via a plain non-streaming, source-filtered `container.logs()` call
+    (the same historical-fetch shape the `raw_command` branch already uses
+    against this same podman socket) and publishes it as `cli.stderr`
+    metadata — never concatenated into a line a caller might treat as reply
+    text. This trades away *live* stderr (acceptable: nothing was reading it
+    live, and today it actively corrupts the reply) for *recoverable*
+    stderr on a normal exit. The one case this does NOT cover is a
+    hard-killed container: this app's own kill path is `abort_job`, which
+    runs synchronously in the HTTP-handler thread and removes the container
+    right after signalling it — usually before this function (running in a
+    separate worker thread, still blocked on the log stream) gets here. So
+    `abort_job` fetches stderr itself, before it removes anything — see its
+    own comment. This function's fetch below is still the one that matters
+    for every other abnormal exit (non-zero exit, this app's own retry
+    giving up) and is harmless best-effort if a kill already removed the
+    container first (degrades to nothing captured, never raises).
+
+    Container cleanup is explicit here (`container.remove(force=True)`)
+    because the kwargs that spawn this container now set `remove=False` —
+    `remove=True` would let the engine auto-remove it the instant it exits,
+    racing this very fetch.
     """
     buf = ""
     live = False
@@ -981,47 +1010,57 @@ def _stream_cold_attempt(container, r, run_id: str, codex_retryable: bool,
     buffered_lines: list[str] = []
     saw_rollout_signature = False
     saw_rate_limit_signature = False
-    for raw in container.logs(stream=True, follow=True):
-        buf += raw.decode("utf-8", errors="replace")
-        while "\n" in buf:
-            line, buf = buf.split("\n", 1)
-            if not line.strip():
-                continue
-            if not auth_revoked_logged and any(
-                    sig in line for sig in _CODEX_AUTH_REVOKED_SIGNATURES):
-                auth_revoked_logged = True
-                log.warning(
-                    "execute: run=%s codex reports its OAuth refresh_token was "
-                    "revoked/invalidated — $CODEX_HOME/auth.json needs a fresh "
-                    "login; every further codex turn against this shared home "
-                    "will fail identically until it is resynced. First "
-                    "offending line: %s", run_id, line[:500])
-            if live:
-                _publish_line(r, run_id, line)
-                continue
-            if codex_retryable and _is_codex_rate_limit_exhaustion(line):
-                saw_rate_limit_signature = True
-                buffered_lines.append(line)
-                continue
-            if codex_retryable and _CODEX_ROLLOUT_ERROR_SIGNATURE in line:
-                saw_rollout_signature = True
-                buffered_lines.append(line)
-                continue
-            if codex_retryable and (
-                    any(sig in line for sig in _CODEX_SESSION_HANDSHAKE_SIGNATURES)
-                    or any(sig in line for sig in _CODEX_PREAMBLE_SIGNATURES)):
-                buffered_lines.append(line)
-                continue
-            live = True
-            for held in buffered_lines:
-                _publish_line(r, run_id, held)
-            buffered_lines = []
-            _publish_line(r, run_id, line)
     try:
-        status = container.wait()
-        returncode = int(status.get("StatusCode", 1)) if isinstance(status, dict) else int(status)
-    except Exception:
-        returncode = 0
+        for raw in container.logs(stream=True, follow=True):
+            buf += raw.decode("utf-8", errors="replace")
+            while "\n" in buf:
+                line, buf = buf.split("\n", 1)
+                if not line.strip():
+                    continue
+                if not auth_revoked_logged and any(
+                        sig in line for sig in _CODEX_AUTH_REVOKED_SIGNATURES):
+                    auth_revoked_logged = True
+                    log.warning(
+                        "execute: run=%s codex reports its OAuth refresh_token was "
+                        "revoked/invalidated — $CODEX_HOME/auth.json needs a fresh "
+                        "login; every further codex turn against this shared home "
+                        "will fail identically until it is resynced. First "
+                        "offending line: %s", run_id, line[:500])
+                if live:
+                    _publish_line(r, run_id, line)
+                    continue
+                if codex_retryable and _is_codex_rate_limit_exhaustion(line):
+                    saw_rate_limit_signature = True
+                    buffered_lines.append(line)
+                    continue
+                if codex_retryable and _CODEX_ROLLOUT_ERROR_SIGNATURE in line:
+                    saw_rollout_signature = True
+                    buffered_lines.append(line)
+                    continue
+                if codex_retryable and (
+                        any(sig in line for sig in _CODEX_SESSION_HANDSHAKE_SIGNATURES)
+                        or any(sig in line for sig in _CODEX_PREAMBLE_SIGNATURES)):
+                    buffered_lines.append(line)
+                    continue
+                live = True
+                for held in buffered_lines:
+                    _publish_line(r, run_id, held)
+                buffered_lines = []
+                _publish_line(r, run_id, line)
+    finally:
+        # Guaranteed even if the loop above raised (e.g. the log stream
+        # itself broke mid-attempt) — otherwise `remove=False` would leak
+        # this container forever instead of the engine auto-cleaning it up.
+        try:
+            status = container.wait()
+            returncode = int(status.get("StatusCode", 1)) if isinstance(status, dict) else int(status)
+        except Exception:
+            returncode = 0
+        _fetch_and_publish_cli_stderr(container, r, run_id)
+        try:
+            container.remove(force=True)
+        except Exception:
+            pass  # already gone (e.g. force-removed by an abort) — fine
 
     if codex_retryable and not live and saw_rate_limit_signature:
         reason = "rate_limit"
@@ -1084,8 +1123,12 @@ def _run_cold_agent_with_retry(client, image, kwargs: dict, container, run_id: s
                          "429 rate-limit exhaustion" if reason == "rate_limit"
                          else "rollout-contention")
                 break
-            # The previous attempt's container already exited (self-removes,
-            # remove=True for a non-raw_command job).
+            # The previous attempt's container already exited AND has already
+            # been explicitly removed by _stream_cold_attempt itself (which
+            # fetches its stderr before doing so) — remove=False now, so
+            # nothing auto-cleans it; this respawn's `name` is free only
+            # because that removal already ran synchronously, before
+            # _stream_cold_attempt returned.
             if reason == "rate_limit":
                 _codex_429_cooldown_arm(r)
                 backoff = _CODEX_RATE_LIMIT_RETRY_BACKOFF_S[
@@ -1260,6 +1303,33 @@ def _publish_line(r, run_id: str, line: str) -> None:
         r.xadd(_stream_key(run_id), {"line": line}, maxlen=STREAM_MAXLEN, approximate=True)
     except Exception:
         log.exception("execute: publish_line failed run=%s", run_id)
+
+
+def _publish_stderr_line(r, run_id: str, text: str) -> None:
+    """Codex/CLI diagnostics as metadata, never as reply text — mirrors
+    aw-warm-relay-codex.py's own `_publish_stderr_line` (commit 5d54968),
+    the proven pattern this mirrors onto the cold path."""
+    _publish_line(r, run_id, json.dumps({"type": "cli.stderr", "text": text}))
+
+
+def _fetch_and_publish_cli_stderr(container, r, run_id: str) -> None:
+    """Best-effort: read whatever stderr the container still has and publish
+    it as `cli.stderr` metadata. Safe to call on a container that has
+    already exited, already been killed, or already been removed by
+    something else racing this call — every one of those degrades to
+    "nothing captured" rather than raising. See `_stream_cold_attempt`'s
+    docstring for why this is the recoverable half of the stderr story, and
+    `abort_job` for the half this alone cannot cover (a hard kill racing its
+    own removal of the container)."""
+    try:
+        raw = container.logs(stdout=False, stderr=True, stream=False)
+        text = raw.decode("utf-8", errors="replace") if isinstance(raw, (bytes, bytearray)) else str(raw)
+    except Exception:
+        log.warning("execute: could not fetch stderr for run=%s (container may "
+                    "already be gone)", run_id, exc_info=True)
+        return
+    if text.strip():
+        _publish_stderr_line(r, run_id, text)
 
 
 def _publish_done(r, run_id: str, returncode: int) -> None:
@@ -2406,7 +2476,13 @@ def _build_container_kwargs(job: dict, client=None) -> tuple[str, list[str], dic
         "environment": env,
         "volumes": volumes,
         "detach": True,
-        "remove": True,
+        # NOT remove=True — _stream_cold_attempt needs the container to
+        # still exist after it exits, to fetch its stderr (as `cli.stderr`
+        # metadata, card 4085bf3b-9510-8181-93e0-c0eab7f88bce) without
+        # racing engine-side auto-removal. Same reasoning as the
+        # raw_command branch's own `remove=False` above. _stream_cold_attempt
+        # removes it explicitly once it's done.
+        "remove": False,
         "privileged": False,
         "stdin_open": False,
         "tty": False,
@@ -3152,6 +3228,19 @@ def abort_job(run_id: str, redis_url: str | None = None, *,
                 # force-remove below is still worth doing.
                 log.info("execute: abort run=%s — %s did not take a kill signal "
                          "(already exiting?)", run_id, name, exc_info=True)
+            # A CLI-agent cold container's OWN post-exit stderr fetch
+            # (_stream_cold_attempt, card 4085bf3b-9510-8181-93e0-c0eab7f88bce)
+            # runs in a different thread that is still blocked reading the
+            # log stream right now — the force-remove a few lines below runs
+            # synchronously in THIS thread and usually wins that race,
+            # removing the container before that other thread ever gets to
+            # fetch it. So on a hard kill specifically, fetch stderr HERE,
+            # before anything removes the container — this is the only
+            # ordering that cannot race itself. Scoped to this one name
+            # prefix (not warm, not a raw_command monitor run) because this
+            # fix's whole scope is the CLI-agent cold spawn path.
+            if name.startswith("aw-runner-run-") and r is not None:
+                _fetch_and_publish_cli_stderr(container, r, run_id)
             # A warm container is the ONLY case where this process owes the
             # stream its terminal sentinel: the relay inside it publishes
             # `done` for every turn and we just killed the relay, so nothing

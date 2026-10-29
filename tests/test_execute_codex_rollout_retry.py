@@ -77,17 +77,35 @@ class _FakeContainer:
     """`.logs(stream=True, follow=True)` yields raw byte CHUNKS, not lines —
     _stream_cold_attempt does its own newline buffering. One chunk per line
     is the simplest faithful stand-in (matches how test_execute_raw_command.py
-    and friends treat the docker-py container object as a bare test double)."""
+    and friends treat the docker-py container object as a bare test double).
 
-    def __init__(self, lines: list[str], rc: int):
+    `stderr_lines` and `.remove()` back card
+    4085bf3b-9510-8181-93e0-c0eab7f88bce's post-exit stderr fetch:
+    `stream=False` returns the stdout/stderr-filtered non-streaming blob the
+    real SDK would, exactly like the `raw_command` branch already relies on
+    against this same podman socket."""
+
+    def __init__(self, lines: list[str], rc: int, stderr_lines: list[str] | None = None):
         self._chunks = [(l + "\n").encode() for l in lines]
         self._rc = rc
+        self._stderr = "\n".join(stderr_lines or []).encode()
+        self.remove_calls = 0
 
-    def logs(self, stream=True, follow=True):
-        return iter(self._chunks)
+    def logs(self, stream=True, follow=True, stdout=True, stderr=False):
+        if stream:
+            return iter(self._chunks)
+        parts = []
+        if stdout:
+            parts.append(b"".join(self._chunks))
+        if stderr:
+            parts.append(self._stderr)
+        return b"".join(parts)
 
     def wait(self):
         return {"StatusCode": self._rc}
+
+    def remove(self, force=False):
+        self.remove_calls += 1
 
 
 def _publish_capture(monkeypatch):
@@ -104,6 +122,85 @@ def test_ordinary_attempt_streams_live(monkeypatch):
     assert rc == 0
     assert reason is None
     assert published == ['{"type":"thread.started"}', '{"type":"turn.completed"}']
+
+
+def test_stderr_is_fetched_once_after_exit_as_metadata_not_reply_text(monkeypatch):
+    """Card 4085bf3b-9510-8181-93e0-c0eab7f88bce: mirrors 5d54968's warm-relay
+    fix onto the cold path. `container.logs(stream=True, follow=True)` can't
+    separate stdout/stderr (docker-py discards the frame's stream-type tag
+    once both are requested together), so the fix is a second, non-streaming,
+    source-filtered fetch once the container has exited — never merged into
+    a line a caller might treat as reply text."""
+    published = _publish_capture(monkeypatch)
+    banner = "HTTP 403 / 携程旅行网"
+    container = _FakeContainer(['{"type":"turn.completed"}'], 0, stderr_lines=[banner])
+    rc, reason = execute_mod._stream_cold_attempt(container, _FakeRedis(), "run-x", True)
+    assert rc == 0
+    assert reason is None
+    assert published[0] == '{"type":"turn.completed"}'
+    assert banner not in published[0]
+    stderr_events = [json.loads(p) for p in published if json.loads(p).get("type") == "cli.stderr"]
+    assert stderr_events == [{"type": "cli.stderr", "text": banner}]
+
+
+def test_container_is_removed_after_the_attempt(monkeypatch):
+    """`remove=False` now (so the stderr fetch above can't race engine-side
+    auto-removal) — _stream_cold_attempt must clean the container up itself."""
+    _publish_capture(monkeypatch)
+    container = _FakeContainer(['{"type":"turn.completed"}'], 0)
+    execute_mod._stream_cold_attempt(container, _FakeRedis(), "run-x", True)
+    assert container.remove_calls == 1
+
+
+def test_stderr_fetch_failure_degrades_to_nothing_captured(monkeypatch):
+    """A container already removed (e.g. raced by an abort) must not crash
+    the stream — fetching its stderr just comes back empty."""
+    published = _publish_capture(monkeypatch)
+
+    class _GoneContainer(_FakeContainer):
+        def logs(self, stream=True, follow=True, stdout=True, stderr=False):
+            if stream:
+                return iter(self._chunks)
+            raise RuntimeError("no such container")
+
+    container = _GoneContainer(['{"type":"turn.completed"}'], 0)
+    rc, _reason = execute_mod._stream_cold_attempt(container, _FakeRedis(), "run-x", True)
+    assert rc == 0
+    assert published == ['{"type":"turn.completed"}']
+
+
+def test_each_retry_attempts_container_is_removed_before_the_next_spawn(monkeypatch):
+    """End-to-end over _run_cold_agent_with_retry: every attempt's own
+    container — including the ones that get retried away — must be removed,
+    since remove=False means nothing else will."""
+    _publish_capture(monkeypatch)
+    monkeypatch.setattr(execute_mod.time, "sleep", lambda _s: None)
+
+    made: list[_FakeContainer] = []
+
+    def _make(lines, rc):
+        c = _FakeContainer(lines, rc)
+        made.append(c)
+        return c
+
+    attempts = iter([
+        _make([ROLLOUT_ERROR], 1),
+        _make(['{"type":"turn.completed"}'], 0),
+    ])
+    first_container = next(attempts)
+
+    class _FakeContainers:
+        def run(self, _image, **_kwargs):
+            return next(attempts)
+
+    class _FakeClient:
+        containers = _FakeContainers()
+
+    returncode = execute_mod._run_cold_agent_with_retry(
+        _FakeClient(), "img", {}, first_container, "run-x", _FakeRedis(), True)
+
+    assert returncode == 0
+    assert [c.remove_calls for c in made] == [1, 1]
 
 
 def test_contention_hit_publishes_nothing_when_a_retry_follows(monkeypatch):

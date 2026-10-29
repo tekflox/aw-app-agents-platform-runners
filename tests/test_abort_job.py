@@ -16,6 +16,7 @@ Same reasoning as tests/test_warm_raw_prompt_forwarded.py's own note.
 """
 from __future__ import annotations
 
+import json
 import sys
 from pathlib import Path
 from types import ModuleType
@@ -115,6 +116,9 @@ def engine(monkeypatch):
             self.hard_kill_at_kill: list[bool] = []
             self.redis: _FakeRedis | None = None
             self.run_id = ""
+            #: container name -> stderr bytes a test wants `.logs()` to
+            #: return — unset means b"" (every pre-existing test, unaffected).
+            self.stderr: dict[str, bytes] = {}
 
     engine = _Engine()
 
@@ -124,6 +128,8 @@ def engine(monkeypatch):
             if name not in engine.alive:
                 raise RuntimeError(f"no such container: {name}")
             container = _FakeContainer(name, engine.log)
+            container.logs = lambda stdout=True, stderr=False, stream=False: (
+                engine.stderr.get(name, b""))
             original_kill = container.kill
 
             def _kill():
@@ -352,6 +358,71 @@ def test_the_hard_kill_marker_is_not_set_when_nothing_was_found(engine, monkeypa
     assert r.get(execute_mod._hard_kill_key("run-hk-3")) is None
 
 
+# ---------------------------------------------------------------------------
+# Stderr on the hard-kill path (card 4085bf3b-9510-8181-93e0-c0eab7f88bce)
+# ---------------------------------------------------------------------------
+#
+# _stream_cold_attempt's own post-exit stderr fetch runs in a different
+# thread that is usually still blocked on the log stream when abort_job's
+# force-remove below fires — so abort_job has to fetch stderr itself, before
+# removing anything, for this to be recoverable at all on a hard kill.
+
+def test_abort_fetches_stderr_before_removing_a_cold_cli_container(engine, monkeypatch):
+    """Mutation: move the stderr fetch after `container.remove(force=True)`
+    (or drop it) and this fails — a hard-killed run would then lose its
+    stderr exactly when it matters most."""
+    execute_mod._RUN_CONTAINER_NAMES["run-stderr-1"] = "aw-runner-run-run-stderr-1"
+    engine.alive.add("aw-runner-run-run-stderr-1")
+    engine.stderr["aw-runner-run-run-stderr-1"] = b"HTTP 403 / banner"
+
+    _result, r = _abort(engine, monkeypatch, "run-stderr-1")
+
+    published = [json.loads(fields["line"]) for fields in r.published]
+    stderr_events = [p for p in published if p.get("type") == "cli.stderr"]
+    assert stderr_events == [{"type": "cli.stderr", "text": "HTTP 403 / banner"}]
+    # kill, then the fetch (not itself in engine.log), then remove — the
+    # ordering that makes the fetch race-free.
+    assert engine.log == ["kill:aw-runner-run-run-stderr-1",
+                          "remove:aw-runner-run-run-stderr-1"]
+
+
+def test_abort_does_not_fetch_stderr_for_a_warm_or_monitor_container(engine, monkeypatch):
+    """Scoped to the CLI-agent cold path only — a warm container's stderr is
+    already handled live by the relay (5d54968), and a monitor run's stderr
+    is this card's declared out-of-scope (raw_command, untouched)."""
+    execute_mod._RUN_CONTAINER_NAMES["run-warm-1"] = "aw-warm-agent-sess"
+    engine.alive.add("aw-warm-agent-sess")
+    engine.stderr["aw-warm-agent-sess"] = b"should never be fetched here"
+
+    _result, r = _abort(engine, monkeypatch, "run-warm-1")
+
+    assert not any(json.loads(fields["line"]).get("type") == "cli.stderr"
+                   for fields in r.published if "line" in fields)
+
+
+def test_abort_stderr_fetch_failure_does_not_block_the_kill(engine, monkeypatch):
+    """A container that won't answer `.logs()` (already gone, engine hiccup)
+    must not stop the kill/remove from completing."""
+    execute_mod._RUN_CONTAINER_NAMES["run-stderr-2"] = "aw-runner-run-run-stderr-2"
+    engine.alive.add("aw-runner-run-run-stderr-2")
+
+    class _Containers:
+        def get(self, name):
+            engine.looked_up.append(name)
+            container = _FakeContainer(name, engine.log)
+            container.logs = lambda **_kw: (_ for _ in ()).throw(RuntimeError("gone"))
+            return container
+
+    sys.modules["docker"].DockerClient = lambda **_kw: type(
+        "C", (), {"containers": _Containers()})()
+
+    result, _r = _abort(engine, monkeypatch, "run-stderr-2")
+
+    assert result["status"] == "killed"
+    assert engine.log == ["kill:aw-runner-run-run-stderr-2",
+                          "remove:aw-runner-run-run-stderr-2"]
+
+
 def test_the_codex_retry_loop_does_not_respawn_an_aborted_run(monkeypatch):
     """Trap 2 from the design: `_run_cold_agent_with_retry` respawns a fresh
     container between attempts, so an abort landing in that window would kill
@@ -566,13 +637,22 @@ def test_a_cold_run_is_killable_from_the_moment_it_spawns_and_forgotten_after(
     class _Container:
         name = "aw-runner-run-run-16"
 
-        def logs(self, **_kw):
-            # Mid-run: exactly when an /abort would arrive.
+        def logs(self, stream=True, **_kw):
+            # Mid-run: exactly when an /abort would arrive. Called twice now
+            # — the live stdout stream, then _stream_cold_attempt's own
+            # post-exit stderr-only fetch (card
+            # 4085bf3b-9510-8181-93e0-c0eab7f88bce) — the container must
+            # still be registered as killable for BOTH, not just the first.
             during.append(execute_mod.lookup_container(r, "run-16"))
+            if not stream:
+                return b""
             return iter([b'{"type":"result"}\n'])
 
         def wait(self):
             return {"StatusCode": 0}
+
+        def remove(self, force=False):
+            pass
 
     class _Images:
         def pull(self, _image):
@@ -595,7 +675,7 @@ def test_a_cold_run_is_killable_from_the_moment_it_spawns_and_forgotten_after(
     execute_mod._run_job_blocking({"run_id": "run-16", "cli": "claude", "prompt": "hi"},
                                   "redis://fake")
 
-    assert during == ["aw-runner-run-run-16"]
+    assert during == ["aw-runner-run-run-16", "aw-runner-run-run-16"]
     assert execute_mod.lookup_container(r, "run-16") is None
     assert execute_mod.is_aborted(r, "run-16") is False
 
