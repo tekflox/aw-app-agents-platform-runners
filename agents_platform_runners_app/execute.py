@@ -165,7 +165,51 @@ ISOLATED_KEEP_SECONDS = int(os.environ.get("AW_RUNNER_ISOLATED_KEEP_SECONDS") or
 #: differing. Averaging the directory sizes hides it; it is a 180x spread.
 #: Scratch by definition, recreated on demand, and the shared home's own
 #: `tmp` sits at 28 KB — nothing reads the copied one.
-CREDS_COPY_IGNORE = ("isolated", "sessions", "cache", ".tmp", "tmp", "packages")
+#:
+#: `app-server-control`, `app-server-daemon` joined 2026-10-28: codex
+#: 0.147's app-server daemon leaves live Unix-domain sockets in these dirs
+#: (`app-server-control/app-server-control.sock`,
+#: `app-server-daemon/daemon-updater.sock`) and `shutil.copytree` raises
+#: `shutil.Error` (Errno 6, sockets can't be copied) the instant it tries —
+#: see `_creds_copy_ignore` below for why a fourth named entry is not where
+#: this actually gets fixed.
+#:
+#: `openai-curated-remote` joined the same day: this is
+#: `plugins/cache/openai-curated-remote/`, where codex caches the ChatGPT
+#: account's curated remote connectors (Tripadvisor, GitHub, Notion, ...).
+#: Already shadowed by the `cache` entry above at that exact nesting, named
+#: here explicitly anyway so a future reorg of `plugins/` can't silently
+#: resurrect it — a headless runner job has no business copying, let alone
+#: dialing, a third party's MCP endpoint on the shared account's OAuth.
+CREDS_COPY_IGNORE = ("isolated", "sessions", "cache", ".tmp", "tmp", "packages",
+                      "app-server-control", "app-server-daemon", "openai-curated-remote")
+
+
+def _creds_copy_ignore(directory: str, names: list[str]) -> set[str]:
+    """``ignore`` callback for every per-run creds ``shutil.copytree`` below.
+
+    Layers a file-TYPE check on top of CREDS_COPY_IGNORE's name-based
+    exclusions. Codex has broken this copy three different ways now — a
+    duplicated plugins git checkout, an ENOSPC-inducing package-release
+    tree, and now the Unix-domain sockets its app-server daemon leaves in
+    the live home (Errno 6, sockets can't be copied) — and the first two
+    needed naming the specific directory while the third didn't have to:
+    nothing a CLI's creds directory legitimately holds is a socket, FIFO,
+    or device node, so skip anything that is not a regular file, a
+    directory, or a symlink, BY TYPE, so the next thing codex's daemon
+    invents doesn't need its own named entry here either.
+    """
+    ignored = set(shutil.ignore_patterns(*CREDS_COPY_IGNORE)(directory, names))
+    for name in names:
+        if name in ignored:
+            continue
+        try:
+            mode = os.lstat(os.path.join(directory, name)).st_mode
+        except OSError:
+            continue
+        if not (stat.S_ISDIR(mode) or stat.S_ISREG(mode) or stat.S_ISLNK(mode)):
+            ignored.add(name)
+    return ignored
 
 
 def _reap_isolated_dirs(parent: "Path") -> None:
@@ -1395,7 +1439,7 @@ def _sync_home_creds_into_workspace(real_home: Path, spec: dict) -> None:
         dst = Path(WORKSPACE_CONTAINER_DIR) / rel
         try:
             if src.is_dir():
-                shutil.copytree(src, dst, dirs_exist_ok=True)
+                shutil.copytree(src, dst, dirs_exist_ok=True, ignore=_creds_copy_ignore)
             elif src.is_file():
                 dst.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(src, dst)
@@ -1622,6 +1666,11 @@ def _strip_stale_identity_headers(headers: dict | None) -> dict:
 
 
 _TOML_TABLE_HEADER_RE = re.compile(r"^\s*\[{1,2}\s*([^\[\]]+?)\s*\]{1,2}\s*(?:#.*)?$")
+#: Matches the dotted-key form _render_codex_config_toml injects
+#: (``features.plugins = ...`` / ``features.remote_plugin = ...``) so a
+#: second pass over its own output can strip and re-force them instead of
+#: redefining the same root key twice (TOML rejects that).
+_FEATURES_DOTTED_RE = re.compile(r"^\s*features\.(plugins|remote_plugin)\s*=")
 
 
 def _render_codex_config_toml(base_text: str, mcp_servers: dict) -> str:
@@ -1661,18 +1710,43 @@ def _render_codex_config_toml(base_text: str, mcp_servers: dict) -> str:
     ``CODEX_WARM_TOKEN_ENV_VAR``, unchanged from _patch_codex_warm_token_headers
     (see _strip_stale_identity_headers for which per-turn headers are still
     dropped from the static table, and why X-Aw-Caller-Run-Id no longer is).
+
+    Also forces ``features.plugins = false`` and ``features.remote_plugin =
+    false`` — codex 0.147 initializes MCP clients for the ChatGPT account's
+    cached remote connectors (Tripadvisor, GitHub, Notion, ...) in
+    ``~/.codex/plugins/cache/openai-curated-remote/`` at startup even with
+    ``--disable apps`` on the argv (that flag only covers codex's native
+    Apps/connectors system, a different switch — see CLI_SPECS["codex"]'s
+    own comment). Per-plugin ``enabled = false`` is unreliable upstream
+    (openai/codex#28443, #38185); ``features.plugins = false`` is the one
+    confirmed-working global kill switch, and a headless runner job has no
+    legitimate use for ANY codex plugin, local or remote. Written as
+    dotted keys at the very TOP of the file, before any ``[table]`` header
+    — codex has a documented quirk where a ``features.*`` key placed AFTER
+    a table section is silently folded into that table instead of the root
+    (reproduces on 0.147.0), and this function's own base_text may carry
+    ``[projects.*]`` tables ahead of where a naively-appended line would
+    land. Existing ``features.plugins``/``features.remote_plugin`` dotted
+    lines or a ``[features]`` table in ``base_text`` are stripped first, so
+    reapplying this function to its own output stays idempotent (TOML
+    rejects a redefined key).
     """
     kept: list[str] = []
     in_mcp_table = False
+    in_features_table = False
     for line in base_text.splitlines():
         m = _TOML_TABLE_HEADER_RE.match(line)
         if m:
             table = m.group(1)
             in_mcp_table = table == "mcp_servers" or table.startswith("mcp_servers.")
-        if not in_mcp_table:
-            kept.append(line)
+            in_features_table = table == "features" or table.startswith("features.")
+        if in_mcp_table or in_features_table:
+            continue
+        if _FEATURES_DOTTED_RE.match(line):
+            continue
+        kept.append(line)
 
-    out = "\n".join(kept).rstrip("\n")
+    out = "features.plugins = false\nfeatures.remote_plugin = false\n\n" + "\n".join(kept).rstrip("\n")
     for name, cfg in (mcp_servers or {}).items():
         url = cfg.get("url")
         if not url:
@@ -1699,6 +1773,40 @@ def _render_codex_config_toml(base_text: str, mcp_servers: dict) -> str:
         out += (f"\n[mcp_servers.{key}.env_http_headers]\n"
                 f'"X-Aw-Warm-Token" = "{CODEX_WARM_TOKEN_ENV_VAR}"\n')
     return out.lstrip("\n") + "\n"
+
+
+class CodexScopeRenderError(RuntimeError):
+    """Raised when this run's own scoped codex MCP config could not be
+    rendered to disk — see ``_render_scoped_codex_config_or_raise``.
+    Propagates out of ``_build_container_kwargs`` (caught, logged and
+    turned into a loud ``spawn_error`` result by its callers) instead of
+    being swallowed, so the run fails visibly rather than silently falling
+    back to the shared, unscoped config.toml — the exact regression armed
+    2026-10-28 when codex 0.147's sockets started making creds staging
+    fail open."""
+
+
+def _render_scoped_codex_config_or_raise(
+        *, run_id: str, rendered_path: "Path", base_config_path: "Path",
+        mcp_servers: dict) -> None:
+    """Write THIS run's own scoped codex config.toml to ``rendered_path``,
+    rendered from whatever ``base_config_path`` currently holds (the
+    EFFECTIVE codex home for whichever of the three mount paths
+    ``_build_container_kwargs`` is using — staged, live-mount fallback, or
+    legacy copy; see its callers). Raises ``CodexScopeRenderError`` on any
+    failure instead of logging and continuing: a run that cannot prove its
+    MCP scope must not spawn at all, rather than spawn against the shared
+    unscoped config.toml every codex agent on this host reads otherwise.
+    """
+    try:
+        base_text = base_config_path.read_text() if base_config_path.is_file() else ""
+        rendered_path.write_text(_render_codex_config_toml(base_text, mcp_servers))
+        rendered_path.chmod(0o666)
+    except Exception as exc:
+        raise CodexScopeRenderError(
+            f"execute: could not render this run's scoped codex MCP config "
+            f"(run={run_id}, file={rendered_path}) — refusing to fall back "
+            f"to the shared, unscoped config.toml") from exc
 
 
 def _git_creds_volumes() -> dict[str, dict]:
@@ -1992,7 +2100,7 @@ def _build_container_kwargs(job: dict, client=None) -> tuple[str, list[str], dic
             if creds_copy.exists():
                 shutil.rmtree(creds_copy, ignore_errors=True)
             shutil.copytree(_real_home / creds_dir, creds_copy,
-                            ignore=shutil.ignore_patterns(*CREDS_COPY_IGNORE))
+                            ignore=_creds_copy_ignore)
             if cli == "codex" and (creds_copy / "config.toml").is_file():
                 # So a brand-new shared $CODEX_HOME inherits the warm-token
                 # header patch the first time it's ever populated from this
@@ -2055,6 +2163,22 @@ def _build_container_kwargs(job: dict, client=None) -> tuple[str, list[str], dic
             _mount_abs(f"{_home}/{creds_file}", f"/home/ubuntu/{creds_file}", ro=False)
         # Isolated cwd already lives inside the whole-.claude mount above — no
         # separate mount (matches docker_agent.py).
+        if cli == "codex":
+            # THIS is the path every codex run falls through to today
+            # whenever creds staging fails (the 2026-10-28 socket
+            # regression) — it mounts the LIVE ~/.codex straight in, with
+            # no per-agent scoping at all. Render and bind the same scoped
+            # override the staged branch gets, over the LIVE config.toml
+            # this branch just mounted rw, so scope never depends on
+            # staging having worked. Also restores env_http_headers'
+            # warm-token indirection, which the live config lacks.
+            _rendered = isolated_host_dir / "codex-config.toml"
+            _render_scoped_codex_config_or_raise(
+                run_id=run_id, rendered_path=_rendered,
+                base_config_path=_real_home / creds_dir / "config.toml",
+                mcp_servers=mcp_servers)
+            _mount_abs(str(_rendered).replace(str(_real_home), _home, 1),
+                       f"/home/ubuntu/{creds_dir}/config.toml", ro=True)
     else:
         # Fallback — $HOME has no separate host bind-mount, so its host path is
         # unknown to the podman daemon and can't be a sibling-mount source.
@@ -2070,6 +2194,18 @@ def _build_container_kwargs(job: dict, client=None) -> tuple[str, list[str], dic
             _cred_file = f"{creds_dir}/.credentials.json"
             if (Path(WORKSPACE_CONTAINER_DIR) / _cred_file).is_file():
                 _mount(_cred_file, f"/home/ubuntu/{_cred_file}", ro=True)
+            if cli == "codex":
+                # Legacy-copy counterpart of the live-mount branch above —
+                # same reasoning, scoped over the WORKSPACE-TREE copy of
+                # config.toml _sync_home_creds_into_workspace just synced,
+                # since that's the effective home this branch mounted.
+                _rendered = isolated_host_dir / "codex-config.toml"
+                _render_scoped_codex_config_or_raise(
+                    run_id=run_id, rendered_path=_rendered,
+                    base_config_path=Path(WORKSPACE_CONTAINER_DIR) / creds_dir / "config.toml",
+                    mcp_servers=mcp_servers)
+                _mount(f"{isolated_rel}/codex-config.toml",
+                       f"/home/ubuntu/{creds_dir}/config.toml", ro=True)
         if creds_file and (Path(WORKSPACE_CONTAINER_DIR) / creds_file).is_file():
             _mount(creds_file, f"/home/ubuntu/{creds_file}", ro=True)
         # Isolated run cwd (rw — the CLI writes its own session/project state here)
@@ -2442,22 +2578,21 @@ def _build_container_kwargs(job: dict, client=None) -> tuple[str, list[str], dic
             # not a repointed $CODEX_HOME — auth.json, the rollouts and
             # state_*.sqlite all live in that same dir and codex loses its
             # login (and every resumable thread) the moment they move.
+            # Fail CLOSED (2026-10-30): this used to catch-and-log and let
+            # the run proceed against the shared, unscoped config.toml —
+            # exactly the behaviour of every run before the 2026-09-08 fix.
+            # That silent widening is the failure mode this whole card
+            # exists to remove; a run that cannot prove its scope must not
+            # spawn at all. _render_scoped_codex_config_or_raise raises
+            # CodexScopeRenderError, which propagates out of this function
+            # to its callers' `except Exception` spawn-error handling.
             _rendered = isolated_host_dir / "codex-config.toml"
-            try:
-                _base = _home_abs / "config.toml"
-                _base_text = _base.read_text() if _base.is_file() else ""
-                _rendered.write_text(_render_codex_config_toml(_base_text, mcp_servers))
-                _rendered.chmod(0o666)
-                _mount_abs(f"{_host_creds}/codex-config.toml",
-                           f"{staged_home}/config.toml", ro=True)
-            except Exception:
-                # Fail OPEN rather than kill the run: without the override codex
-                # falls back to the shared config.toml, i.e. exactly the
-                # behaviour of every run before this fix. Loud, because that
-                # behaviour is the leak.
-                log.exception("execute: could not render a scoped codex config for "
-                              "run=%s — falling back to the SHARED config.toml, "
-                              "which is NOT scoped to this agent", run_id)
+            _render_scoped_codex_config_or_raise(
+                run_id=run_id, rendered_path=_rendered,
+                base_config_path=_home_abs / "config.toml",
+                mcp_servers=mcp_servers)
+            _mount_abs(f"{_host_creds}/codex-config.toml",
+                       f"{staged_home}/config.toml", ro=True)
         if spec.get("home_env"):
             env[spec["home_env"]] = staged_home
         _inner = " ".join(shlex.quote(a) for a in argv)

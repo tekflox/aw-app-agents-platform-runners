@@ -21,6 +21,7 @@ import uuid
 import httpx
 from fastapi import Body, Depends, FastAPI, File, Form, HTTPException, Request, UploadFile
 
+from . import codex_scope_canary as codex_scope_canary_mod
 from . import execute as execute_mod
 from . import execution_index as execution_index_mod
 from . import notion_subscription as notion_subscription_mod
@@ -160,6 +161,46 @@ def build_routes(config: dict | None = None, *, kanban_sweep_status: dict | None
         except Exception as exc:  # noqa: BLE001 — surfaced as an error, never as []
             raise HTTPException(502, f"could not list warm containers: {exc}") from exc
         return {"warm_enabled": warm_pool.enabled(), "containers": containers}
+
+    @app.get("/codex-scope-canary/doctor")
+    async def codex_scope_canary_doctor() -> dict:
+        """``contributes.doctor`` entry automating card
+        4085bf3b-9510-81ba-adc3-fee01f6cee37's own acceptance criterion:
+        spawn a throwaway no-MCP codex job and assert the gateway logged
+        no `/mcp` traffic while it ran. Deliberately NOT cheap — see
+        codex_scope_canary.py's own docstring for why nothing calls this
+        proactively and why a red result means "go look", not
+        self-sufficient proof (the gateway's access log has no per-run
+        attribution to check against instead)."""
+        if not execute_mod.CONTAINER_SOCKET:
+            return {"ok": False, "detail": {"problems": [
+                "AW_CONTAINER_SOCKET is not set — this workspace has no container "
+                "engine available to run the canary"]}}
+        import docker as docker_sdk
+        try:
+            client = docker_sdk.DockerClient(base_url="unix://" + execute_mod.CONTAINER_SOCKET)
+        except Exception as exc:  # noqa: BLE001
+            return {"ok": False, "detail": {"problems": [
+                f"could not reach the container engine: {exc}"]}}
+
+        try:
+            result = codex_scope_canary_mod.run_canary(client)
+        except Exception as exc:  # noqa: BLE001 — e.g. the gateway container itself is gone
+            return {"ok": False, "detail": {"problems": [
+                f"the canary could not even check the gateway's own logs: {exc}"]}}
+
+        problems = []
+        if result.get("error"):
+            problems.append(f"the canary codex job itself failed to run: {result['error']}")
+        elif result.get("gateway_mcp_access_lines"):
+            lines = result["gateway_mcp_access_lines"]
+            problems.append(
+                f"a codex job declaring NO MCP servers ran while the gateway logged "
+                f"{len(lines)} /mcp access line(s) — a no-MCP agent must open zero MCP "
+                f"transports; see detail.gateway_mcp_access_lines "
+                f"(may be a false alarm from a concurrent unrelated agent — see "
+                f"codex_scope_canary.py's own docstring)")
+        return {"ok": not problems, "detail": {**result, "problems": problems}}
 
     def _exec_index_base() -> str:
         raw = cfg.get("exec_index_url")

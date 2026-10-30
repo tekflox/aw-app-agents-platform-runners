@@ -56,6 +56,10 @@
       {
         "label": "Execution index",
         "route": "/execution-index/doctor"
+      },
+      {
+        "label": "Codex MCP scoping canary",
+        "route": "/codex-scope-canary/doctor"
       }
     ],
     "mcp": {
