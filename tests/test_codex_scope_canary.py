@@ -73,6 +73,21 @@ class _FakeClient:
             _FakeGatewayContainer(gateway_log_lines or []))
 
 
+def _stub_docker_module(monkeypatch):
+    """The route handler does a function-local ``import docker as
+    docker_sdk`` — CI's test environment does not install the real
+    ``docker`` package (only this app's own deployed runtime does), so a
+    real import fails there even though it happens to succeed in a
+    workspace sandbox with it already on the system interpreter. Same
+    ``sys.modules`` stub pattern as test_execute_raw_command.py and
+    friends use for the exact same reason."""
+    import sys
+    import types
+    fake_docker = types.ModuleType("docker")
+    fake_docker.DockerClient = lambda base_url=None: object()
+    monkeypatch.setitem(sys.modules, "docker", fake_docker)
+
+
 def _stub_build_container_kwargs(monkeypatch):
     """The canary's job construction is already covered end-to-end by
     test_codex_agent_scoped_mcp_config.py — stub it here so these tests
@@ -163,8 +178,8 @@ def test_doctor_route_is_red_without_a_container_socket(monkeypatch):
 
 
 def test_doctor_route_is_green_when_the_canary_is_clean(monkeypatch):
+    _stub_docker_module(monkeypatch)
     monkeypatch.setattr(execute_mod, "CONTAINER_SOCKET", "/var/run/fake.sock")
-    monkeypatch.setattr("docker.DockerClient", lambda base_url=None: object())
     monkeypatch.setattr(codex_scope_canary, "run_canary",
                          lambda client, **kw: {"run_id": "r-x", "ok": True,
                                                 "gateway_mcp_access_lines": [],
@@ -178,8 +193,8 @@ def test_doctor_route_is_green_when_the_canary_is_clean(monkeypatch):
 
 
 def test_doctor_route_is_red_and_names_the_leak_when_the_canary_catches_one(monkeypatch):
+    _stub_docker_module(monkeypatch)
     monkeypatch.setattr(execute_mod, "CONTAINER_SOCKET", "/var/run/fake.sock")
-    monkeypatch.setattr("docker.DockerClient", lambda base_url=None: object())
     monkeypatch.setattr(codex_scope_canary, "run_canary",
                          lambda client, **kw: {
                              "run_id": "r-y", "ok": False,
