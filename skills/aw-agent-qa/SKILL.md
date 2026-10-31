@@ -41,6 +41,7 @@ guessing keywords:
 - `mcp__aw-gateway__aw__aw_kanban__set_qa_status` — your mandatory end-of-review call, if installed
 - `mcp__aw-gateway__aw__aw_kanban__set_blocker` — call the moment you're stuck (missing tool, missing access, ambiguous ask) — check the knowledge base first, see below
 - `mcp__aw-gateway__aw__aw_kanban__add_kanban_comment` — a plain comment, no status change
+- `mcp__aw-gateway__aw__aw_kanban__set_kanban_property` — correct `is_live`/`is_deployment_needed` after you verify (or yourself perform) a release/deploy — see "Mandatory for deployable-code deliveries" below
 - `mcp__aw-gateway__aw__notion__API-retrieve-a-page` — only if you need to re-read the card's raw properties beyond what the dispatch input already gave you
 - `mcp__aw-gateway__aw__notion__API-post-search` — only as a last resort, shouldn't normally be needed
 
@@ -63,10 +64,8 @@ decisions, gotchas, and architecture notes specific to this codebase.
    (`aw-agent-coder`'s Definition of Done) is to have pushed **and deployed**
    through this repo's real CI/CD or deploy path before handing off — so
    exercise the actually-deployed/running change, not an uncommitted working
-   tree. If what you find is still sitting uncommitted or undeployed, that
-   itself is a finding: send it back with `need_human` (or straight back to
-   the coder if you're in an Agents Flow — see below) rather than testing a
-   local diff and signing off as if it shipped.
+   tree. See "Mandatory for deployable-code deliveries" below for exactly
+   what to check and do when that isn't the case yet.
 2. Where appropriate, run the existing unit test suite for the touched area,
    and write/run small automation or e2e checks (e.g. a curl smoke test
    against a REST endpoint) to confirm the feature works, not just that it
@@ -103,6 +102,62 @@ decisions, gotchas, and architecture notes specific to this codebase.
        exactly what needs to be decided.
    - If no such tools exist, report the same verdict in plain text in your
      final response instead.
+
+## Mandatory for deployable-code deliveries: commit/push, release cut, deploy by default
+
+Scope: this applies whenever the delivery touches deployable code — a
+changed file that needs a build, a restart, a release, or a running
+process to pick it up (backend/frontend source, a migration, a config file
+the app reads at runtime). It does **not** apply to a docs-only change, a
+read-only investigation, or something already applied live through an API
+call with nothing left to build or ship. This is part of standard
+validation for anything in scope, not a separate optional pass — run all
+three steps, in order, before you decide the verdict.
+
+1. **Confirm the coder actually committed and pushed.** Check `git log` /
+   `git status` on the real repo yourself — not the coder's summary. The
+   bar is a clean working tree with the reviewed diff present on the
+   pushed branch/SHA. If the code is correct but still sits uncommitted, or
+   committed but not pushed, that is **not** a scope question for
+   `need_human` — it's a plain `aw-agent-coder` Definition-of-Done gap.
+   Reject it straight back to the coder (`run_agent_async` to the coder
+   agent in an Agents Flow, or `set_qa_status(status="need_human",
+   comment=...)` naming the gap explicitly otherwise) so they finish
+   their own job. **QA does not commit or push in the coder's place** —
+   that boundary hasn't moved.
+2. **Check whether this delivery needs a release cut and/or has a pending
+   prod deploy.** Read the repo's own release/CI setup — the same
+   discovery `aw-agent-coder` is expected to do: CI/release workflow
+   config, README, `docs/` — to find out whether a push to the default
+   branch already ships it (nothing further needed), or whether it still
+   needs an explicit release (version bump + tag) and/or a separate deploy
+   step to actually reach production. A change that's pushed but still one
+   tag or one deploy away from prod is exactly as incomplete as an
+   uncommitted diff, and is part of this same check, not a different one.
+3. **Execute it by default.** Cut the release and run the deploy yourself
+   (the same actions `aw-agent-coder`'s Definition of Done already expects
+   from the coder), then verify it actually landed — CI green for that
+   exact commit, and the running container/app/version matching the new
+   commit or tag, not just a green workflow (see
+   `aw-autoskill-verify-deploy-in-container` and sibling skills for how to
+   check a live container rather than trusting the pipeline status alone).
+   Do this **without waiting for approval** — ship is the default, not an
+   ask. The one exception: the card or the dispatch instructions
+   explicitly say not to deploy without approval (e.g. a card flagged for
+   a controlled/staged rollout, an explicit Need Human gate on release).
+   In that case stop short of the deploy step, say so explicitly in your
+   verdict, and route accordingly — `ready_to_deploy` if everything else
+   passes, `need_human` if the explicit instruction itself is ambiguous.
+   If `is_live`/`is_deployment_needed` kanban properties exist on the card,
+   correct them to match what you actually verified (e.g. flip `is_live`
+   to `true` once you've confirmed the deploy yourself).
+
+Record what you found and did at each of the three steps in your
+`set_qa_status` comment — the commit SHA you verified, the version/tag you
+cut, the live check that proves the deploy landed — the same evidence
+discipline as the rest of this review. "Released and deployed" with
+nothing to back it up is not an acceptable verdict any more than "I
+confirmed it logs correctly" is.
 
 ## Delivery checklist — check every item explicitly, name the failing ones
 
@@ -219,7 +274,11 @@ your verdict back to whoever dispatched you.
 - Don't fix the bug yourself — route it via `set_qa_status(status="need_human")`
   (or plainly in your report) with a clear comment; a human decides whether
   it goes back to the dev.
-- Don't commit or push unless explicitly asked.
+- Don't commit or push the coder's feature code in their place — if it
+  isn't committed/pushed, reject it back to them (see "Mandatory for
+  deployable-code deliveries" above). Cutting a release and deploying an
+  already-pushed delivery is a different action and the default for
+  anything in that section's scope, not something that needs asking.
 
 ## Bootstrap context block
 
