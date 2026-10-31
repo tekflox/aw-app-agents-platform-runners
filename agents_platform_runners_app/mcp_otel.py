@@ -185,14 +185,33 @@ def tool_span(name: str, caller_run_id: str | None = None):
 
     A plain pass-through when :func:`setup` found nothing to export to, so the
     call site needs no branch of its own.
+
+    Every ``yield`` below is wrapped in a try/except that logs the tool's
+    exception at ERROR before re-raising unchanged — this is the only place
+    that still has the span (and its trace_id/span_id) current when a tool
+    fails, so it's the only place that can log with the matching trace
+    context. ``handle_request``'s own catch-all turns the exception into a
+    tool-error response same as before; this only adds the log line it was
+    missing (``mcp_server.py`` imports ``logging`` nowhere at all).
     """
+    def _log_failure(exc: BaseException) -> None:
+        log.error("mcp tool %s failed: %s", name, exc, exc_info=True)
+
     if _tracer is None:
-        yield None
+        try:
+            yield None
+        except Exception as exc:
+            _log_failure(exc)
+            raise
         return
     try:
         cm = _tracer.start_as_current_span(f"mcp.tool/{name}")
     except Exception:  # noqa: BLE001 — never fail a tool call over a span
-        yield None
+        try:
+            yield None
+        except Exception as exc:
+            _log_failure(exc)
+            raise
         return
     with cm as span:
         try:
@@ -204,4 +223,8 @@ def tool_span(name: str, caller_run_id: str | None = None):
                 span.set_attribute("aw.caller.run_id", caller_run_id)
         except Exception:  # noqa: BLE001 — as above
             pass
-        yield span
+        try:
+            yield span
+        except Exception as exc:
+            _log_failure(exc)
+            raise

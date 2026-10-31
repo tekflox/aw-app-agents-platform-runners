@@ -71,6 +71,59 @@ def test_tool_span_is_a_pass_through_when_disabled(monkeypatch):
         assert span is None
 
 
+def test_tool_span_logs_and_reraises_when_disabled(monkeypatch, caplog):
+    """The `_tracer is None` early-return branch (telemetry itself is
+    unavailable) must still log the failing tool at ERROR and re-raise the
+    exception unchanged — this used to swallow it with zero logging."""
+    _fresh(monkeypatch)
+    with caplog.at_level(logging.ERROR, logger=mcp_otel.__name__):
+        with pytest.raises(ValueError, match="boom"):
+            with mcp_otel.tool_span("list_runs", "run-123"):
+                raise ValueError("boom")
+
+    assert any("list_runs" in r.message and "boom" in r.message
+               for r in caplog.records)
+
+
+def test_tool_span_logs_and_reraises_with_a_real_span(monkeypatch, caplog):
+    """With the SDK wired up, a tool failure must be logged while the span is
+    still current, and the exception must still propagate unchanged so
+    `handle_request`'s catch-all builds its tool-error response exactly as
+    before — only the logging is new."""
+    try:
+        from opentelemetry.exporter.otlp.proto.http import _log_exporter, trace_exporter
+        from opentelemetry.sdk._logs.export import InMemoryLogRecordExporter
+        from opentelemetry.sdk.trace.export.in_memory_span_exporter import (
+            InMemorySpanExporter,
+        )
+    except ImportError:  # pragma: no cover — SDK absent, the no-op test above covers it
+        pytest.skip("opentelemetry SDK not installed in this environment")
+
+    monkeypatch.setattr(trace_exporter, "OTLPSpanExporter",
+                        lambda **_kw: InMemorySpanExporter())
+    monkeypatch.setattr(_log_exporter, "OTLPLogExporter",
+                        lambda **_kw: InMemoryLogRecordExporter())
+    monkeypatch.setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://aw-app-signoz:8080")
+    root = logging.getLogger()
+    before = list(root.handlers)
+    otel = _fresh(monkeypatch)
+    try:
+        assert otel.setup() is True
+
+        with caplog.at_level(logging.ERROR, logger=mcp_otel.__name__):
+            with pytest.raises(RuntimeError, match="simulated timeout"):
+                with mcp_otel.tool_span("mark_flow_done", "run-456") as span:
+                    assert span is not None
+                    raise RuntimeError("simulated timeout")
+
+        assert any("mark_flow_done" in r.message and "simulated timeout" in r.message
+                   for r in caplog.records)
+    finally:
+        for handler in list(root.handlers):
+            if handler not in before:
+                root.removeHandler(handler)
+
+
 def test_the_server_still_dispatches_tools_with_the_sdk_missing(monkeypatch):
     """The end-to-end form of the two tests above: import the real server,
     run a tool call through the real `_call_tool` wrapper with no SDK and no
