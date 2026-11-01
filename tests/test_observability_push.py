@@ -1,6 +1,6 @@
 """Unit tests for observability_push.py (Kanban ap-mt-tenant-log-routing) —
 covers the two-hop push (local read, AP-MT write) against stubbed HTTP legs,
-same monkeypatch-the-private-helper style as test_skills_sync.py. No real
+same monkeypatch-the-private-helper style as test_notion_token_sync.py. No real
 network, no aw-workspace server, no agents-platform-multitenant instance
 needed.
 """

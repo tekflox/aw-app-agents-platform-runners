@@ -1,5 +1,5 @@
 """Regression coverage for the Kanban 3e45bf3b-9510-816d-b0e3-d94995d2168c
-fix: ``_register_skills_watchdog``'s ``_delta``/``_reconcile`` closures (and
+fix: the skills-index ``_delta``/``_reconcile`` closures (and
 ``_register_kanban_sweep_watchdog``'s ``_sweep`` closure) used to bake
 ``agents_platform_token`` into a plain local variable / SkillsSyncClient
 attribute at ``activate()`` time and never look at it again — unlike every
@@ -12,6 +12,12 @@ live-read watchdog) was ``ok:true`` on the same snapshot — once ~24h passed
 since that worker's own activate(), its frozen token stayed expired for the
 rest of that worker's life, with no fresh app config, token rotation, or
 even a full re-registration able to fix it short of a process restart.
+
+The skills-index half of that fix is gone with the index itself (aw-skills
+fase 5, DESIGN §17.6 step 1). What replaced its registration — the
+Notion-token reconcile, which was riding its tick — is covered below in the
+same terms: it must hand ``_live_config`` itself to ``reconcile_once``, not a
+snapshot taken at activate() time. The kanban-sweep half is untouched.
 
 Run: .venv/aw/bin/python -m pytest tests/test_watchdog_live_token_not_frozen.py
 """
@@ -50,72 +56,61 @@ class _StubCtx:
         return False
 
 
-# --- skills-sync: SkillsSyncClient must reflect a config-updated token -----
+# --- notion-token reconcile: must see a config-updated token ---------------
 
 
-def test_skills_delta_tick_uses_the_live_config_token_not_the_frozen_one(monkeypatch):
+def test_notion_reconcile_tick_gets_the_live_config_dict_not_a_snapshot(monkeypatch):
+    """The reconcile closure must pass ``self._live_config`` itself, so a token
+    the refresh watchdog rotated in place on a later tick is the one
+    ``reconcile_once`` sees — the same live-read rule the skills-sync closures
+    this registration replaced had to be fixed to follow."""
     monkeypatch.setattr(plugin_mod.identity_token_mod, "refresh", lambda config: None)
 
     plugin = AgentsPlatformRunnersAppPlugin()
     plugin._live_config["agents_platform_token"] = "activation-time-token"
     ctx = _StubCtx(dict(plugin._live_config))
-    plugin._register_skills_watchdog(ctx, plugin._live_config)
-    delta_fn, _interval, _run_immediately = ctx.watchdog.registered["skills-sync-delta"]
+    plugin._register_notion_token_watchdog(ctx, plugin._live_config)
+    reconcile_fn, interval, run_immediately = ctx.watchdog.registered["notion-token-reconcile"]
+
+    # Same cadence the skills-sync reconcile it inherited from used, and still
+    # not run_immediately — this is a reconcile, not a boot-time sync.
+    assert interval == plugin_mod.NOTION_TOKEN_RECONCILE_INTERVAL_S
+    assert run_immediately is False
 
     # No app config save, no fresh watchdog registration — just the config
     # dict the token-refresh watchdog mutates in place on a later tick.
     plugin._live_config["agents_platform_token"] = "rotated-by-refresh-watchdog"
 
     seen = {}
-    monkeypatch.setattr(plugin_mod.skills_sync_mod.SkillsSyncClient, "sync_incremental",
-                        lambda self: seen.setdefault("token", self.token) or {"mode": "delta"})
 
-    asyncio.run(delta_fn())
+    def _record(config):
+        seen["token"] = config.get("agents_platform_token")
+        return {"reconciled": True}
 
-    assert seen["token"] == "rotated-by-refresh-watchdog"
-
-
-def test_skills_reconcile_tick_uses_the_live_config_token(monkeypatch):
-    monkeypatch.setattr(plugin_mod.identity_token_mod, "refresh", lambda config: None)
-    monkeypatch.setattr(plugin_mod.notion_token_sync_mod, "reconcile_once",
-                        lambda config: {"reconciled": True})
-
-    plugin = AgentsPlatformRunnersAppPlugin()
-    plugin._live_config["agents_platform_token"] = "activation-time-token"
-    ctx = _StubCtx(dict(plugin._live_config))
-    plugin._register_skills_watchdog(ctx, plugin._live_config)
-    reconcile_fn, _interval, _run_immediately = ctx.watchdog.registered["skills-sync-reconcile"]
-
-    plugin._live_config["agents_platform_token"] = "rotated-by-refresh-watchdog"
-
-    seen = {}
-    monkeypatch.setattr(plugin_mod.skills_sync_mod.SkillsSyncClient, "sync_full",
-                        lambda self: seen.setdefault("token", self.token) or {"mode": "full"})
+    monkeypatch.setattr(plugin_mod.notion_token_sync_mod, "reconcile_once", _record)
 
     asyncio.run(reconcile_fn())
 
     assert seen["token"] == "rotated-by-refresh-watchdog"
 
 
-def test_skills_tick_keeps_last_known_token_if_config_value_goes_missing(monkeypatch):
-    """A momentarily-empty config value (mid on_config_reloaded mutation) must
-    not blank out a client that was working — fall back to whatever the
-    client already had rather than sending an empty Authorization header."""
+def test_notion_reconcile_watchdog_is_registered_without_the_dead_skills_tasks(monkeypatch):
+    """aw-skills fase 5 (DESIGN §17.6 step 1): the two skills-index tasks are
+    gone and must not come back — a workspace still POSTing a slug list to an
+    AP-MT that answers 410 is the silent-degradation fuel the ordered
+    decommission exists to avoid."""
+    monkeypatch.setattr(plugin_mod.identity_token_mod, "refresh", lambda config: None)
+
     plugin = AgentsPlatformRunnersAppPlugin()
-    plugin._live_config["agents_platform_token"] = "activation-time-token"
+    plugin._live_config["agents_platform_token"] = "tok"
     ctx = _StubCtx(dict(plugin._live_config))
-    plugin._register_skills_watchdog(ctx, plugin._live_config)
-    delta_fn, _interval, _run_immediately = ctx.watchdog.registered["skills-sync-delta"]
+    plugin._register_notion_token_watchdog(ctx, plugin._live_config)
 
-    plugin._live_config.pop("agents_platform_token")
-
-    seen = {}
-    monkeypatch.setattr(plugin_mod.skills_sync_mod.SkillsSyncClient, "sync_incremental",
-                        lambda self: seen.setdefault("token", self.token) or {"mode": "delta"})
-
-    asyncio.run(delta_fn())
-
-    assert seen["token"] == "activation-time-token"
+    assert "notion-token-reconcile" in ctx.watchdog.registered
+    assert "skills-sync-delta" not in ctx.watchdog.registered
+    assert "skills-sync-reconcile" not in ctx.watchdog.registered
+    assert not hasattr(plugin, "_register_skills_watchdog")
+    assert not hasattr(plugin_mod, "skills_sync_mod")
 
 
 # --- kanban sweep: same frozen-token pattern in a second watchdog ----------

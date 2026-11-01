@@ -162,7 +162,7 @@ class _StubCtx:
 
 def _plugin_with_stubbed_watchdogs() -> AgentsPlatformRunnersAppPlugin:
     plugin = AgentsPlatformRunnersAppPlugin()
-    plugin._register_skills_watchdog = lambda ctx, config: None
+    plugin._register_notion_token_watchdog = lambda ctx, config: None
     plugin._register_kanban_sweep_watchdog = lambda ctx, config: None
     plugin._register_identity_token_watchdog = lambda ctx, config: None
     plugin._register_runner_registration_watchdog = lambda ctx, config: None

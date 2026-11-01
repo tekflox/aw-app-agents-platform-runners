@@ -26,9 +26,33 @@ Two hops, deliberately not one:
    ``contributes.mcp.reload_on_save`` — an in-memory-only refresh leaves
    every MCP tool on the dead token while this app's own state looks fine.
 
-Both hops, and the decode below, never raise past :func:`refresh` — called
+A third hop, added by aw-skills fase 5 (``docs/DESIGN.md`` §17.1 in
+fredericowu/aw-skills):
+
+3. **Push to agents-platform-multitenant** —
+   ``POST {agents_platform_base}/api/runners/skills-token``, authenticated
+   with the identity token ITSELF as Bearer. AP-MT's skills provider needs a
+   per-tenant credential to read that tenant's skills out of aw-skills, and
+   the only credential that already exists, already rotates, and already
+   carries the tenant's ``memberships`` claim is this one. AP-MT derives the
+   tenant from the presented token and stores that same token — there is no
+   credential field in the body, so this hop hands over nothing it wasn't
+   already authenticated with.
+
+   This rides :func:`refresh` rather than a cadence of its own — the card's
+   "reuse the same renewal, don't create a second cycle". But note it runs on
+   EVERY pass, not only when a mint happened: the store on the AP-MT side is
+   an idempotent upsert, and gating the push on a mint would mean a workspace
+   whose token isn't due yet stays uncredentialed for up to half a token
+   lifetime after this release — including, at release time, every workspace
+   there is.
+
+Every hop, and the decode below, never raises past :func:`refresh` — called
 from ``activate()`` (non-fatal by design) and from a watchdog tick, where an
-exception is a stack trace nobody reads.
+exception is a stack trace nobody reads. Hop 3 is best-effort in the stronger
+sense too: its failure never changes what :func:`refresh` returns, because an
+AP-MT that is down, old, or refusing must not be able to stop this workspace
+from rotating the credential its own runners authenticate with.
 """
 from __future__ import annotations
 
@@ -38,6 +62,8 @@ import logging
 import time
 
 import httpx
+
+from . import platform_base as platform_base_mod
 
 log = logging.getLogger("aw_apps.agents_platform_runners.identity_token")
 
@@ -122,20 +148,64 @@ def _persist(api_url: str, api_key: str, token: str) -> bool:
     return True
 
 
-def refresh(config: dict) -> str | None:
-    """Mint + persist a fresh token if the one in ``config`` needs it.
+def push_skills_token(config: dict, token: str | None) -> bool:
+    """Hand ``token`` to agents-platform-multitenant as this tenant's aw-skills
+    credential (aw-skills DESIGN §17.1). Best-effort: returns False on anything
+    that didn't land, logs it, and never raises.
 
-    Returns the new token on success — already persisted; the caller only
-    needs this to also update its own in-memory copy (e.g.
-    ``self._live_config``) before it writes mcp.json in the same pass.
-    Returns None, and leaves ``config`` untouched, when no refresh was
-    needed or any step failed. Never raises.
+    The token is both the credential being stored and the credential this call
+    authenticates with — AP-MT reads the tenant out of it and ignores the body
+    for anything but the workspace name, which it then checks against the same
+    token's ``memberships`` claim.
     """
     from .plugin import _workspace_env  # local import: avoids a plugin<->this-module cycle
 
-    current = (config or {}).get("agents_platform_token")
-    if not needs_refresh(current):
-        return None
+    if not token:
+        return False
+    base = platform_base_mod.resolve(config or {})
+    # Not ``os.environ.get``: on this workspace AW_WORKSPACE lives only in
+    # ``.aw-workspace/.env``, and reading it raw would name every workspace
+    # "aw" — the runner-dynamic-workspace-slug lesson, which cost the skills
+    # index a whole workspace's rows being filed under another's.
+    workspace = _workspace_env("AW_WORKSPACE").strip()
+    url = f"{base.rstrip('/')}/api/runners/skills-token"
+    # ``workspace`` omitted rather than sent empty when this workspace can't
+    # name itself: AP-MT falls back to the token's sole membership, which is
+    # right far more often than a guess would be, and errors loudly when the
+    # token has several instead of picking one.
+    body: dict = {"workspace": workspace} if workspace else {}
+    try:
+        with httpx.Client(timeout=TIMEOUT_S) as client:
+            resp = client.post(url, json=body,
+                               headers={"Authorization": f"Bearer {token}"})
+    except httpx.HTTPError as exc:
+        log.warning("identity_token: could not push the aw-skills credential to %s: %s",
+                    url, exc)
+        return False
+    if resp.status_code == 404:
+        # DESIGN §17.9 risk 5: deploy order puts the AP-MT route first, but app
+        # updates are pull-based and a workspace can run this client against an
+        # older AP-MT for a while. "Route isn't there yet" is not a failure, and
+        # must not log like one every refresh for however long that lasts.
+        log.info("identity_token: %s has no /api/runners/skills-token route "
+                 "(older agents-platform-multitenant) — skipping the aw-skills "
+                 "credential push", base)
+        return False
+    if resp.status_code >= 400:
+        log.warning("identity_token: agents-platform-multitenant refused the "
+                    "aw-skills credential push (%s): %s",
+                    resp.status_code, resp.text[:300])
+        return False
+    log.info("identity_token: pushed the aw-skills credential to %s (workspace=%s)",
+             base, workspace or "<from token membership>")
+    return True
+
+
+def _mint_and_persist(config: dict) -> str | None:
+    """The mint + persist hops. Returns the new token, or None if any step
+    failed. Never raises. Assumes the caller already decided a refresh is due.
+    """
+    from .plugin import _workspace_env  # local import: avoids a plugin<->this-module cycle
 
     backend_url = _workspace_env("AW_BACKEND_URL")
     workspace = _workspace_env("AW_WORKSPACE")
@@ -161,3 +231,36 @@ def refresh(config: dict) -> str | None:
 
     log.info("identity_token: minted and persisted a fresh agents_platform_token")
     return token
+
+
+def refresh(config: dict) -> str | None:
+    """Mint + persist a fresh token if the one in ``config`` needs it, then push
+    whichever token this workspace now holds to AP-MT (hop 3 in the module
+    docstring).
+
+    Returns the new token on success — already persisted; the caller only
+    needs this to also update its own in-memory copy (e.g.
+    ``self._live_config``) before it writes mcp.json in the same pass.
+    Returns None, and leaves ``config`` untouched, when no refresh was
+    needed or any step failed. Never raises.
+
+    The return value deliberately says nothing about hop 3: the caller's
+    reaction to a non-None return is to update its in-memory token and rewrite
+    mcp.json, and neither of those has anything to do with whether AP-MT
+    accepted the credential.
+    """
+    current = (config or {}).get("agents_platform_token")
+    minted = _mint_and_persist(config) if needs_refresh(current) else None
+    try:
+        push_skills_token(config, minted or current)
+    except Exception:  # noqa: BLE001 — see below
+        # push_skills_token already swallows every transport and HTTP failure
+        # it can name. This catch is for the ones it can't: the card's
+        # requirement is that an unavailable endpoint cannot break the renewal
+        # cycle, and a guarantee that depends on having enumerated the failure
+        # modes correctly is weaker than one the control flow enforces. A mint
+        # that already succeeded and persisted must not be reported as a
+        # failure because of what happened after it.
+        log.warning("identity_token: the aw-skills credential push raised past "
+                    "its own handlers — carrying on", exc_info=True)
+    return minted

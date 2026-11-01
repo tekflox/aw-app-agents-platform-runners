@@ -46,18 +46,18 @@ from . import platform_settings as platform_settings_mod
 from . import routes as routes_mod
 from . import runner_registration as runner_registration_mod
 from . import shared_redis as shared_redis_mod
-from . import skills_sync as skills_sync_mod
 from . import warm_pool as warm_pool_mod
 
 log = logging.getLogger("aw_apps.agents_platform_runners")
 
-# Skills-index watchdog cadences (ADR 2026-08-06). The delta task runs
-# immediately on boot — with no ack yet that first tick is a full sync — then
-# every DELTA_INTERVAL_S only POSTs when the local skill set actually changed.
-# The reconcile task ships the complete list unconditionally so the index can't
-# silently drift.
-DELTA_INTERVAL_S = 180.0
-RECONCILE_INTERVAL_S = 360.0
+# Notion-token reconcile cadence. This was RECONCILE_INTERVAL_S, the second of
+# the two decentralized-skills-index cadences (ADR 2026-08-06) — the index was
+# decommissioned by aw-skills fase 5 (DESIGN §17.6 step 1: AP-MT now queries
+# aw-skills directly, so shipping it a list of slug NAMES has no reader left)
+# and skills_sync.py went with it. The Notion-token reconcile had been riding
+# this tick rather than owning a cadence, so it inherits the interval and the
+# registration instead of dying alongside the sync it was hitched to.
+NOTION_TOKEN_RECONCILE_INTERVAL_S = 360.0
 
 # Kanban Ready-card sweep (2026-08-21). 60s is not a compromise: the Notion
 # webhook this replaces was measured at ~50s end to end on a real card, and its
@@ -353,7 +353,7 @@ class AgentsPlatformRunnersAppPlugin:
 
         self._register_exec_index_service(ctx, self._live_config)
 
-        self._register_skills_watchdog(ctx, self._live_config)
+        self._register_notion_token_watchdog(ctx, self._live_config)
         self._register_kanban_sweep_watchdog(ctx, self._live_config)
         self._register_identity_token_watchdog(ctx, self._live_config)
         self._register_runner_registration_watchdog(ctx, self._live_config)
@@ -530,66 +530,48 @@ class AgentsPlatformRunnersAppPlugin:
             log.warning("exec-index: could not restart the service after a config change",
                         exc_info=True)
 
-    def _register_skills_watchdog(self, ctx, config: dict) -> None:
-        """Register the decentralized skills-index sync watchdog (ADR
-        2026-08-06). Skipped (with a log) when the app isn't configured to
-        reach agents-platform-multitenant, or when the ``watchdog:tasks``
-        capability wasn't granted — the app's other jobs still work."""
-        base = platform_base_mod.resolve(config)
+    def _register_notion_token_watchdog(self, ctx, config: dict) -> None:
+        """Register the Notion-token reconcile watchdog (Kanban
+        ``architecture:notion-token-per-tenant-ap-mt-step1``).
+
+        This used to ride the skills-index reconcile tick — 360s already bounded
+        how stale AP-MT's derived state may be, and a second watchdog at the same
+        period was two things to reason about instead of one. aw-skills fase 5
+        (DESIGN §17.6 step 1) decommissioned the skills index, so the tick it was
+        riding is gone and the reconcile gets the registration it was sharing.
+        Same cadence, same work, one task instead of two.
+
+        Both of the old guards are kept as they were: skipped (with a log) when
+        the app has no ``agents_platform_token`` — the push half of the reconcile
+        is what this app authenticates to AP-MT with, so the poke has nowhere to
+        land without it — or when ``watchdog:tasks`` wasn't granted.
+        """
         token = config.get("agents_platform_token")
         if not token:
-            log.info("skills_sync: agents_platform_token not configured — "
-                     "skills index watchdog not started")
+            log.info("notion_token_sync: agents_platform_token not configured — "
+                     "reconcile watchdog not started")
             return
         if not ctx.has("watchdog:tasks"):
-            log.warning("skills_sync: 'watchdog:tasks' capability not granted — "
-                        "skills index watchdog not started")
+            log.warning("notion_token_sync: 'watchdog:tasks' capability not granted — "
+                        "reconcile watchdog not started")
             return
 
-        workspace = _workspace_env("AW_WORKSPACE") or "aw"
-        client = skills_sync_mod.SkillsSyncClient(base=base, token=token, workspace=workspace)
-
-        async def _delta() -> None:
-            # Re-read the live token on every tick instead of trusting the
-            # one `client` was constructed with — this closure is created
-            # once at activate() time and, unlike _refresh/_reassert/_ensure
-            # below, used to never look at self._live_config again, so a
-            # token rotated after activation silently 401'd this worker's
-            # skills sync forever. See the card this fixes for the live
-            # 23/22-consecutive-401 evidence.
-            client.token = self._live_config.get("agents_platform_token") or client.token
-            result = await asyncio.to_thread(client.sync_incremental)
-            log.info("skills_sync delta: %s", result)
-
         async def _reconcile() -> None:
-            try:
-                client.token = self._live_config.get("agents_platform_token") or client.token
-                result = await asyncio.to_thread(client.sync_full)
-                log.info("skills_sync reconcile: %s", result)
-            finally:
-                # The Notion-token reconcile rides THIS tick rather than
-                # registering a cadence of its own (Kanban
-                # architecture:notion-token-per-tenant-ap-mt-step1): 360s is
-                # already the interval that bounds how stale AP-MT's derived
-                # state may be, and a second watchdog at the same period is
-                # two things to reason about instead of one.
-                #
-                # In `finally` deliberately — a skills-sync failure (AP-MT
-                # briefly down, a 409 storm) must not be able to stop a token
-                # rotation from propagating. reconcile_once never raises, so
-                # it cannot mask the skills exception on its way out.
-                outcome = await asyncio.to_thread(
-                    notion_token_sync_mod.reconcile_once, self._live_config)
-                # Quiet on the steady state ("fingerprints match", every 6
-                # minutes, forever); loud on anything that changed or broke.
-                if outcome.get("changed") or not outcome.get("reconciled"):
-                    log.info("notion token reconcile: %s", outcome)
+            # Reads self._live_config live on every tick, like every other
+            # credential watchdog in this file — see the card behind
+            # tests/test_watchdog_live_token_not_frozen.py for what baking a
+            # token into a closure at activate() time cost last time.
+            outcome = await asyncio.to_thread(
+                notion_token_sync_mod.reconcile_once, self._live_config)
+            # Quiet on the steady state ("fingerprints match", every 6
+            # minutes, forever); loud on anything that changed or broke.
+            if outcome.get("changed") or not outcome.get("reconciled"):
+                log.info("notion token reconcile: %s", outcome)
 
-        ctx.watchdog.register("skills-sync-delta", _delta, DELTA_INTERVAL_S,
-                              run_immediately=True)
-        ctx.watchdog.register("skills-sync-reconcile", _reconcile, RECONCILE_INTERVAL_S,
-                              run_immediately=False)
-        log.info("skills_sync: watchdog registered (workspace=%s base=%s)", workspace, base)
+        ctx.watchdog.register("notion-token-reconcile", _reconcile,
+                              NOTION_TOKEN_RECONCILE_INTERVAL_S, run_immediately=False)
+        log.info("notion_token_sync: reconcile watchdog registered (every %.0fs)",
+                 NOTION_TOKEN_RECONCILE_INTERVAL_S)
 
     def _register_kanban_sweep_watchdog(self, ctx, config: dict) -> None:
         """Register the Kanban Ready-card sweep — the trigger that replaces the

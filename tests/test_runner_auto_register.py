@@ -18,6 +18,7 @@ import pytest
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
+from agents_platform_runners_app import identity_token as identity_token_mod  # noqa: E402
 from agents_platform_runners_app import plugin as plugin_mod  # noqa: E402
 from agents_platform_runners_app.plugin import AgentsPlatformRunnersAppPlugin  # noqa: E402
 
@@ -67,7 +68,7 @@ def _plugin_with_stubbed_watchdogs() -> AgentsPlatformRunnersAppPlugin:
     """A plugin whose OTHER three watchdog registrations are no-ops, so a
     test only has to reason about the runner-registration one."""
     plugin = AgentsPlatformRunnersAppPlugin()
-    plugin._register_skills_watchdog = lambda ctx, config: None
+    plugin._register_notion_token_watchdog = lambda ctx, config: None
     plugin._register_kanban_sweep_watchdog = lambda ctx, config: None
     plugin._register_identity_token_watchdog = lambda ctx, config: None
     return plugin
@@ -195,23 +196,49 @@ def test_watchdog_tick_survives_registration_raising(monkeypatch):
     asyncio.run(tick())  # must not raise
 
 
-def test_skills_watchdog_reads_workspace_from_the_env_file_not_just_process_env(
+def test_skills_token_push_reads_workspace_from_the_env_file_not_just_process_env(
         monkeypatch, tmp_path):
     """runner-dynamic-workspace-slug (Perna C): a raw ``os.environ.get`` here
-    tags this workspace's skills-index sync as "aw" whenever ``AW_WORKSPACE``
-    lives only in ``.aw-workspace/.env`` — the skills registry keys on
-    (workspace, cli), so that silently misfiles this workspace's own skill
-    index under another workspace's row."""
+    names this workspace "aw" whenever ``AW_WORKSPACE`` lives only in
+    ``.aw-workspace/.env``.
+
+    This used to guard the skills-index sync, which keyed on (workspace, cli)
+    and silently misfiled one workspace's rows under another's. aw-skills fase
+    5 decommissioned that sync, but the same env var now names the workspace
+    on the aw-skills credential push — where a wrong value is worse, not
+    better: AP-MT checks it against the token's ``memberships`` claim and
+    refuses with a 403, so a workspace that misnames itself gets no credential
+    at all.
+    """
     monkeypatch.delenv("AW_WORKSPACE", raising=False)
     monkeypatch.setenv("AW_WORKSPACE_HOME", str(tmp_path))
     (tmp_path / ".env").write_text("AW_WORKSPACE=crispal\n")
 
-    seen = {}
-    monkeypatch.setattr(plugin_mod.skills_sync_mod, "SkillsSyncClient",
-                        lambda base, token, workspace: seen.setdefault("workspace", workspace))
+    sent = []
 
-    plugin = AgentsPlatformRunnersAppPlugin()
-    ctx = _StubCtx({"agents_platform_token": "tok"})
-    plugin._register_skills_watchdog(ctx, {"agents_platform_token": "tok"})
+    class _Client:
+        def __init__(self, *a, **k):
+            pass
 
-    assert seen["workspace"] == "crispal"
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def post(self, url, **kwargs):
+            sent.append((url, kwargs))
+            return _OkResponse()
+
+    class _OkResponse:
+        status_code = 200
+        text = "{}"
+
+        def json(self):
+            return {}
+
+    monkeypatch.setattr(identity_token_mod.httpx, "Client", _Client)
+
+    assert identity_token_mod.push_skills_token(
+        {"agents_platform_base": "http://ap-mt"}, "tok") is True
+    assert sent[0][1]["json"] == {"workspace": "crispal"}

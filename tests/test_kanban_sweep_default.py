@@ -184,7 +184,7 @@ def test_new_workspace_activate_flips_default_before_watchdog_registration(monke
         seen_config_at_registration.update(config)
 
     plugin = AgentsPlatformRunnersAppPlugin()
-    plugin._register_skills_watchdog = lambda ctx, config: None
+    plugin._register_notion_token_watchdog = lambda ctx, config: None
     plugin._register_kanban_sweep_watchdog = spy_register_kanban_sweep
     plugin._register_identity_token_watchdog = lambda ctx, config: None
     plugin._register_runner_registration_watchdog = lambda ctx, config: None
@@ -204,7 +204,7 @@ def test_activate_never_reflips_an_already_applied_install(monkeypatch):
     _stub_client(monkeypatch, lambda url, kwargs: FakeResponse(200, {}), seen)
 
     plugin = AgentsPlatformRunnersAppPlugin()
-    plugin._register_skills_watchdog = lambda ctx, config: None
+    plugin._register_notion_token_watchdog = lambda ctx, config: None
     plugin._register_kanban_sweep_watchdog = lambda ctx, config: None
     plugin._register_identity_token_watchdog = lambda ctx, config: None
     plugin._register_runner_registration_watchdog = lambda ctx, config: None
@@ -221,7 +221,7 @@ def test_activate_completes_when_flip_fails(monkeypatch):
     _stub_client(monkeypatch, lambda url, kwargs: FakeResponse(500, None, "boom"))
 
     plugin = AgentsPlatformRunnersAppPlugin()
-    plugin._register_skills_watchdog = lambda ctx, config: None
+    plugin._register_notion_token_watchdog = lambda ctx, config: None
     plugin._register_kanban_sweep_watchdog = lambda ctx, config: None
     plugin._register_identity_token_watchdog = lambda ctx, config: None
     plugin._register_runner_registration_watchdog = lambda ctx, config: None
@@ -238,7 +238,7 @@ def test_activate_completes_when_flip_raises(monkeypatch):
     monkeypatch.setattr(plugin_mod.kanban_sweep_default_mod, "ensure_default_applied", _boom)
 
     plugin = AgentsPlatformRunnersAppPlugin()
-    plugin._register_skills_watchdog = lambda ctx, config: None
+    plugin._register_notion_token_watchdog = lambda ctx, config: None
     plugin._register_kanban_sweep_watchdog = lambda ctx, config: None
     plugin._register_identity_token_watchdog = lambda ctx, config: None
     plugin._register_runner_registration_watchdog = lambda ctx, config: None
