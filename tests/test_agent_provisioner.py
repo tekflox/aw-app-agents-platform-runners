@@ -197,6 +197,24 @@ def test_workspace_survives_the_create_post():
     assert body["workspace"] == "aw"
 
 
+def test_a_contributed_agent_without_workspace_defaults_to_the_seeding_workspace(
+        monkeypatch):
+    # The bug this guards: every app-contributed runner-provider agent
+    # (coder-sonnet, telegram-sonnet, ...) declares no `workspace` in its
+    # manifest — they're tenant-shared, seeded once by whichever workspace
+    # installs first. Without a default here, that first create POST lands
+    # with workspace=NULL, and on a tenant with 2+ registered Runner
+    # workspaces under strict enforcement, the platform's create-time gate
+    # 422s it — seed() swallows that as a logged skip, so the agent would
+    # silently never exist. See card 40c5bf3b-9510-8174-821a-f1766a3fabd3.
+    monkeypatch.setenv("AW_WORKSPACE", "aw")
+    platform = FakePlatform()
+    _seed(platform, {"agents": [{"slug": "coder-sonnet", "name": "Coder",
+                                 "model_slug": "claude-runner-sonnet"}]})
+    _, body = platform.posts[0]
+    assert body["workspace"] == "aw"
+
+
 def test_reconcile_keeps_disable_harness_tools():
     platform = RecordingPlatform(existing={"/api/agents": ["sec-reviewer"]})
     provisioner = AgentProvisioner(base="http://ap.test", token="tok",

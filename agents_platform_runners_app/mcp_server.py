@@ -268,6 +268,8 @@ def _agent_spec_schema() -> dict:
                               "description": "Short list of example use cases — when to pick this agent. e.g. ['Greenfield product research', 'Domain investigation before plan']. Consumed by the conductor to choose between agents."},
             "model_slug":    {"type": ["string", "null"],
                               "description": "Slug from list_models; omit to use platform default."},
+            "workspace":     {"type": ["string", "null"],
+                              "description": "Default workspace this agent dispatches to when provider='runner' and the tenant has more than one registered Runner workspace. Required in that case; omit for single-workspace tenants or non-runner agents."},
             "tool_specs":    {"type": "array", "items": {"type": "string"},
                               "description": "Tool ids like 'code.read_file', 'code.write_file'."},
             "skill_slugs":   {"type": "array", "items": {"type": "string"}},
@@ -3276,6 +3278,7 @@ async def _dispatch_tool(name: str, arguments: dict[str, Any] | None) -> list[Te
                 body["target_slug"] = args["target_slug"]
             if args.get("target_id"):
                 body["target_id"] = args["target_id"]
+            body.setdefault("workspace", _own_workspace())
             r = await c.post(f"{BASE}/api/agents/{slug}/run", json=body)
             if r.status_code != 200:
                 return _err(r.status_code, r.text)
@@ -3290,6 +3293,7 @@ async def _dispatch_tool(name: str, arguments: dict[str, Any] | None) -> list[Te
                 body["target_slug"] = args["target_slug"]
             if args.get("target_id"):
                 body["target_id"] = args["target_id"]
+            body.setdefault("workspace", _own_workspace())
             r = await c.post(f"{BASE}/api/workflows/{slug}/run", json=body)
             if r.status_code != 200:
                 return _err(r.status_code, r.text)

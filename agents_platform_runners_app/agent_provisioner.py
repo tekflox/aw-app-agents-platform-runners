@@ -457,6 +457,20 @@ def _payload(kind: str, entry: dict[str, Any], allowed: frozenset[str]) -> dict[
     for field, source in DEFAULTS.get(kind, {}).items():
         if not body.get(field):
             body[field] = entry.get(source, "")
+    if kind == "agents" and not body.get("workspace"):
+        # Contributed agents never declare `workspace` in a manifest — they
+        # are seeded once, tenant-shared, by whichever workspace installs
+        # first (see aw-workspace's qualify_workspace_agents docstring).
+        # Without this, a runner-provider agent (model_slug=claude-runner-*
+        # etc.) is created with workspace=NULL, and on a tenant with 2+
+        # registered Runner workspaces under strict enforcement the
+        # platform's create-time gate 422s it — seed() swallows that as a
+        # logged-and-skipped failure (module docstring), so the agent would
+        # silently never exist rather than loudly failing to install. The
+        # seeding workspace is as defensible a default as any: tier-1
+        # explicit (the dispatch door's own body.setdefault) outranks this
+        # at dispatch time regardless, so it is only ever the fallback.
+        body["workspace"] = platform_base_mod.workspace_env("AW_WORKSPACE") or "aw"
     return body
 
 

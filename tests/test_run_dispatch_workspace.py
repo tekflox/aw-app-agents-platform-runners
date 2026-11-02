@@ -130,6 +130,68 @@ def test_run_agents_parallel_carries_workspace(monkeypatch):
     assert recorder[0]["workspace"] == "aw"
 
 
+# --- the dynamic agent_<slug> / workflow_<slug> runners -------------------
+
+async def _no_sleep(*_a, **_kw):
+    return None
+
+
+def test_agent_dynamic_handler_carries_workspace(monkeypatch):
+    # agent_<slug> / workflow_<slug> (mcp_server.py ~3263-3297) are the
+    # dynamic per-resource runners generated for every active agent/workflow
+    # — the exact door the two stuck pr-agent-llm runs came through, because
+    # unlike the 5 handlers above they never named their own workspace.
+    monkeypatch.setenv("AW_WORKSPACE", "aw")
+    recorder: list = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST":
+            recorder.append(json.loads(request.content or b"{}"))
+            return httpx.Response(200, json={"run_id": "r1"})
+        return httpx.Response(200, json={"run_id": "r1", "status": "success"})
+
+    real_async_client = httpx.AsyncClient
+
+    def fake_async_client(*args, **kwargs):
+        kwargs["transport"] = httpx.MockTransport(handler)
+        return real_async_client(*args, **kwargs)
+
+    monkeypatch.setattr(mcp_server.httpx, "AsyncClient", fake_async_client)
+    monkeypatch.setattr(mcp_server.asyncio, "sleep", _no_sleep)
+
+    asyncio.run(mcp_server._call_tool("agent_coder_sonnet", {
+        "input": "do it", "target_slug": "some-target",
+    }))
+
+    assert recorder[0]["workspace"] == "aw"
+
+
+def test_workflow_dynamic_handler_carries_workspace(monkeypatch):
+    monkeypatch.setenv("AW_WORKSPACE", "aw")
+    recorder: list = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST":
+            recorder.append(json.loads(request.content or b"{}"))
+            return httpx.Response(200, json={"run_id": "r1"})
+        return httpx.Response(200, json={"run_id": "r1", "status": "success"})
+
+    real_async_client = httpx.AsyncClient
+
+    def fake_async_client(*args, **kwargs):
+        kwargs["transport"] = httpx.MockTransport(handler)
+        return real_async_client(*args, **kwargs)
+
+    monkeypatch.setattr(mcp_server.httpx, "AsyncClient", fake_async_client)
+    monkeypatch.setattr(mcp_server.asyncio, "sleep", _no_sleep)
+
+    asyncio.run(mcp_server._call_tool("workflow_some_workflow", {
+        "input": "do it", "target_slug": "some-target",
+    }))
+
+    assert recorder[0]["workspace"] == "aw"
+
+
 # --- setdefault never clobbers an explicit value --------------------------
 
 def test_run_agents_parallel_does_not_clobber_an_already_set_workspace(monkeypatch):
