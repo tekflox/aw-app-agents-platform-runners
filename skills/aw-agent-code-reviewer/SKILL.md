@@ -92,6 +92,220 @@ as a snippet in your report — not as a commit.
 
 Don't commit, don't push, don't open a PR.
 
+## PR deep-review entry path (dispatched from GitHub CI)
+
+Some of your runs don't come from Agents Flow or a human at all: GitHub
+Actions (`tekflox/aw-app-template`'s `.github/workflows/code-review.yml`)
+dispatches you directly through AP-MT's `/v1/chat/completions` door on
+`opened`/`reopened`/`ready_for_review`, an `/aw-review` PR comment, or an
+`/aw-improve` PR comment (narrower ask, same dispatch — see its own
+subsection below), using an ApiKey scoped to you alone. The dispatch
+message gives you only the bare coordinates — **repo, PR number, head SHA,
+base ref** — and tells you to follow this section. Everything tunable
+about this entry path lives here, not in the workflow file or in your seed
+prompt, so a lens/budget/schema change never needs a repo commit.
+
+**Get the diff.** The repo is already checked out on this workspace at
+`repos/<name>`. `git fetch` and diff `base ref...head SHA` there — do not
+re-clone, and do not trust a stale checkout without fetching first.
+
+**Run exactly five lenses, yourself:**
+
+1. **Correctness** and **2. Test-coverage** — same bar as any other review:
+   a concrete failure behind every finding, a test that would actually have
+   caught it.
+2. **Out-of-diff impact** — `codegraph_callers`/`codegraph_impact` plus a
+   knowledge-base search, specifically hunting for a caller or integration
+   point the diff doesn't touch but changes the meaning of.
+3. **Dependency-freshness / CVE / integration** — your own `WebSearch`/
+   `WebFetch`, in-session, for up to ~2 quick questions. For more,
+   escalate to **at most 3** `pr-research-haiku` runs via
+   `run_agents_parallel`, each awaited with `wait_run(timeout=...)`. A dead
+   or zero-token child is reported as "research unavailable for X" in your
+   findings — never waited on indefinitely, never silently dropped.
+4. **Dead and commented-out code** — code the diff leaves behind that does
+   nothing going forward: a block someone commented out "just in case" and
+   left in, a function/variable that is no longer called or referenced
+   anywhere after this change, an import the change made unused. Confirm
+   it, don't guess it — run `codegraph_callers`/`codegraph_impact` on the
+   symbol and cite that nothing references it before flagging it as dead;
+   if codegraph shows a live caller, it isn't dead, drop the finding. The
+   evidence for this lens is the file:line of the dead/commented block
+   plus that codegraph confirmation (or the absence of any caller found).
+   This is almost always **low/info** severity, not a blocker — if a scan
+   turns up many instances, say so and name only the clearest 2-3 rather
+   than filing one finding per instance; this lens must never crowd out
+   correctness/security/CVE findings in volume.
+
+**Budget, exactly:** 1 of you + at most 3 research workers per head SHA.
+Do not exceed it, and do not re-run lenses already covered by a worker's
+answer.
+
+**The eliminatory bar (this is the whole point of this entry path):** at
+least one finding must be of a class a diff-only reviewer (PR-Agent)
+structurally cannot produce — a named dependency/version/CVE/advisory URL,
+or a named out-of-diff caller/integration point with a file:line. Tag every
+finding's `class` honestly (see schema below) rather than reaching for
+`out_of_repo` to pad the bar — a review that is diff-local only is a
+reportable fact, not a result to hide.
+
+**Output contract — your final message must be, and contain nothing but,
+this JSON object** (a markdown fence around it is fine and expected):
+
+```json
+{
+  "findings": [
+    {
+      "severity": "critical|high|medium|low|info",
+      "confidence": "certain|likely|possible",
+      "class": "diff_local|out_of_repo",
+      "title": "one line",
+      "file": "path/from/repo/root or omit for a cross-cutting finding",
+      "line": 123,
+      "line_start": 120,
+      "suggestion": "exact replacement text for line_start..line, or omit",
+      "evidence": "file:line, or a URL for an out_of_repo finding",
+      "body": "the full finding, written for a human reading it on the PR"
+    }
+  ],
+  "counts": {"critical": 0, "high": 0, "medium": 0, "low": 0, "info": 0},
+  "research_runs_used": 0
+}
+```
+
+A **round-2** review adds exactly one required field to each finding,
+`blocks_merge` — see "Round 2: the major-only lens" below. Round 1's schema is
+the one above, unchanged.
+
+Omit `file`/`line` together for a finding about the PR as a whole
+(architecture-level, cross-cutting, "this breaks module X elsewhere") —
+their presence is exactly how the workflow decides where a finding is
+posted: a finding with both becomes an inline comment anchored to that
+line; a finding with neither becomes a top-level PR comment. Don't force a
+cross-cutting observation onto a line just to have one, and don't omit a
+real line reference you actually have.
+
+**`suggestion` is how you give a finding a concrete, applicable fix — the
+same UX PR-Agent's `/improve` is known for.** Include it only alongside
+both `file` and `line` (and `line_start` too, when the fix spans more than
+one line); the workflow wraps it verbatim in a ```` ```suggestion ```` fence
+on that inline comment, which GitHub renders as a one-click-applicable
+diff. The text must be the exact, correctly-indented replacement for lines
+`line_start`..`line` and nothing else — no markdown, no explanatory prose,
+no fence of your own; the explanation belongs in `body`. Use it for a fix
+that reduces to a mechanical diff — a wrong operator, a typo, a missing
+null check, an off-by-one — never for an architectural or design-level
+finding that doesn't reduce to one; omit the field entirely rather than
+force one onto a finding that's really a prose observation. This is part
+of your **normal output on every trigger** (`/aw-review` included, not a
+separate mode) — produce it whenever a finding earns one, regardless of
+how you were triggered.
+
+One correction to the premise this is modeled on, so you don't cite it as
+established behavior: PR-Agent's own `/improve`, as actually configured on
+this repo, does **not** post a real suggestion-block comment — verified
+live (2026-11-03, probe PR #11, both PR-Agent's self-reflection pass
+dropping a trivial unused-import suggestion at score 0, and a scored
+correctness fix rendering as a single top-level `## PR Code Suggestions`
+comment with a plain ```` ```diff ```` block inside an HTML table, not an
+applicable suggestion). The mechanism you're matching is GitHub's native
+review-comment suggestion fence — the same one CodeRabbit already uses on
+this repo (e.g. PR #5) — not PR-Agent's own rendering choice on this one.
+
+**You do not call `gh` to post this review.** The workflow parses your
+JSON and posts every comment itself, under its own GitHub identity — not
+the shared personal `gh` credential your session otherwise has for reading
+the repo and codegraph. This is deliberate, not an oversight: that shared
+credential is Frederico's own GitHub login, and a comment posted through it
+would appear to come from him personally rather than from an automated
+reviewer. The workflow's own token renders as `github-actions[bot]` with a
+`🔎 Dev Team Code Review` banner it adds automatically, distinct from
+PR-Agent's own comment format on that same bot identity — you don't need to
+add a banner yourself, just write `body` as the finding, nothing else.
+Everything else in "You review; you do not fix" above still holds: you
+still never edit the code, still never commit.
+
+### `/aw-improve` — same judge, narrower ask
+
+A PR comment whose first token is `/aw-improve` dispatches you exactly
+like `/aw-review` — same gate, same trust allowlist, same 1+≤3 budget,
+same output schema above. The only difference is the dispatch message
+tells you this run is specifically about the improvement-suggestion half:
+produce `suggestion` fields for whatever concrete, mechanical fixes the
+diff has, and **skip lens 3 (dependency/CVE research) unless the diff
+genuinely needs it** (e.g. it touches a dependency pin or version string)
+— don't spin up `pr-research-haiku` workers by default just because this
+trigger fired. Still run the other lenses if something there feeds a
+concrete suggestion (a correctness bug is exactly the kind of thing
+`/aw-improve` exists to surface); just don't pad the run with research
+nobody asked for on this trigger. Use it to re-run the suggestion half on
+demand — a stale run, a reviewer who wants suggestions re-checked after
+discussion — without needing a new PR event.
+
+### Round 2: the major-only lens
+
+The dispatch message says `Round: 2` when the PR already carries the
+`devteam:awaiting-fixes` label — i.e. round 1 posted findings, the coder was
+woken, addressed them and pushed, and re-triggered you with `/aw-review`.
+Round 2 exists so that loop terminates: there is no round 3. Either this
+review clears the PR and the workflow squash-merges it, or the PR gets
+`devteam:needs-human` and a person takes over.
+
+**You are not re-running round 1.** Same lenses, same output schema, same
+budget — but the question changes. Round 1 asks "what is wrong with this
+code". Round 2 asks "is anything left that I would stop a merge over". Bias
+toward shipping. Do not re-file a round-1 finding the coder fixed, and do not
+go looking for new material in code the diff does not touch.
+
+**One required extra field: `blocks_merge`.** Every finding in a round-2
+response must carry it, a boolean, and it is what decides the merge:
+
+```json
+{ "...": "all the round-1 fields", "blocks_merge": true }
+```
+
+Set it using **exactly** this test and nothing else:
+
+> `blocks_merge` is true if and only if this finding, left as-is, would
+> **break the application** or **is a security risk**.
+
+That is Frederico's definition of "major", and it is behavioural — it is not
+the `severity` field. The two disagree in both directions and you must follow
+the test, not the label: a `severity: high` style or maintainability concern
+that breaks nothing is `blocks_merge: false`; a `severity: medium` real
+security hole is `blocks_merge: true`. `severity` stays in the schema and
+still drives the comment labels, the counts and the human-readable record —
+in round 2 it just does not gate anything.
+
+**Missing the field fails CLOSED.** The workflow counts a round-2 finding
+with no `blocks_merge` as blocking, so a schema slip escalates the PR to a
+human rather than silently merging over an unjudged finding. That is the
+right default, and it is also why you must emit the field on every finding
+rather than only on the blocking ones: an omission reads as "block it".
+
+**Read the coder's "Won't do:" replies as input.** When woken for round 1 the
+coder is required to post a `Won't do: <reason>` reply for every finding it
+declined — in-thread on inline findings, as a top-level comment quoting the
+title for cross-cutting ones. Read those before judging a declined finding.
+You are free to be persuaded: if the reasoning shows the issue does not
+actually break the app or pose a security risk (it is intentional, it is
+guarded elsewhere, the input cannot reach it), set `blocks_merge: false` and
+say so in `body`. If it still meets the test, set `blocks_merge: true` — a
+"won't do" is an argument, not a veto, and the escalation comment carries the
+coder's reasoning to the human alongside your finding, so the disagreement
+arrives framed rather than as a bare failure.
+
+**Still report non-major findings**, with `blocks_merge: false`. They get
+posted to the PR and are part of the record; they simply do not block. Keep
+that list short — only what is worth a human reading on the PR a second time.
+If you have nothing at all, return zero findings; "no blocking findings" is
+the expected round-2 result, not a weak one.
+
+**If the PR already carries `devteam:needs-human`**, the dispatch message
+says so. Review it and post your findings exactly as above — the run is
+informational, the workflow will not merge and will not touch any label,
+until a human removes that label to re-arm the machine.
+
 ## Where you sit in the Software Engineering flow (if this platform has Agents Flow enabled)
 
 If this instance uses the `software-engineering` Agents Flow, you're a

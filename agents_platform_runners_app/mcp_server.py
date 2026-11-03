@@ -1526,7 +1526,10 @@ async def _list_tools() -> list[Tool]:
              description=("Attach a PR URL (with optional title/status/ci_status) to "
                           "a Target. Idempotent on URL — re-attaching the same URL "
                           "updates the metadata in place. Use this so the retro view "
-                          "shows the PRs that delivered the Target."),
+                          "shows the PRs that delivered the Target. Your OWN run id is "
+                          "recorded with the PR automatically, which is what lets the "
+                          "Dev Team review flow wake this exact session when a reviewer "
+                          "posts findings on it — nothing to pass for that."),
              inputSchema={"type": "object",
                           "properties": {"slug": {"type": "string"},
                                          "url": {"type": "string"},
@@ -3098,8 +3101,20 @@ async def _dispatch_tool(name: str, arguments: dict[str, Any] | None) -> list[Te
             r = await c.delete(f"{BASE}/api/targets/{slug}/link_run/{rid}", params=params)
             return _err(r.status_code, r.text) if r.status_code != 200 else _ok(r.json())
         if name == "attach_pr_to_target":
-            slug = args.pop("slug")
-            r = await c.post(f"{BASE}/api/targets/{slug}/pr", json=args)
+            slug = args["slug"]
+            # Built field by field rather than forwarding `args` wholesale:
+            # `_gateway_caller_run_id` rides along in `args` on the gateway
+            # path, and `run_id` below is server-side only (not on the
+            # inputSchema), same rule as `_own_workspace` — a hallucinated
+            # run_id would wake the wrong coder's session, which is worse
+            # than waking none.
+            body: dict[str, Any] = {"url": args["url"]}
+            for k in ("title", "status", "ci_status", "notes"):
+                if args.get(k):
+                    body[k] = args[k]
+            if _rid := _caller_run_id(args):
+                body["run_id"] = _rid
+            r = await c.post(f"{BASE}/api/targets/{slug}/pr", json=body)
             return _err(r.status_code, r.text) if r.status_code != 200 else _ok(r.json())
         if name == "detach_pr_from_target":
             slug = args["slug"]; url = args["url"]
