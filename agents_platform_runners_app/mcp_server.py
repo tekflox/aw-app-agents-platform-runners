@@ -530,7 +530,16 @@ async def _list_tools() -> list[Tool]:
                           "itself. Ignored if `call_me_back:false` is also set.\n\n"
                           "**`target_slug` is REQUIRED.** Create a Target first with "
                           "`create_target` if none exists. Calls without `target_slug` "
-                          "are rejected with a 400 error."),
+                          "are rejected with a 400 error.\n\n"
+                          "**QA dispatches are deduped server-side.** Dispatching a `qa-*` "
+                          "agent for a card/target that already has a QA run — one still in "
+                          "flight, or one that already produced a verdict — is refused with "
+                          "**409**, and the error names the existing run. Do NOT retry it: "
+                          "read that run instead (`register_callback` / `wait_run` / "
+                          "`get_run`). A `run_agent_async` call that TIMED OUT on your side "
+                          "may well have landed, so check `list_target_runs` before composing "
+                          "a second dispatch. Use `qa_rerun:true` only to override "
+                          "deliberately."),
              inputSchema={"type": "object",
                           "properties": {"slug": {"type": "string"},
                                          "input": {"type": "string"},
@@ -544,7 +553,9 @@ async def _list_tools() -> list[Tool]:
                                          "call_me_back": {"type": "boolean", "default": True,
                                                           "description": "Default true: when the dispatched run finishes, your own session gets woken up with its result and replies down your own channel automatically. Set false for pure fire-and-forget."},
                                          "call_me_back_on": {"type": ["string", "null"],
-                                                             "description": "Optional session_id to redirect the callback to instead of your own session — e.g. a session_id returned by a prior run_agent_async call. That session's agent gets woken with this run's result instead of you."}},
+                                                             "description": "Optional session_id to redirect the callback to instead of your own session — e.g. a session_id returned by a prior run_agent_async call. That session's agent gets woken with this run's result instead of you."},
+                                         "qa_rerun": {"type": "boolean", "default": False,
+                                                      "description": "Override the server-side QA dedup guard (see above), which otherwise 409s a second qa-* dispatch for the same card/target. Use it when new commits merged AFTER the prior verdict and the delivery genuinely needs re-verifying, or to run a deliberate second QA in parallel (e.g. a different model). Do NOT use it to retry a dispatch you think failed — a 409 means one already exists, so read that run instead."}},
                           "required": ["slug", "input", "target_slug"]}),
         Tool(name="run_workflow_async",
              description=("Start a workflow run in the background and return its run_id.\n\n"
@@ -2452,6 +2463,10 @@ async def _dispatch_tool(name: str, arguments: dict[str, Any] | None) -> list[Te
             # answer straight to A.
             if args.get("call_me_back_on"):
                 body["call_me_back_on"] = args["call_me_back_on"]
+            # Only sent when actually set, so a dispatch that never mentions
+            # qa_rerun keeps the request body it has always had.
+            if args.get("qa_rerun"):
+                body["qa_rerun"] = True
             # This workspace's own runners app dispatching this run is, by
             # construction, FROM this workspace — tier 1 of the resolver,
             # never inference. setdefault: never clobber an explicit

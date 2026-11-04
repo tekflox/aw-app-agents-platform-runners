@@ -140,6 +140,35 @@ the CI job's discovered path (wrong directory, wrong naming convention, not
 in the matrix) will bit-rot the first time someone doesn't know to run it by
 hand. Point at the CI config you checked, not just the test output.
 
+## Handing off to QA
+
+**QA reviews MERGED work only.** A review of an open PR verifies claims about
+code that can still change under it, and it burns a full review pass to do
+it — on 2026-11-04 both failure modes happened live on one afternoon's
+rollout, costing ~13M tokens between them.
+
+- **If your delivery goes through a PR, do NOT dispatch QA while that PR is
+  open.** On a PR-first repo the post-merge wake prompt IS your QA-handoff
+  moment — the merged event wakes you with "sync the tree, then hand off to
+  QA", and that is the first point at which there is a merged change to
+  review. On a direct-push repo, hand off only after push **and** deploy, per
+  the Definition of Done above.
+- **`run_agent_async` on a `qa-*` agent can come back 409.** That means the
+  server found a QA run for this card/target already — either still in
+  flight, or already finished with a verdict — and the error names it.
+  **Do not retry, and do not re-word the input and try again.** Read that
+  run instead: `register_callback(run_id=...)` to be woken when it ends,
+  `wait_run` to block on it, `get_run` if it already finished.
+- **A `run_agent_async` that TIMED OUT on your side may well have landed.**
+  That is exactly how the duplicate above happened: the dispatch succeeded
+  server-side, the client gave up waiting, and the session re-composed a
+  second one 34 seconds later. Before composing a second dispatch of
+  anything, call `list_target_runs` and look for the run you think failed.
+- **`qa_rerun=true` is for one case only:** new commits merged *after* the
+  prior QA verdict, so there is genuinely something new to verify (or you are
+  deliberately running a second QA in parallel, e.g. on a different model).
+  It is not a way to get past a 409 you did not expect.
+
 ### `is_live` / `is_deployment_needed`
 
 When this run has a Kanban card, set these two checkbox properties on the

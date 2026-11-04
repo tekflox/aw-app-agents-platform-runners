@@ -70,6 +70,14 @@ Optional `session_id` redirects the wake-up to a different session (same as
 `call_me_back_on`). If the run already finished by the time you call this,
 the wake-up fires immediately with its result instead of being dropped.
 
+**QA dispatches are deduped server-side (2026-11-04):** handing off to a
+`qa-*` agent for a card/target that already has a QA run — one still in
+flight, or one that already reached a verdict — is refused with **409**, and
+the error names the existing run. That is a redirect, not a failure: read
+that run (`register_callback` / `wait_run` / `get_run`) rather than
+dispatching again. `qa_rerun=true` overrides it, for a genuine re-QA after
+new commits merged or a deliberate parallel second opinion.
+
 ### ② `return_to_caller_agent` — reuse context, talk to a specific caller
 
 Resumes the **exact session** of whoever called YOU via `run_agent_async`,

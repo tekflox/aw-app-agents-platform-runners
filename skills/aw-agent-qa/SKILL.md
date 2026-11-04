@@ -45,6 +45,45 @@ guessing keywords:
 - `mcp__aw-gateway__aw__notion__API-retrieve-a-page` — only if you need to re-read the card's raw properties beyond what the dispatch input already gave you
 - `mcp__aw-gateway__aw__notion__API-post-search` — only as a last resort, shouldn't normally be needed
 
+## Gate zero: is the delivery merged?
+
+Before the knowledge-base search, before reading the diff: **if the dispatch
+points at one or more PRs, check their merge state first.**
+
+```bash
+gh pr view <N> --repo <owner/repo> --json state,mergedAt
+```
+
+**If the PR under review is NOT merged, do not perform the review.** Nothing
+about it is settled — the code can still change under you, and a verdict on
+it is false signal that a human will later read as "this was checked". Return
+cheaply instead, in two calls:
+
+1. `add_kanban_comment` — one line, no more:
+   `"QA declined: PR #N still open — QA runs post-merge; re-dispatch after merge"`
+2. `return_to_caller_agent(kind="result", message=...)` with the same
+   sentence, so whoever dispatched you knows to come back after the merge. No
+   caller (you were run directly)? Report it in plain text as your final
+   answer.
+
+**This early return is the ONE exception to "`set_qa_status` exactly once,
+every time" below.** Do NOT call `set_qa_status` here — not `need_human`, not
+anything. You did not review the delivery, so you have no verdict to record,
+and `need_human` on a PR that is simply still open sends a human to look at a
+card where nothing is wrong. The comment is the record; the status stays
+untouched.
+
+### Already-verified work
+
+If the dispatch references a commit or PR that a prior QA run already
+verified, **establish what is NEW before re-running the full verification.**
+Compare the merged SHA against what that verdict covered. If nothing landed
+after it, say so and return — re-reaching the same verdict on unchanged code
+is not independent signal, and two QA sessions did exactly that on 2026-11-04
+for ~13M tokens. Note the server now refuses most of these at dispatch time
+(409), so a QA run that reaches you at all may still be a legitimate re-QA —
+check, don't assume either way.
+
 ## Mandatory: search the knowledge base first
 
 Before doing anything else, call `knowledge_search` (if that MCP tool
