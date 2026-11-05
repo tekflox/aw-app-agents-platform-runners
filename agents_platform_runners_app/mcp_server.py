@@ -1389,6 +1389,41 @@ async def _list_tools() -> list[Tool]:
                                          "events_limit": {"type": "integer",
                                                            "description": "Cap on returned events. Default 500."}},
                           "required": ["run_id"]}),
+        Tool(name="tool_usage_metrics",
+             description=("Tool-usage METRICS across runs: counts and per-call metadata "
+                          "only — tool name, run/session/agent, timestamp, duration. "
+                          "`get_run_detail(run_id=...)` opens one specific run's full "
+                          "event trace instead; use that when you already know which run "
+                          "you want, use this tool to count or enumerate calls across "
+                          "many runs.\n\n"
+                          "Set `count_only=true` for an aggregate (total count + top-50 "
+                          "`by_tool` breakdown) instead of the detailed `calls` list — "
+                          "it is a parameter on this tool, not a separate one. Detailed "
+                          "mode paginates with `limit` (default 20, max 100) + `offset`, "
+                          "ordered most-recent-first. Never returns tool input/output "
+                          "content — name and metadata only."),
+             inputSchema={"type": "object",
+                          "properties": {
+                              "count_only": {"type": "boolean",
+                                  "description": "True for the aggregate count + by_tool "
+                                                 "breakdown only. Default false."},
+                              "tool_name": {"type": "string",
+                                  "description": "Exact match on the tool's name."},
+                              "agent_slug": {"type": "string",
+                                  "description": "Filter to this agent/workflow slug "
+                                                 "(Run.source_slug)."},
+                              "session_id": {"type": "string",
+                                  "description": "Filter to this CLI session id "
+                                                 "(Run.session_id)."},
+                              "since": {"type": "string",
+                                  "description": "ISO8601 — only calls at or after this time."},
+                              "until": {"type": "string",
+                                  "description": "ISO8601 — only calls before this time."},
+                              "limit": {"type": "integer",
+                                  "description": "Page size, detailed mode only. Default 20, max 100."},
+                              "offset": {"type": "integer",
+                                  "description": "Pagination offset, detailed mode only. Default 0."},
+                          }}),
         Tool(name="list_bots",
              description=("Per-bot (per-agent) snapshot: for every agent/source_slug seen "
                           "in recent runs, its currently active session_id (the session_id "
@@ -2821,6 +2856,26 @@ async def _dispatch_tool(name: str, arguments: dict[str, Any] | None) -> list[Te
             er = await c.get(f"{BASE}/api/runs/{run_id}/events", params=ev_params)
             run["events"] = er.json() if er.status_code == 200 else []
             return _ok(run)
+        if name == "tool_usage_metrics":
+            params = {}
+            if args.get("count_only"):
+                params["count_only"] = "true"
+            if args.get("tool_name"):
+                params["tool_name"] = args["tool_name"]
+            if args.get("agent_slug"):
+                params["agent_slug"] = args["agent_slug"]
+            if args.get("session_id"):
+                params["session_id"] = args["session_id"]
+            if args.get("since"):
+                params["since"] = args["since"]
+            if args.get("until"):
+                params["until"] = args["until"]
+            if args.get("limit"):
+                params["limit"] = str(args["limit"])
+            if args.get("offset"):
+                params["offset"] = str(args["offset"])
+            r = await c.get(f"{BASE}/api/runs/tool-metrics", params=params)
+            return _err(r.status_code, r.text) if r.status_code != 200 else _ok(r.json())
         if name == "list_bots":
             scan_limit = str(args.get("scan_limit") or 500)
             r = await c.get(f"{BASE}/api/runs",
