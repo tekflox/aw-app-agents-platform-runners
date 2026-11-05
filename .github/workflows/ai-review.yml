@@ -21,7 +21,7 @@ name: AI Review
 # ── WHY AN EXACT TAG, NOT @master ─────────────────────────────────────────
 # `@v1.2.0` is immutable and never retagged; the shared repo's tag ruleset
 # enforces that for everyone including the owner. `code-review.yml`'s
-# `@v1.4.0` pin is on a separate `v*` line in the SAME tag family (the shared
+# `@v1.5.0` pin is on a separate `v*` line in the SAME tag family (the shared
 # repo keeps one `v*` line for both workflows, since its immutability
 # ruleset only targets `refs/tags/v*`) — v1.2.0 is simply the last tag that
 # touched `ai-review-reusable.yml`'s content, confirmed unchanged since.

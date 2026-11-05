@@ -14,12 +14,12 @@ name: Code Review
 # boundary) rather than re-derived.
 #
 # ── WHY AN EXACT TAG, NOT @master ─────────────────────────────────────────
-# `@v1.4.0` is immutable and never retagged — enforced by a ruleset on the
+# `@v1.5.0` is immutable and never retagged — enforced by a ruleset on the
 # shared repo's `refs/tags/v*`. A moving ref here would mean an edit in that
 # repo changes this repo's merge gate with no commit on this repo — the same
 # shape as `app-release.yml`, referenced via a moving `@master` from ~45 app
 # repos, where one fail-loud edit reddened the whole marketplace at once.
-# Landing straight on v1.4.0 (the current tag, proven on 5 prior callers)
+# Landing straight on v1.5.0 (the current tag, proven on 6 prior callers)
 # rather than an earlier one — including its `provenance-gate` job (see
 # below) — avoids landing a caller already known to need a later bump.
 #
@@ -63,6 +63,15 @@ name: Code Review
 # natively on agent-authored PRs. The `provenance-exempt` label (created
 # alongside the two round labels, see the secrets/labels note below) is the
 # escape hatch for a human opening a PR by hand.
+#
+# ── v1.5.0's CLOSE-GATE NEEDS NO CALLER-SIDE WORK EITHER ──────────────────
+# Adds a `cleared` event (an eligible round now reports its findings digest
+# instead of reporting nothing) and enriches the `merged` payload with
+# `pr_head_sha` + unchecked PR-body checklist items, so the backend can file
+# Backlog cards for leftovers once a PR actually merges. Everything new is
+# internal to the shared workflow — no new permission scope, secret, input,
+# or trigger on this side; an old AP-MT server predating this just 400s the
+# unrecognised event harmlessly.
 
 on:
   pull_request:
@@ -100,7 +109,7 @@ concurrency:
 
 jobs:
   review:
-    uses: fredericowu/aw-shared-workflows/.github/workflows/code-review-reusable.yml@v1.4.0
+    uses: fredericowu/aw-shared-workflows/.github/workflows/code-review-reusable.yml@v1.5.0
     with:
       ci_check_name: pytest
     # Declared here as well as in the called workflow: for a reusable
