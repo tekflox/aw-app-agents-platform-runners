@@ -40,12 +40,30 @@ HOOKS_DIR = ROOT / "agent-images" / "shared" / "git-hooks"
 # and a live warm container even has a real /home/ubuntu/.aw-warm) must
 # never leak into these subprocess calls — every test's intent is exactly
 # which identity IS or ISN'T visible to the hook.
+#
+# GIT_CONFIG_* is its own case, not just another identity var: since this
+# feature went live, every github-permitted runner/Coder/QA container (this
+# test's own process very possibly included — found live by QA reviewing
+# this exact file, card 40f5bf3b-9510-811d-916c-dd2ad57d3ac4) has
+# GIT_CONFIG_COUNT/KEY_0/VALUE_0 set in its ambient env, pointing at the
+# production-mounted /opt/aw-agent/git-hooks — which OUTRANKS a repo's own
+# `git config core.hooksPath` (env config beats file config). Left
+# unstripped, _init_repo()'s own `git config core.hooksPath HOOKS_DIR` call
+# is silently overridden by the ambient ones, so most of this file's tests
+# stop exercising the repo's checked-out hook code and instead run whatever
+# happens to already be mounted in the container — a false "tests pass"
+# that would not have caught a real regression in prepare-commit-msg's own
+# identity-resolution logic. A whole GIT_CONFIG_* prefix is stripped, not
+# just these three names, since GIT_CONFIG_COUNT controls how many
+# GIT_CONFIG_KEY_N/VALUE_N pairs git reads — leaving a stray one behind
+# would be read as a 4th, garbled entry.
 _IDENTITY_VARS = ("AW_RUN_ID", "AW_SESSION_ID", "NOTION_TASK_ID", "AW_WARM_DIR",
                   "AW_SOURCE_DEVICE", "AW_GATEWAY_BEARER_TOKEN")
 
 
 def _clean_env(tmp_path, **overrides) -> dict:
-    env = {k: v for k, v in os.environ.items() if k not in _IDENTITY_VARS}
+    env = {k: v for k, v in os.environ.items()
+           if k not in _IDENTITY_VARS and not k.startswith("GIT_CONFIG_")}
     env["HOME"] = str(tmp_path)  # git needs a writable $HOME for its own config lookups
     env.setdefault("AW_WARM_DIR", str(tmp_path / "no-such-warm-dir"))
     env.update(overrides)
