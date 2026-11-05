@@ -1374,7 +1374,9 @@ async def _list_tools() -> list[Tool]:
                                          "status": {"type": "string",
                                                     "description": "Filter by status: pending|running|success|error|cancelled."},
                                          "session_id": {"type": "string",
-                                                        "description": "Filter to runs resumed under this CLI session id only."}}}),
+                                                        "description": "Filter to runs resumed under this CLI session id only."},
+                                         "notion_task_id": {"type": "string",
+                                                             "description": "Filter to runs linked to this Notion Kanban page id only."}}}),
         Tool(name="get_run_detail",
              description=("FULL record for one Run: untruncated input/output, status, "
                           "timestamps, target_slug, agent/source_slug, cost, tokens, "
@@ -2805,6 +2807,8 @@ async def _dispatch_tool(name: str, arguments: dict[str, Any] | None) -> list[Te
                 params["status"] = args["status"]
             if args.get("session_id"):
                 params["session_id"] = args["session_id"]
+            if args.get("notion_task_id"):
+                params["notion_task_id"] = args["notion_task_id"]
             r = await c.get(f"{BASE}/api/runs", params=params)
             return _err(r.status_code, r.text) if r.status_code != 200 else _ok(r.json())
         if name == "get_run_detail":
