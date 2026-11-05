@@ -1,0 +1,73 @@
+#!/bin/sh
+# Stamps AW-Run-Id / AW-Session-Id / AW-Card trailers onto every commit made
+# inside a Dev Team runner container, below the agent's own prompt — so a
+# PR's provenance can't be forgotten the way a body/label field can (card
+# 40f5bf3b-9510-811d-916c-dd2ad57d3ac4, design on card
+# 40f5bf3b-9510-8174-be1c-c69bdc2676ba). prepare-commit-msg, not commit-msg:
+# this still runs under `git commit --no-verify`.
+#
+# Activated workspace-wide via core.hooksPath (execute.py's
+# _build_container_kwargs / _build_raw_kwargs). POSIX sh only — the shell
+# image has no node.
+set -eu
+
+SELF_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+. "$SELF_DIR/_chain.sh"
+
+msg_file="$1"
+
+# Chain to whatever would have fired without our override FIRST — our
+# stamping below runs last and so always wins over anything that hook did
+# to the message file. A nonzero exit here aborts the commit, same as if
+# core.hooksPath had never been overridden.
+chain_hook prepare-commit-msg "$@"
+
+# AW_WARM_DIR is overridable only so tests can point it at a tmp dir; every
+# real runner container's HOME is /home/ubuntu (execute.py's env["HOME"]).
+warm_dir="${AW_WARM_DIR:-/home/ubuntu/.aw-warm}"
+
+# Resolve THIS turn's run id: the per-turn warm file first (rewritten by
+# warm_pool.dispatch_turn at the start of every turn, including turn 2+ of a
+# reused warm container), $AW_RUN_ID — correct only on a cold/ephemeral
+# container — as the fallback. Reading $AW_RUN_ID alone would silently
+# re-stamp turn 1's id on every later turn of a reused warm container (the
+# exact staleness bug fixed for codex in card 3d25bf3b-9510-814a-
+# acd9-d06f9c28d10b).
+run_id=""
+if [ -f "$warm_dir/current_run_id" ]; then
+    run_id=$(cat "$warm_dir/current_run_id" 2>/dev/null) || run_id=""
+fi
+[ -n "$run_id" ] || run_id="${AW_RUN_ID:-}"
+
+# No identity at all — a human committing from outside a runner container,
+# or any context that never set one of the above up. No-op, silently, same
+# as if this hook did not exist.
+if [ -z "$run_id" ]; then
+    exit 0
+fi
+
+# Stable per (agent, session) — a warm container lives for one session's
+# whole life, so unlike the run id this needs no per-turn refresh.
+session_id="${AW_SESSION_ID:-}"
+
+# turn_env is rewritten every turn by warm_pool.dispatch_turn and is
+# authoritative over whatever NOTION_TASK_ID this container's env was
+# created with, which goes stale on turn 2+ of a reused warm container
+# exactly like current_run_id above. Sourcing it is safe here: it only ever
+# re-exports AW_RUN_ID/NOTION_TASK_ID/AW_SOURCE_DEVICE/
+# AW_GATEWAY_BEARER_TOKEN, and run_id was already resolved above.
+if [ -f "$warm_dir/turn_env" ]; then
+    . "$warm_dir/turn_env"
+fi
+card_id="${NOTION_TASK_ID:-}"
+
+git interpret-trailers --if-exists replace \
+    --trailer "AW-Run-Id: ${run_id}" --in-place "$msg_file"
+if [ -n "$session_id" ]; then
+    git interpret-trailers --if-exists replace \
+        --trailer "AW-Session-Id: ${session_id}" --in-place "$msg_file"
+fi
+if [ -n "$card_id" ]; then
+    git interpret-trailers --if-exists replace \
+        --trailer "AW-Card: ${card_id}" --in-place "$msg_file"
+fi

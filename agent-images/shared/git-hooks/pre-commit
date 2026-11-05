@@ -1,0 +1,9 @@
+#!/bin/sh
+# Chain wrapper — see _chain.sh. core.hooksPath (activated by execute.py to
+# enable prepare-commit-msg's provenance stamping) replaces .git/hooks
+# wholesale, so this exists purely to keep whatever hook used to live at
+# .git/hooks/pre-commit (the §6 pre-commit-framework standard, or a
+# repo-local husky-style hooksPath) firing.
+SELF_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+. "$SELF_DIR/_chain.sh"
+chain_hook pre-commit "$@"
