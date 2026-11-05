@@ -1871,12 +1871,23 @@ def _build_raw_kwargs(job: dict) -> tuple[str, list[str], dict]:
     # creds themselves live) rw — the mount only puts them where `gh`/`git`
     # know to look. Unconditional, same as the workspace mount above.
     volumes.update(_git_creds_volumes())
+    # Provenance hook (card 40f5bf3b-9510-811d-916c-dd2ad57d3ac4): paired
+    # with the creds mount just above for the same reason — a monitor run
+    # can always push, so its commits always get stamped, unconditionally.
+    volumes[_host_path_for(GIT_HOOKS_DIR)] = {
+        "bind": GIT_HOOKS_CONTAINER_MOUNT, "mode": "ro"}
 
     kwargs: dict[str, Any] = {
         "name": f"aw-runner-monitor-{run_id[:12]}",
         "command": argv,
         "working_dir": workdir,
-        "environment": {"HOME": "/home/ubuntu", "AW_RUN_ID": run_id},
+        "environment": {
+            "HOME": "/home/ubuntu", "AW_RUN_ID": run_id,
+            # Activates the hooks mounted above — see GIT_HOOKS_DIR.
+            "GIT_CONFIG_COUNT": "1",
+            "GIT_CONFIG_KEY_0": "core.hooksPath",
+            "GIT_CONFIG_VALUE_0": GIT_HOOKS_CONTAINER_MOUNT,
+        },
         "volumes": volumes,
         "detach": True,
         # NOT remove=True — the wait-then-fetch-once raw_command branch in
@@ -2224,6 +2235,12 @@ def _build_container_kwargs(job: dict, client=None) -> tuple[str, list[str], dic
     # aw-app-git's own login flow owns.
     if _perms.get("github"):
         volumes.update(_git_creds_volumes())
+        # Provenance hook (card 40f5bf3b-9510-811d-916c-dd2ad57d3ac4): a
+        # container that can push gets its commits stamped — same gate as
+        # the creds mount just above, deliberately, so the two can never
+        # disagree about whether this run can push.
+        volumes[_host_path_for(GIT_HOOKS_DIR)] = {
+            "bind": GIT_HOOKS_CONTAINER_MOUNT, "mode": "ro"}
 
     # Workspace root mount — found live 2026-08-02: nothing above actually
     # mounted anything AT a container path named "aw-workspace" (creds go to
@@ -2426,6 +2443,14 @@ def _build_container_kwargs(job: dict, client=None) -> tuple[str, list[str], dic
         env["AW_SOURCE_DEVICE"] = job["source_device"]
     env["AW_SESSION_ID"] = job.get("session_id") or ""
     env["AW_RUN_ID"] = run_id
+    if _perms.get("github"):
+        # Activates the hooks mounted above (core.hooksPath via env is the
+        # highest-precedence git config source, so it wins even over a
+        # repo-local core.hooksPath — see git-hooks/_chain.sh for how that
+        # repo-local setting still gets honored).
+        env["GIT_CONFIG_COUNT"] = "1"
+        env["GIT_CONFIG_KEY_0"] = "core.hooksPath"
+        env["GIT_CONFIG_VALUE_0"] = GIT_HOOKS_CONTAINER_MOUNT
     # Durable auth for claude: a long-lived OAuth token (claude setup-token)
     # injected via env. Preferred over the mounted .credentials.json because
     # env-token auth doesn't rotate every 8h and never writes/blanks the creds
@@ -2699,6 +2724,11 @@ WARM_RELAY_PATH = _SHARED_DIR / "aw-warm-relay.py"
 WARM_WRAPPER_CODEX_PATH = _SHARED_DIR / "aw-warm-wrapper-codex"
 WARM_RELAY_CODEX_PATH = _SHARED_DIR / "aw-warm-relay-codex.py"
 ATTACH_HELPER_PATH = _SHARED_DIR / "aw_attach.py"
+# Run-id/session-id/card provenance hook (card 40f5bf3b-9510-811d-916c-
+# dd2ad57d3ac4) — see agent-images/shared/git-hooks/ and this constant's
+# call sites in _build_container_kwargs/_build_raw_kwargs above.
+GIT_HOOKS_DIR = _SHARED_DIR / "git-hooks"
+GIT_HOOKS_CONTAINER_MOUNT = "/opt/aw-agent/git-hooks"
 
 # CLIs the warm pool knows how to keep alive across turns. Extending this
 # list means writing that CLI's own aw-warm-wrapper-<cli>/relay pair AND a

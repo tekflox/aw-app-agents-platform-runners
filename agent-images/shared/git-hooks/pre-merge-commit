@@ -1,0 +1,5 @@
+#!/bin/sh
+# Chain wrapper — see _chain.sh and pre-commit's copy of this header.
+SELF_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+. "$SELF_DIR/_chain.sh"
+chain_hook pre-merge-commit "$@"

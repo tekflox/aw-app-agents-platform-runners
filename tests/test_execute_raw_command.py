@@ -47,9 +47,14 @@ def test_build_raw_kwargs_starts_bash_under_the_identity_mapped_workspace(tmp_pa
     # The SAME bind target every CLI-agent spawn's workspace mount uses
     # (_build_container_kwargs) — this is what makes a monitor run's cwd
     # resolve identically to a real agent run's.
-    assert kwargs["volumes"] == {
-        "/home/aw-remote-host/aw-workspace": {"bind": "/opt/aw-workspace", "mode": "rw"}
+    assert kwargs["volumes"]["/home/aw-remote-host/aw-workspace"] == {
+        "bind": "/opt/aw-workspace", "mode": "rw"
     }
+    # Provenance hook mount — unconditional here too, see
+    # test_build_raw_kwargs_mounts_git_hooks_unconditionally below for the
+    # dedicated coverage; asserted loosely here so this test stays focused
+    # on the workspace-identity mapping it's named for.
+    assert any(v["bind"] == "/opt/aw-agent/git-hooks" for v in kwargs["volumes"].values())
     # NOT remove=True: the raw_command branch in _run_job_blocking waits for
     # the container then fetches its logs in one shot, which needs the
     # container to still exist after exit — podman's follow-mode log API was
@@ -97,9 +102,13 @@ def test_build_raw_kwargs_mounts_no_git_creds_when_never_mirrored(tmp_path, monk
 
     _, _, kwargs = execute_mod._build_raw_kwargs({"run_id": "abc123", "raw_command": "echo hi"})
 
-    assert kwargs["volumes"] == {
-        "/home/aw-remote-host/aw-workspace": {"bind": "/opt/aw-workspace", "mode": "rw"}
+    assert kwargs["volumes"]["/home/aw-remote-host/aw-workspace"] == {
+        "bind": "/opt/aw-workspace", "mode": "rw"
     }
+    # The provenance hook mount has no git-creds precondition (see
+    # test_build_raw_kwargs_mounts_git_hooks_unconditionally) — it's still
+    # present even when aw-app-git was never logged in.
+    assert any(v["bind"] == "/opt/aw-agent/git-hooks" for v in kwargs["volumes"].values())
 
 
 def test_build_container_kwargs_branches_to_raw_before_touching_cli_specs(monkeypatch):
