@@ -21,10 +21,15 @@ name: Test
 # comment). A paths filter would let a docs-only PR never produce this check
 # at all.
 #
-# `[self-hosted, aw-baremetal]`: this is a tekflox-owned private repo, same
-# runner pool `release.yml`'s own reusable workflow already uses for every
-# tekflox/* caller (`app-release.yml`'s `runs-on` ternary) — zero billed
-# minutes, same as every other tekflox-owned repo in this rollout.
+# `ubuntu-latest`, NOT `[self-hosted, aw-baremetal]`: this repo is PUBLIC
+# (same as code-review.yml / ai-review.yml both already state), and
+# `pull_request` has no fork restriction here — a fork-authored PR's own
+# `tests/`/install step would otherwise execute directly on the self-hosted
+# baremetal pool, a known way to compromise self-hosted CI infrastructure.
+# `app-release.yml`'s self-hosted ternary is not a counter-example: that
+# workflow runs on `push` to master only, never on an untrusted PR head.
+# GitHub-hosted minutes are free on a public repo, so there is no cost
+# reason to prefer self-hosted here anyway.
 on:
   push:
     branches: [master]
@@ -33,7 +38,7 @@ on:
 
 jobs:
   pytest:
-    runs-on: [self-hosted, aw-baremetal]
+    runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v7
@@ -62,7 +67,7 @@ jobs:
   # with its own defaults needs no repo config and gives a baseline without
   # inventing an un-triaged blocking gate as a side effect of adding CI.
   lint:
-    runs-on: [self-hosted, aw-baremetal]
+    runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v7
