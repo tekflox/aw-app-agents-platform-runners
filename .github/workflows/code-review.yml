@@ -1,0 +1,142 @@
+name: Code Review
+
+# Thin caller. The whole two-round PR review -> merge loop lives in
+# fredericowu/aw-shared-workflows — read that file's header for the state
+# machine, the fail-closed `blocks_merge` rule, the RUNNER_TEMP discipline,
+# the trusted-author gate, and why the merge uses a PAT and never
+# GITHUB_TOKEN.
+#
+# This repo is the 6th consumer of that loop (tekflox/aw-app-template, then
+# fredericowu/agents-platform-multitenant, fredericowu/aw-workspace,
+# tekflox/aw-stack, fredericowu/aw-console) — a proven, reusable pattern,
+# copied from the current canary (tekflox/aw-app-template's own caller,
+# itself the closest precedent: public, tekflox-owned, same account
+# boundary) rather than re-derived.
+#
+# ── WHY AN EXACT TAG, NOT @master ─────────────────────────────────────────
+# `@v1.4.0` is immutable and never retagged — enforced by a ruleset on the
+# shared repo's `refs/tags/v*`. A moving ref here would mean an edit in that
+# repo changes this repo's merge gate with no commit on this repo — the same
+# shape as `app-release.yml`, referenced via a moving `@master` from ~45 app
+# repos, where one fail-loud edit reddened the whole marketplace at once.
+# Landing straight on v1.4.0 (the current tag, proven on 5 prior callers)
+# rather than an earlier one — including its `provenance-gate` job (see
+# below) — avoids landing a caller already known to need a later bump.
+#
+# ── ci_check_name IS A PREDICTION, VERIFY IT LIVE ─────────────────────────
+# `pytest` is `test.yml`'s job id in THIS repo (no job `name:` override, so
+# GitHub reports the id as the check's display name). Confirm the literal
+# string with `gh pr checks <PR> -R tekflox/aw-app-agents-platform-runners
+# --json name,state,bucket` once the first real PR is open, and fix it in
+# this same PR if it differs — round 1 runs this file's own PR copy, so a
+# fix lands live immediately. `test.yml`'s `pull_request` trigger has no
+# `paths:` filter, so every PR produces a `pytest` check — no risk of the
+# merge gate waiting forever on a PR that never triggers it.
+#
+# ── `runs_on` LEFT AT ITS DEFAULT (`ubuntu-latest`) ────────────────────────
+# This repo is PUBLIC, same shape as tekflox/aw-app-template. Nothing in
+# code-review-reusable.yml ever checks out PR code (it reads the diff and
+# checks exclusively via the GitHub API), so pointing it at this repo's own
+# `[self-hosted, aw-baremetal]` pool would be safe even against a fork PR —
+# but there is no cost reason to: GitHub-hosted minutes are free on a public
+# repo, same call aw-app-template and aw-workspace core both made.
+#
+# ── THIS REPO HAS NO BRANCH PROTECTION BEYOND WHAT THIS CARD ADDS ─────────
+# A ruleset requiring PRs into `master` is added as part of this same change
+# (ruleset, not classic branch protection — this is a free-plan org repo).
+# `ci_gate`'s equivalent — the shared workflow's `merge-attempt` job reading
+# this repo's own checks — is still the thing that actually decides whether
+# a PR is mergeable; the ruleset only forces work to go through a PR at all.
+#
+# ── ONE TRAP, IF YOU ARE EDITING *THIS FILE* IN A PR ──────────────────────
+# `pull_request` runs this file's PR copy (rounds 1 and 2 both see your
+# edits live). `issue_comment` (`/aw-review`) and `workflow_run` BOTH always
+# run the DEFAULT BRANCH's copy. So the PR that introduces this file cannot
+# exercise its own comment path or its own workflow_run path — verify those
+# on the NEXT PR after merge, don't burn time "debugging" them.
+#
+# ── v1.4.0's `provenance-gate` NEEDS NO EXTRA WORK HERE ───────────────────
+# Every commit this repo's Dev Team coders make is already stamped with an
+# `AW-Run-Id` trailer by the `prepare-commit-msg` hook THIS repo itself ships
+# (`agent-images/shared/git-hooks/prepare-commit-msg`), activated via
+# `core.hooksPath` in every runner container — so provenance-gate passes
+# natively on agent-authored PRs. The `provenance-exempt` label (created
+# alongside the two round labels, see the secrets/labels note below) is the
+# escape hatch for a human opening a PR by hand.
+
+on:
+  pull_request:
+    # `synchronize` -> automatic round 2 on the coder's fix push; the shared
+    # gate refuses it on any other round (requires `devteam:awaiting-fixes`
+    # already applied).
+    #
+    # `closed` is here only for the shared workflow's merged-event job; its
+    # gate job excludes `closed` explicitly, so a close never dispatches a
+    # review.
+    types: [opened, reopened, ready_for_review, synchronize, closed]
+  issue_comment:
+    types: [created]
+  # This repo's own CI, BY ITS `name:` (`.github/workflows/test.yml` starts
+  # with `name: Test`) — NOT its filename, NOT its job id. Confirm with
+  #   gh api repos/tekflox/aw-app-agents-platform-runners/actions/workflows \
+  #     --jq '.workflows[].name'
+  # Get it wrong, or rename that workflow later, and nothing fails loudly:
+  # the event simply stops arriving and merges whose CI finishes after the
+  # review verdict quietly stop happening.
+  workflow_run:
+    workflows: ["Test"]
+    types: [completed]
+
+# Stays in the caller, not in the reusable workflow: what needs serializing
+# is "reviews of THIS repo's PR #N". A reusable workflow's own `concurrency`
+# would key on the shared file's identity instead, collapsing unrelated
+# repos into one queue. The third arm is required because a `workflow_run`
+# event has neither `pull_request.number` nor `issue.number` — without it
+# every workflow_run run in this repo would collapse into the single group
+# `code-review-` and, with `cancel-in-progress: false`, queue one at a time.
+concurrency:
+  group: code-review-${{ github.event.pull_request.number || github.event.issue.number || github.event.workflow_run.head_branch }}
+  cancel-in-progress: false
+
+jobs:
+  review:
+    uses: fredericowu/aw-shared-workflows/.github/workflows/code-review-reusable.yml@v1.4.0
+    with:
+      ci_check_name: pytest
+    # Declared here as well as in the called workflow: for a reusable
+    # workflow the effective GITHUB_TOKEN permissions are the INTERSECTION
+    # of the two, so a scope omitted here cannot be granted by the shared
+    # file, and a scope the shared file omits cannot be granted here either.
+    # An unlisted scope is an explicit `none`, never an inherit — either side
+    # alone caps the token to zero.
+    permissions:
+      contents: read
+      pull-requests: write
+      issues: write
+      statuses: write
+      # Not currently load-bearing on THIS repo (it's public — a public
+      # repo's check rollup is readable without this scope), and listed
+      # anyway: the merge gate reads the PR's checks with `gh pr checks`,
+      # which goes through the Checks API and is REFUSED without this scope
+      # on a PRIVATE repo, reporting `required check(s) ['pytest'] did not
+      # report a pass ... Saw: []` every round — exactly the trap this repo
+      # would otherwise inherit the moment it (or a fork of it) goes private.
+      checks: read
+      # SAME story, for a separate, later-discovered scope gap: `gh pr
+      # checks` always embeds checkSuite{workflowRun{...}} in its GraphQL
+      # query regardless of requested fields, which needs `actions: read`,
+      # not `checks: read`. Public repos' rollups are readable without it;
+      # a private repo hits a deterministic GraphQL 403 on every read.
+      actions: read
+    # Passed BY NAME, not `secrets: inherit`: this repo is `tekflox/*`
+    # calling a `fredericowu/*`-owned reusable workflow, and `inherit` does
+    # not cross that account boundary — it fails SILENTLY (empty string)
+    # rather than erroring, measured live on tekflox/aw-app-template's PR
+    # #16. Each is declared `required: false` upstream so a genuinely
+    # missing one produces the shared workflow's own fail-loud error naming
+    # this repo and the secret, instead of GitHub refusing the whole call
+    # before any of those diagnostics can run.
+    secrets:
+      AW_CODEREVIEW_V1_KEY: ${{ secrets.AW_CODEREVIEW_V1_KEY }}
+      AW_DEVTEAM_MERGE_TOKEN: ${{ secrets.AW_DEVTEAM_MERGE_TOKEN }}
+      AW_DEVTEAM_EVENT_SECRET: ${{ secrets.AW_DEVTEAM_EVENT_SECRET }}
