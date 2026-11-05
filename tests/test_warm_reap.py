@@ -169,6 +169,13 @@ def test_unparseable_draining_suffix_is_skipped_not_crashed():
 
 def test_maybe_reap_runs_once_then_throttles(monkeypatch):
     calls = []
+    # A fake, controlled clock — not the real one. `_last_reap = 0.0` only
+    # means "elapsed since the epoch of this clock", and on a freshly booted
+    # CI runner `time.monotonic()` itself can read well under
+    # REAP_INTERVAL_S (600s) into the job, which silently turned both calls
+    # below into no-ops (clock stays far above REAP_INTERVAL_S here instead).
+    clock = [10_000.0]
+    monkeypatch.setattr(warm_pool.time, "monotonic", lambda: clock[0])
     monkeypatch.setattr(warm_pool, "reap", lambda client: calls.append(client))
     # Threads would make the assertion racy; run the body inline instead.
     monkeypatch.setattr(warm_pool.threading, "Thread",
@@ -183,6 +190,8 @@ def test_maybe_reap_runs_once_then_throttles(monkeypatch):
 
 def test_maybe_reap_runs_again_after_the_interval(monkeypatch):
     calls = []
+    clock = [10_000.0]
+    monkeypatch.setattr(warm_pool.time, "monotonic", lambda: clock[0])
     monkeypatch.setattr(warm_pool, "reap", lambda client: calls.append(client))
     monkeypatch.setattr(warm_pool.threading, "Thread",
                         lambda target, name=None, daemon=None: _InlineThread(target))
@@ -190,8 +199,7 @@ def test_maybe_reap_runs_again_after_the_interval(monkeypatch):
 
     client = _FakeClient([])
     warm_pool.maybe_reap(client)
-    monkeypatch.setattr(warm_pool, "_last_reap",
-                        time.monotonic() - warm_pool.REAP_INTERVAL_S - 1)
+    clock[0] += warm_pool.REAP_INTERVAL_S + 1
     warm_pool.maybe_reap(client)
     assert len(calls) == 2
 
