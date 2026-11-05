@@ -19,7 +19,7 @@ name: Code Review
 # repo changes this repo's merge gate with no commit on this repo — the same
 # shape as `app-release.yml`, referenced via a moving `@master` from ~45 app
 # repos, where one fail-loud edit reddened the whole marketplace at once.
-# Landing straight on v1.5.0 (the current tag, proven on 6 prior callers)
+# Landing straight on v1.5.0 (the current tag, proven on 5 prior callers)
 # rather than an earlier one — including its `provenance-gate` job (see
 # below) — avoids landing a caller already known to need a later bump.
 #
