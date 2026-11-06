@@ -1087,6 +1087,10 @@
     },
     "knowledge": {
       "path": "docs"
+    },
+    "agents_md": {
+      "path": "docs/AGENTS-block.md",
+      "title": "Inbound message routing"
     }
   },
   "config_schema": {
