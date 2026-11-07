@@ -180,6 +180,29 @@ three steps, in order, before you decide the verdict.
    commit or tag, not just a green workflow (see
    `aw-autoskill-verify-deploy-in-container` and sibling skills for how to
    check a live container rather than trusting the pipeline status alone).
+   **"CI green for that exact commit" means read `gh run list`, not `gh pr
+   checks`** — `gh pr checks` reports the most recent *terminal* result per
+   check name, so a check whose in-flight run on the true HEAD got
+   cancelled by a concurrency group (and nothing re-triggered it) still
+   shows as "pass" there, using an earlier commit's result. This is exactly
+   how a coder-sonnet delivery was reported "all green" (lint, pytest,
+   ai-review, deep code-review) on 2026-11-07 (card
+   `4115bf3b-9510-8156-9e5e-f6c772ad2538`) while the ai-review and
+   code-review runs on the real HEAD sat `cancelled` with nothing newer —
+   caught only by a human reading the raw run list, not by the coder or by
+   QA. Run this yourself before accepting the coder's "CI is green" claim:
+
+   ```bash
+   gh run list --repo <owner/repo> --branch <branch> --limit 20 \
+     --json databaseId,workflowName,status,conclusion,createdAt
+   ```
+
+   For every required workflow, find the entry with the latest `createdAt`
+   and confirm it is `status=completed` / `conclusion=success` — not
+   `cancelled` with nothing newer superseding it. If it is, that workflow
+   has not actually passed on HEAD; reject back to the coder (or
+   `gh run rerun <databaseId>` yourself and wait on it) rather than
+   recording a verdict off the per-check-name rollup.
    Do this **without waiting for approval** — ship is the default, not an
    ask. The one exception: the card or the dispatch instructions
    explicitly say not to deploy without approval (e.g. a card flagged for

@@ -444,8 +444,25 @@ proof. Follow up until terminal state.
 **You do this via a delegated agent — NOT in your own shell.** Dispatch
 `code-enhancer` (or whichever fits) to:
 
-1. Poll `gh pr checks <pr>` until every check reaches a terminal state
-   (`pass` | `fail` | `cancelled`). Cadence: 30–60 s; cap at 30 min wall.
+1. Poll the chronological run list, not `gh pr checks` — `gh pr checks`
+   reports the most recent *terminal* result per check name, so a check
+   whose in-flight run on the true HEAD got cancelled by a concurrency
+   group (and nothing re-triggered it) still shows as "pass" there, using
+   an EARLIER commit's result (same `aw-agent-coder`/`aw-agent-qa` gh-run-
+   staleness fix, card `4115bf3b-9510-8156-bbb6-e2072711d3ec`). Instead:
+
+   ```bash
+   gh run list --repo <owner/repo> --branch <branch> --limit 20 \
+     --json databaseId,workflowName,status,conclusion,createdAt
+   ```
+
+   For each required workflow, find the entry with the latest
+   `createdAt` and treat only that one as authoritative. Keep polling
+   (cadence: 30–60 s; cap at 30 min wall) until every required workflow's
+   latest run has reached a terminal `status` (`completed` | `cancelled`
+   | ...). A latest run that's `cancelled` with nothing newer is not a
+   pass — re-trigger it (`gh run rerun <databaseId>`) and wait on the new
+   run instead of accepting an older `gh pr checks` rollup entry.
 2. For **each failing check**, pull logs via
    `gh run view <run-id> --log-failed` and surface the verbatim error.
 3. Classify each failure:
