@@ -263,6 +263,15 @@ def resume_payload(run: dict, page_id: str, message: str) -> tuple[str, dict] | 
     explainable state — not an exception."""
     agent_slug = (run.get("source_slug") or "").strip()
     session_id = (run.get("session_id") or "").strip()
+    category = (run.get("category") or "").strip()
+    # Belt-and-braces: the caller is expected to have already filtered with
+    # category="work" (invoke_kanban_agent does); this refuses a monitor/
+    # wrapper row even if it somehow reaches here anyway, rather than
+    # resuming its own empty conversation as if it were the real coding
+    # session (Kanban 4115bf3b-9510-8156-9e5e-f6c772ad2538).
+    if category and category != "work":
+        return (f"the latest run for this card is a {category!r} dispatch (source_slug="
+                f"{agent_slug!r}), not the real agent session — nothing to resume")
     if not agent_slug:
         return "the latest run for this card has no source_slug (agent) to resume"
     if not session_id:
