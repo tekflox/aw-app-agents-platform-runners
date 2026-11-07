@@ -1376,7 +1376,9 @@ async def _list_tools() -> list[Tool]:
                                          "session_id": {"type": "string",
                                                         "description": "Filter to runs resumed under this CLI session id only."},
                                          "notion_task_id": {"type": "string",
-                                                             "description": "Filter to runs linked to this Notion Kanban page id only."}}}),
+                                                             "description": "Filter to runs linked to this Notion Kanban page id only."},
+                                         "category": {"type": "string",
+                                                      "description": "Filter by Run.category: 'work' (real agent/workflow dispatches) or 'monitor' (shell-wrapper dispatches like monitor-shell). Omit for no filter."}}}),
         Tool(name="get_run_detail",
              description=("FULL record for one Run: untruncated input/output, status, "
                           "timestamps, target_slug, agent/source_slug, cost, tokens, "
@@ -2694,7 +2696,13 @@ async def _dispatch_tool(name: str, arguments: dict[str, Any] | None) -> list[Te
                 return _err(400, "page_id is required — this run is not tied to a Kanban card, "
                                  "so there is nothing to infer it from.")
 
-            r = await c.get(f"{BASE}/api/runs", params={"notion_task_id": page_id, "limit": 1})
+            # category="work" excludes monitor/wrapper dispatches (e.g.
+            # monitor-shell) from "the run for this card" — without it, a
+            # wrapper row carrying its own session_id would be resumed as if
+            # it were the real coding session (Kanban
+            # 4115bf3b-9510-8156-9e5e-f6c772ad2538).
+            r = await c.get(f"{BASE}/api/runs",
+                            params={"notion_task_id": page_id, "category": "work", "limit": 1})
             if r.status_code != 200:
                 return _err(r.status_code, r.text)
             runs = r.json() or []
@@ -2844,6 +2852,8 @@ async def _dispatch_tool(name: str, arguments: dict[str, Any] | None) -> list[Te
                 params["session_id"] = args["session_id"]
             if args.get("notion_task_id"):
                 params["notion_task_id"] = args["notion_task_id"]
+            if args.get("category"):
+                params["category"] = args["category"]
             r = await c.get(f"{BASE}/api/runs", params=params)
             return _err(r.status_code, r.text) if r.status_code != 200 else _ok(r.json())
         if name == "get_run_detail":

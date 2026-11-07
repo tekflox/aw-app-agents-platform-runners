@@ -149,6 +149,29 @@ def test_a_run_with_no_agent_explains_itself():
     assert "source_slug" in reason
 
 
+def test_a_monitor_wrapper_run_is_refused_even_with_a_session_id():
+    """Belt-and-braces (Kanban 4115bf3b-9510-8156-9e5e-f6c772ad2538): a
+    monitor/wrapper row that DOES carry a session_id must still be refused
+    here, not resumed as if it were the real coding session — the caller is
+    expected to have already filtered with category="work", but this must
+    not silently resume one that slips through anyway."""
+    reason = kd.resume_payload(
+        {"source_slug": "monitor-shell", "session_id": "sess-wrapper", "category": "monitor"},
+        "page-1", "x")
+    assert isinstance(reason, str)
+    assert "monitor" in reason
+
+
+def test_a_work_category_run_still_resumes_normally():
+    """category="work" (the default once the column exists) must not be
+    mistaken for a non-work category and refused."""
+    path, payload = kd.resume_payload(
+        {"source_slug": "coder-sonnet", "session_id": "sess-1", "category": "work"},
+        "page-1", "keep going")
+    assert path == "/api/agents/coder-sonnet/run"
+    assert payload["session_id"] == "sess-1"
+
+
 # ── the board client's own failure surface ──────────────────────────────
 
 def test_board_prefers_the_published_url_over_loopback(monkeypatch):
