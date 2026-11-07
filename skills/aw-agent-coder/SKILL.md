@@ -134,6 +134,39 @@ Two things follow from that:
   of change to ever be reviewable, that's a real finding — say so on the
   card rather than working around the gap by hand every time.
 
+**Verify the latest commit's checks, not a stale per-check-name rollup.**
+`gh pr checks` reports the most recent *terminal* result per check name —
+if your own push's concurrency group cancelled an in-flight run on the new
+HEAD and nothing re-triggered it, `gh pr checks` still shows that check
+name as "pass", because it's surfacing an EARLIER commit's result, not the
+current HEAD's. There's no way to tell the difference from `gh pr checks`
+output alone. This bit a live delivery on 2026-11-07 (card
+`4115bf3b-9510-8156-9e5e-f6c772ad2538`): a coder-sonnet run reported
+"AP-MT PR #19: lint, pytest, ai-review, deep code-review all pass" right
+after its own push, but that push's concurrency group had cancelled the
+in-flight ai-review and code-review runs on the true latest commit and
+nothing re-ran them — only caught afterward by a human reading the
+chronological run list by hand, not by the coder or by QA.
+
+Before declaring a PR ready, confirm the real state with the chronological
+run list instead of the per-check rollup:
+
+```bash
+gh run list --repo <owner/repo> --branch <branch> --limit 20 \
+  --json databaseId,workflowName,status,conclusion,createdAt
+```
+
+For every workflow this repo requires before merge, find its entries and
+check the one with the latest `createdAt` — not the first match, not
+whatever `gh pr checks` shows. That latest run must be `status=completed`
+/ `conclusion=success`. If it's `cancelled` (or anything other than a
+successful completion) with nothing newer superseding it, the workflow has
+not actually passed on HEAD yet — re-trigger it (`gh run rerun
+<databaseId>`, or this repo's own re-trigger mechanism, e.g. an
+`/aw-review` PR comment) and wait for that new run's own exit before
+declaring the PR ready. Don't sign off "all green" off `gh pr checks`
+alone — it is exactly the check that missed this.
+
 If you touched or added tests, also confirm the pipeline actually **runs**
 them — a test file that passes when you invoke it manually but sits outside
 the CI job's discovered path (wrong directory, wrong naming convention, not
