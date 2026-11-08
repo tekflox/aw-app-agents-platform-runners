@@ -1493,8 +1493,74 @@ async def _list_tools() -> list[Tool]:
                  "status": {"type": "string",
                             "description": "Filter by status: active|completed|cancelled|abandoned."},
                  "q": {"type": "string", "description": "Search slug/name/description/source_ref."},
+                 "plan_slug": {"type": "string",
+                               "description": ("Only this Plan's member Targets. A Plan is the "
+                                               "umbrella ABOVE Targets — see `get_plan`.")},
                  "limit": {"type": "integer"},
              }}),
+        # ---- Plans (the umbrella above Targets) — read + the steward's
+        # terminal call. Plan umbrella Slice 3. The management surface
+        # (create/edit/attach/conclude) is Slice 5 and deliberately absent
+        # here: force, waive and reopen are human-only at every layer, and a
+        # tool that exposed them would be the one bypass of that rule.
+        Tool(name="get_plan",
+             description=("Fetch one Plan by slug — purpose, strategy, delivery "
+                          "criteria with their evidence, cadence, guardrails and "
+                          "iteration state. A Plan is the umbrella ABOVE Targets: one "
+                          "longer-running purpose delivered by many Targets, iterated "
+                          "on a cadence until its exit clause is satisfied."),
+             inputSchema={"type": "object",
+                          "properties": {"slug": {"type": "string"}},
+                          "required": ["slug"]}),
+        Tool(name="plan_summary",
+             description=("Rolled-up view of a Plan: member Targets with their status "
+                          "and spend, criteria satisfied/required counts, plan-level "
+                          "tokens/cost/budget %, next_fire_at, iteration count, and "
+                          "whether the exit clause and activation gate are currently "
+                          "met (with the specific problems when they are not). Read "
+                          "this before deciding what a plan needs next."),
+             inputSchema={"type": "object",
+                          "properties": {"slug": {"type": "string"}},
+                          "required": ["slug"]}),
+        Tool(name="list_plan_iterations",
+             description=("A Plan's iteration history, newest first — what each "
+                          "previous cadence tick decided and why. Includes the "
+                          "`auto_conclude` audit row a self-concluded plan writes "
+                          "(that one has no run)."),
+             inputSchema={"type": "object",
+                          "properties": {"slug": {"type": "string"},
+                                         "limit": {"type": "integer"}},
+                          "required": ["slug"]}),
+        Tool(name="finish_plan_iteration",
+             description=("TERMINAL call for a plan-steward iteration — close YOUR "
+                          "current iteration with the decision you took. Call this "
+                          "exactly once, as the last thing you do.\n\n"
+                          "`decision` is validated server-side: pushed | "
+                          "created_target | evidence_recorded | proposed_conclude | "
+                          "concluded | noop | blocked. Use `proposed_conclude` on a "
+                          "propose-only plan (auto_conclude=false) — closing one of "
+                          "those with `concluded` is refused, because only a human "
+                          "may conclude it.\n\n"
+                          "You do not need to pass ids: the iteration is resolved "
+                          "from your own run. **A 409 means your iteration was "
+                          "already closed** — normally the watchdog timed it out past "
+                          "`max_iteration_seconds` and another iteration may already "
+                          "hold the plan. That is not a retryable error and not "
+                          "something to work around: report it."),
+             inputSchema={"type": "object", "properties": {
+                 "decision": {"type": "string",
+                              "enum": ["pushed", "created_target", "evidence_recorded",
+                                       "proposed_conclude", "concluded", "noop",
+                                       "blocked"],
+                              "description": "What you did this iteration."},
+                 "notes": {"type": "string",
+                           "description": ("Why, in one or two sentences — read by "
+                                           "whoever asks months later why this plan "
+                                           "went the way it did.")},
+                 "plan_iteration_id": {"type": "string",
+                                       "description": ("Only when closing an iteration "
+                                                       "that is not your own run's.")},
+             }, "required": ["decision"]}),
         Tool(name="get_target",
              description="Fetch one Target's full spec by slug.",
              inputSchema={"type": "object",
@@ -3143,9 +3209,45 @@ async def _dispatch_tool(name: str, arguments: dict[str, Any] | None) -> list[Te
                 params["status"] = args["status"]
             if args.get("q"):
                 params["q"] = args["q"]
+            if args.get("plan_slug"):
+                params["plan_slug"] = args["plan_slug"]
             if args.get("limit"):
                 params["limit"] = str(args["limit"])
             r = await c.get(f"{BASE}/api/targets", params=params)
+            return _err(r.status_code, r.text) if r.status_code != 200 else _ok(r.json())
+        if name == "get_plan":
+            r = await c.get(f"{BASE}/api/plans/{args['slug']}")
+            return _err(r.status_code, r.text) if r.status_code != 200 else _ok(r.json())
+        if name == "plan_summary":
+            r = await c.get(f"{BASE}/api/plans/{args['slug']}/summary")
+            return _err(r.status_code, r.text) if r.status_code != 200 else _ok(r.json())
+        if name == "list_plan_iterations":
+            params = {}
+            if args.get("limit"):
+                params["limit"] = str(args["limit"])
+            r = await c.get(f"{BASE}/api/plans/{args['slug']}/iterations", params=params)
+            return _err(r.status_code, r.text) if r.status_code != 200 else _ok(r.json())
+        if name == "finish_plan_iteration":
+            # `run_id` is the CALLER'S OWN run, resolved the same way every
+            # other self-referential tool here does it (see `_caller_run_id`:
+            # gateway-injected, with AW_RUN_ID as the direct-invocation
+            # fallback) — never something the model supplies, because a
+            # steward that could name any run could close another plan's
+            # iteration. The server resolves the iteration from
+            # `runs.plan_iteration_id`, the same resolution its executor
+            # backstop uses, so the tool and the backstop cannot disagree
+            # about which iteration a run owns.
+            body = {"decision": args["decision"], "notes": args.get("notes") or ""}
+            if args.get("plan_iteration_id"):
+                body["plan_iteration_id"] = args["plan_iteration_id"]
+            elif _rid := _caller_run_id(args):
+                body["run_id"] = _rid
+            else:
+                return _err(400, "cannot tell which iteration to close: no caller run "
+                                 "id is available in this session and no "
+                                 "plan_iteration_id was given. Pass "
+                                 "plan_iteration_id (it is in your iteration prompt).")
+            r = await c.post(f"{BASE}/api/plans/finish-iteration", json=body)
             return _err(r.status_code, r.text) if r.status_code != 200 else _ok(r.json())
         if name == "get_target":
             r = await c.get(f"{BASE}/api/targets/{args['slug']}")
