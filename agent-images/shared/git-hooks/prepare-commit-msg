@@ -39,6 +39,26 @@ if [ -f "$warm_dir/current_run_id" ]; then
 fi
 [ -n "$run_id" ] || run_id="${AW_RUN_ID:-}"
 
+# Normalize a DASHED UUID to the bare 32-hex form the provenance gate's
+# regex requires (`^AW-Run-Id: [0-9a-f]{32}$`, aw-shared-workflows'
+# code-review-reusable.yml). Some run-id producers emit `4d86fe4e-451f-
+# 4c4c-8da7-0368afb2a99e`, others the bare hex form — both encode the same
+# 32 hex digits. Scoped to the exact UUID shape (stripped-and-lowercased
+# result is 32 hex chars) rather than an unconditional `tr -d -`, which
+# would also mangle a non-UUID identifier that happens to contain a dash
+# (e.g. a manually-set test/debug run id) into something neither format.
+# Confirmed live: a dashed $AW_RUN_ID stamped unnormalized failed
+# provenance-gate on agents-platform-multitenant PR #32 with "no commit ...
+# carries a well-formed AW-Run-Id trailer" despite a real run id being
+# present.
+_stripped=$(printf '%s' "$run_id" | tr -d '-' | tr 'A-F' 'a-f')
+case "$_stripped" in
+    [0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f])
+        run_id="$_stripped"
+        ;;
+esac
+unset _stripped
+
 # No identity at all — a human committing from outside a runner container,
 # or any context that never set one of the above up. No-op, silently, same
 # as if this hook did not exist.
