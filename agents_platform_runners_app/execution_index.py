@@ -809,12 +809,18 @@ def sweep_retry_queue(config: dict | None = None) -> dict[str, int]:
         except (TypeError, ValueError):
             age = ORPHAN_ADOPT_AFTER_S + 1  # malformed entry — adopt it too
         if age > ORPHAN_ADOPT_AFTER_S:
+            # Queue first, THEN clear the inflight entry — not the other
+            # order. A crash between the two calls must leave the run
+            # recoverable from at least one of the two structures; clearing
+            # inflight first would lose it from both if the process dies
+            # before _queue_retry runs, reintroducing exactly the silent
+            # loss this registry exists to prevent.
+            _queue_retry(run_id, "watcher_orphaned")
             try:
                 client.hdel(_INFLIGHT_KEY, run_id)
             except Exception:
                 log.debug("execution index: could not clear adopted inflight entry %s",
                          run_id, exc_info=True)
-            _queue_retry(run_id, "watcher_orphaned")
             _incr("warm_watchers_orphaned")
             result["adopted"] += 1
     try:
