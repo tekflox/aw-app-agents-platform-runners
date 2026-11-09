@@ -566,6 +566,142 @@ def test_warm_watcher_gap_visible_when_resolution_never_runs(monkeypatch):
     assert snapshot["warm_watchers_resolved"] == 0
 
 
+# --- In-flight warm-watcher registry (card 4135bf3b-9510-8132-880e-
+# ce48d0644338) --------------------------------------------------------
+#
+# The lifetime started/resolved gap above is a non-decreasing ratchet by
+# construction (never reset) — the doctor no longer gates on it. This
+# registry is both the windowed, self-clearing replacement signal AND the
+# list of orphaned run_ids nobody previously generated: a run_id -> start
+# epoch HASH, HSET at the same point warm_watchers_started increments and
+# HDEL on every one of _wait()'s resolution branches. An entry still
+# present past ORPHAN_ADOPT_AFTER_S is a provably dead thread.
+
+
+def test_inflight_registry_entry_present_while_watcher_is_stuck(monkeypatch):
+    """HSET happens synchronously in the calling thread right before
+    thread.start() — same reasoning and same non-race guarantee as
+    test_warm_watcher_gap_visible_when_resolution_never_runs above."""
+    block_forever = threading.Event()
+
+    def _blocking_xread(self, *_a, **_k):
+        block_forever.wait()
+        return []
+
+    fake = FakeCounterRedis()
+    monkeypatch.setattr(idx, "_counter_redis_client", lambda: fake)
+    idx.configure({"execution_index_mode": "all"})
+    _install_fake_redis_module(monkeypatch, _blocking_xread)
+
+    thread = idx.start_after_stream_done("warm-stuck-inflight", "redis://fake")
+    assert thread is not None
+
+    assert "warm-stuck-inflight" in fake.hashes[idx._INFLIGHT_KEY]
+
+
+def test_inflight_registry_cleared_on_the_done_resolution_branch(monkeypatch):
+    fake = FakeCounterRedis()
+    monkeypatch.setattr(idx, "_counter_redis_client", lambda: fake)
+    idx.configure({"execution_index_mode": "all"})
+    monkeypatch.setattr(idx, "index_run", lambda run_id, **_kw: None)
+    _install_fake_redis_module(
+        monkeypatch, lambda self, *_a, **_k: [("stream", [("1-0", {"done": "1"})])])
+
+    thread = idx.start_after_stream_done("warm-done-inflight", "redis://fake")
+    thread.join(timeout=1)
+
+    assert "warm-done-inflight" not in fake.hashes.get(idx._INFLIGHT_KEY, {})
+
+
+def test_inflight_registry_cleared_on_the_deadline_resolution_branch(monkeypatch):
+    fake = FakeCounterRedis()
+    monkeypatch.setattr(idx, "_counter_redis_client", lambda: fake)
+    idx.configure({"execution_index_mode": "all"})
+
+    clock = iter([0, 100000])
+    monkeypatch.setattr(idx.time, "monotonic", lambda: next(clock))
+    _install_fake_redis_module(monkeypatch, lambda self, *_a, **_k: [])
+
+    thread = idx.start_after_stream_done("warm-deadline-inflight", "redis://fake")
+    thread.join(timeout=1)
+
+    assert "warm-deadline-inflight" not in fake.hashes.get(idx._INFLIGHT_KEY, {})
+
+
+def test_inflight_registry_cleared_on_the_exception_resolution_branch(monkeypatch):
+    fake = FakeCounterRedis()
+    monkeypatch.setattr(idx, "_counter_redis_client", lambda: fake)
+    idx.configure({"execution_index_mode": "all"})
+
+    def _raising_xread(self, *_a, **_k):
+        raise RuntimeError("boom")
+
+    _install_fake_redis_module(monkeypatch, _raising_xread)
+
+    thread = idx.start_after_stream_done("warm-exc-inflight", "redis://fake")
+    thread.join(timeout=1)
+
+    assert "warm-exc-inflight" not in fake.hashes.get(idx._INFLIGHT_KEY, {})
+
+
+def test_inflight_registry_cleared_when_thread_start_itself_raises(monkeypatch):
+    fake = FakeCounterRedis()
+    monkeypatch.setattr(idx, "_counter_redis_client", lambda: fake)
+    idx.configure({"execution_index_mode": "all"})
+    _install_fake_redis_module(monkeypatch, lambda self, *_a, **_k: [])
+
+    def _raise_on_start(self):
+        raise RuntimeError("could not start thread")
+
+    monkeypatch.setattr(idx.threading.Thread, "start", _raise_on_start)
+
+    thread = idx.start_after_stream_done("warm-start-fails", "redis://fake")
+
+    assert thread is None
+    assert "warm-start-fails" not in fake.hashes.get(idx._INFLIGHT_KEY, {})
+
+
+def test_sweep_retry_queue_adopts_an_old_inflight_entry(monkeypatch):
+    """An inflight entry older than ORPHAN_ADOPT_AFTER_S is a provably dead
+    thread — adopted into the retry queue, counted in
+    warm_watchers_orphaned, and never counted as warm_watchers_resolved
+    (design doc §6: lifetime counters are never reinterpreted). The
+    adoption pass runs before this same call's own drain step, so the
+    freshly-queued entry is also attempted (and, here, re-queued) within
+    this one sweep — stub index_run so that re-attempt is deterministic
+    and makes no real network call."""
+    fake = FakeCounterRedis()
+    monkeypatch.setattr(idx, "_counter_redis_client", lambda: fake)
+    monkeypatch.setattr(idx, "index_run", lambda run_id, **_kw: False)
+    old_start = time.time() - (idx.ORPHAN_ADOPT_AFTER_S + 1)
+    fake.hashes[idx._INFLIGHT_KEY] = {"run-old": str(old_start)}
+
+    result = idx.sweep_retry_queue()
+
+    assert result["adopted"] == 1
+    assert "run-old" not in fake.hashes.get(idx._INFLIGHT_KEY, {})
+    assert fake.hashes[idx._RETRY_QUEUE_KEY] == {"run-old": "1:watcher_orphaned"}
+    snapshot = idx.counters_snapshot()
+    assert snapshot["warm_watchers_orphaned"] == 1
+    assert snapshot["warm_watchers_resolved"] == 0
+
+
+def test_sweep_retry_queue_leaves_a_young_inflight_entry_untouched(monkeypatch):
+    """A watcher still legitimately in flight (younger than
+    ORPHAN_ADOPT_AFTER_S) must not be mistaken for a leak — _wait() can
+    legitimately run for up to _WATCHER_DEADLINE_S."""
+    fake = FakeCounterRedis()
+    monkeypatch.setattr(idx, "_counter_redis_client", lambda: fake)
+    recent_start = time.time() - 60
+    fake.hashes[idx._INFLIGHT_KEY] = {"run-recent": str(recent_start)}
+
+    result = idx.sweep_retry_queue()
+
+    assert result["adopted"] == 0
+    assert fake.hashes[idx._INFLIGHT_KEY] == {"run-recent": str(recent_start)}
+    assert idx._RETRY_QUEUE_KEY not in fake.hashes
+
+
 def test_warm_watchers_resolved_increments_on_the_deadline_branch(monkeypatch):
     fake = FakeCounterRedis()
     monkeypatch.setattr(idx, "_counter_redis_client", lambda: fake)
@@ -602,10 +738,15 @@ def test_execution_index_status_endpoint_reports_the_raw_counters(monkeypatch):
     assert set(body.keys()) == set(idx.COUNTER_NAMES) | {"retry_queue"}
 
 
-def test_execution_index_doctor_flags_a_persistent_warm_watcher_gap(monkeypatch):
+def test_execution_index_doctor_reports_the_lifetime_gap_as_data_but_never_gates_on_it(monkeypatch):
+    """Card 4135bf3b-9510-8132-880e-ce48d0644338: the lifetime
+    warm_watchers_started/resolved gap is a non-decreasing ratchet by
+    construction (never reset) — the doctor must keep reporting it in
+    detail.counters as raw data, but a huge lifetime gap alone must never
+    be a problem on its own."""
     fake = FakeCounterRedis()
     monkeypatch.setattr(idx, "_counter_redis_client", lambda: fake)
-    fake.data[idx._COUNTER_PREFIX + "warm_watchers_started"] = "30"
+    fake.data[idx._COUNTER_PREFIX + "warm_watchers_started"] = "300"
     fake.data[idx._COUNTER_PREFIX + "warm_watchers_resolved"] = "1"
 
     client = TestClient(build_routes({"exec_index_url": ""}))
@@ -613,8 +754,106 @@ def test_execution_index_doctor_flags_a_persistent_warm_watcher_gap(monkeypatch)
 
     assert resp.status_code == 200
     body = resp.json()
+    assert body["ok"] is True
+    assert body["detail"]["counters"]["warm_watchers_started"] == 300
+    assert body["detail"]["counters"]["warm_watchers_resolved"] == 1
+    assert body["detail"]["problems"] == []
+
+
+def test_execution_index_doctor_flags_restart_churn_above_the_orphan_threshold(monkeypatch):
+    """Problem (a): orphans now RECOVER via the hourly sweep's adoption
+    pass, so a growing windowed orphan rate signals restart churn, not
+    permanent loss."""
+    from agents_platform_runners_app import routes as routes_mod
+
+    fake = FakeCounterRedis()
+    monkeypatch.setattr(idx, "_counter_redis_client", lambda: fake)
+    fake.data[_window_key("warm_watchers_orphaned")] = str(
+        routes_mod._WARM_WATCHER_ORPHANED_THRESHOLD + 1)
+
+    client = TestClient(build_routes({"exec_index_url": ""}))
+    body = client.get("/execution-index/doctor").json()
+
     assert body["ok"] is False
-    assert any("warm_watchers_started" in p for p in body["detail"]["problems"])
+    assert any("warm_watchers_orphaned" in p for p in body["detail"]["problems"])
+
+
+def test_execution_index_doctor_clears_once_the_orphan_rate_drops_back_to_normal(monkeypatch):
+    """Same check as above, but the window shows no orphans — proves (a)
+    self-clears once restart churn stops, instead of staying red forever."""
+    fake = FakeCounterRedis()
+    monkeypatch.setattr(idx, "_counter_redis_client", lambda: fake)
+    fake.data[_window_key("warm_watchers_orphaned")] = "0"
+
+    client = TestClient(build_routes({"exec_index_url": ""}))
+    body = client.get("/execution-index/doctor").json()
+
+    assert body["ok"] is True
+    assert body["detail"]["problems"] == []
+
+
+def test_execution_index_doctor_flags_a_stuck_adoption_pass(monkeypatch):
+    """Problem (b): an in-flight entry that outlives ORPHAN_ADOPT_AFTER_S
+    plus the doctor's own 2h grace means the sweep itself has stopped
+    adopting — e.g. the watchdog isn't ticking, or 'watchdog:tasks' was
+    never granted."""
+    from agents_platform_runners_app import routes as routes_mod
+
+    fake = FakeCounterRedis()
+    monkeypatch.setattr(idx, "_counter_redis_client", lambda: fake)
+    stuck_start = time.time() - (routes_mod._ADOPTION_STUCK_AFTER_S + 1)
+    fake.hashes[idx._INFLIGHT_KEY] = {"run-stuck": str(stuck_start)}
+
+    client = TestClient(build_routes({"exec_index_url": ""}))
+    body = client.get("/execution-index/doctor").json()
+
+    assert body["ok"] is False
+    assert any("adoption pass appears to have stopped" in p for p in body["detail"]["problems"])
+    assert body["detail"]["warm_watchers_inflight"]["count"] == 1
+
+
+def test_execution_index_doctor_does_not_flag_a_healthy_inflight_entry(monkeypatch):
+    """Same check as above, but the entry is young — proves (b) self-clears
+    for an ordinary, still-legitimately-watching warm run."""
+    fake = FakeCounterRedis()
+    monkeypatch.setattr(idx, "_counter_redis_client", lambda: fake)
+    fake.hashes[idx._INFLIGHT_KEY] = {"run-fresh": str(time.time() - 60)}
+
+    client = TestClient(build_routes({"exec_index_url": ""}))
+    body = client.get("/execution-index/doctor").json()
+
+    assert body["ok"] is True
+    assert body["detail"]["problems"] == []
+
+
+def test_execution_index_doctor_flags_any_retry_exhausted_in_the_window(monkeypatch):
+    """Problem (c): retry_exhausted is the only remaining path to losing a
+    run forever — not covered by the failure-ratio prefix rule, which only
+    sums skipped:* counters."""
+    fake = FakeCounterRedis()
+    monkeypatch.setattr(idx, "_counter_redis_client", lambda: fake)
+    fake.data[_window_key("retry_exhausted")] = "1"
+
+    client = TestClient(build_routes({"exec_index_url": ""}))
+    body = client.get("/execution-index/doctor").json()
+
+    assert body["ok"] is False
+    assert any("retry_exhausted" in p for p in body["detail"]["problems"])
+
+
+def test_execution_index_doctor_clears_once_retry_exhausted_ages_out_of_the_window(monkeypatch):
+    """Same check as above, but the exhaustion is historical (lifetime-only,
+    outside the window) — proves (c) self-clears instead of staying red
+    forever over one old incident."""
+    fake = FakeCounterRedis()
+    monkeypatch.setattr(idx, "_counter_redis_client", lambda: fake)
+    fake.data[idx._COUNTER_PREFIX + "retry_exhausted"] = "5"
+
+    client = TestClient(build_routes({"exec_index_url": ""}))
+    body = client.get("/execution-index/doctor").json()
+
+    assert body["ok"] is True
+    assert body["detail"]["problems"] == []
 
 
 def test_execution_index_doctor_ok_with_high_gate_ratio_and_zero_failures(monkeypatch):
@@ -848,7 +1087,7 @@ def test_sweep_retry_queue_removes_entry_on_success(monkeypatch):
 
     result = idx.sweep_retry_queue()
 
-    assert result == {"queued": 1, "indexed": 1, "gated": 0, "requeued": 0, "exhausted": 0}
+    assert result == {"queued": 1, "indexed": 1, "gated": 0, "requeued": 0, "exhausted": 0, "adopted": 0}
     assert fake.hashes[idx._RETRY_QUEUE_KEY] == {}
 
 
@@ -942,11 +1181,11 @@ def test_sweep_retry_queue_is_a_noop_when_queue_is_empty(monkeypatch):
 
     result = idx.sweep_retry_queue()
 
-    assert result == {"queued": 0, "indexed": 0, "gated": 0, "requeued": 0, "exhausted": 0}
+    assert result == {"queued": 0, "indexed": 0, "gated": 0, "requeued": 0, "exhausted": 0, "adopted": 0}
 
 
 def test_sweep_retry_queue_returns_zeros_when_redis_unavailable():
     # No override — conftest's default _counter_redis_client returns None.
     result = idx.sweep_retry_queue()
 
-    assert result == {"queued": 0, "indexed": 0, "gated": 0, "requeued": 0, "exhausted": 0}
+    assert result == {"queued": 0, "indexed": 0, "gated": 0, "requeued": 0, "exhausted": 0, "adopted": 0}
