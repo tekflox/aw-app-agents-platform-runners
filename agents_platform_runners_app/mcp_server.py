@@ -1561,6 +1561,58 @@ async def _list_tools() -> list[Tool]:
                                        "description": ("Only when closing an iteration "
                                                        "that is not your own run's.")},
              }, "required": ["decision"]}),
+        # ---- Plan MEMORY (Plan umbrella Slice 8, card
+        # 4135bf3b-9510-819c-bef0-d50d2440cf90). The iteration prompt
+        # already carries a DIGEST of this document every cycle —
+        # `summary`, `state`, the version and the ext subtrees' NAMES — so
+        # these two tools exist for the two things the digest deliberately
+        # cannot do: read one ext BODY, and write.
+        Tool(name="get_plan_memory",
+             description=("Read a Plan's full JSON memory document — the shared "
+                          "`summary`/`state` plus EVERY writer's `ext` subtree, "
+                          "which your iteration prompt lists by name only.\n\n"
+                          "Call this when you need another writer's state (or your "
+                          "own from a previous cycle) in full. If all you need is "
+                          "the summary and state, you already have them: they are "
+                          "in the prompt, and re-reading them here costs a tool "
+                          "call for nothing."),
+             inputSchema={"type": "object",
+                          "properties": {"slug": {"type": "string",
+                                                  "description": "The plan's slug."}},
+                          "required": ["slug"]}),
+        Tool(name="update_plan_memory",
+             description=("Write what the NEXT cycle needs to know into a Plan's "
+                          "memory.\n\n"
+                          "`writer_key` names YOUR subtree under `ext` and is the "
+                          "only part of the document this can replace — use a "
+                          "stable key (normally your own agent slug), because a "
+                          "new key each cycle is a new subtree each cycle and the "
+                          "document has a 64 KiB ceiling.\n\n"
+                          "`summary` and `state` are SHARED and optional: omit "
+                          "them to leave them exactly as they are. Send `summary` "
+                          "only when you mean to change what every future cycle "
+                          "reads first — it is rendered verbatim into every "
+                          "steward prompt and is capped at 2000 characters.\n\n"
+                          "No version to pass: the write is scoped to your subtree "
+                          "and the server serializes it under a row lock, so it "
+                          "cannot clobber another writer's keys. A 413 means the "
+                          "whole document would exceed 64 KiB — trim your own "
+                          "subtree rather than retrying."),
+             inputSchema={"type": "object", "properties": {
+                 "slug": {"type": "string", "description": "The plan's slug."},
+                 "writer_key": {"type": "string",
+                                "description": ("Your subtree's key under `ext` — "
+                                                "letters/digits then . _ : - , max "
+                                                "64 chars. Normally your agent slug.")},
+                 "value": {"description": ("Whatever you want to remember. Any JSON "
+                                           "value; replaces your subtree outright.")},
+                 "summary": {"type": "string",
+                             "description": ("OPTIONAL, SHARED. Max 2000 chars. Omit "
+                                             "to leave the current summary alone.")},
+                 "state": {"type": "object",
+                           "description": ("OPTIONAL, SHARED. Omit to leave the "
+                                           "current state alone.")},
+             }, "required": ["slug", "writer_key", "value"]}),
         Tool(name="get_target",
              description="Fetch one Target's full spec by slug.",
              inputSchema={"type": "object",
@@ -3248,6 +3300,25 @@ async def _dispatch_tool(name: str, arguments: dict[str, Any] | None) -> list[Te
                                  "plan_iteration_id was given. Pass "
                                  "plan_iteration_id (it is in your iteration prompt).")
             r = await c.post(f"{BASE}/api/plans/finish-iteration", json=body)
+            return _err(r.status_code, r.text) if r.status_code != 200 else _ok(r.json())
+        if name == "get_plan_memory":
+            r = await c.get(f"{BASE}/api/plans/{args['slug']}/memory")
+            return _err(r.status_code, r.text) if r.status_code != 200 else _ok(r.json())
+        if name == "update_plan_memory":
+            # Only the keys the caller actually sent: `summary`/`state` are
+            # None-means-ABSENT server-side (omitting them preserves the
+            # shared fields), so passing an explicit null here would be the
+            # same as omitting them but relies on the server reading it that
+            # way — building the body from what was sent keeps the contract
+            # in one place.
+            body: dict = {"value": args.get("value")}
+            if args.get("summary") is not None:
+                body["summary"] = args["summary"]
+            if args.get("state") is not None:
+                body["state"] = args["state"]
+            r = await c.put(
+                f"{BASE}/api/plans/{args['slug']}/memory/ext/{args['writer_key']}",
+                json=body)
             return _err(r.status_code, r.text) if r.status_code != 200 else _ok(r.json())
         if name == "get_target":
             r = await c.get(f"{BASE}/api/targets/{args['slug']}")
