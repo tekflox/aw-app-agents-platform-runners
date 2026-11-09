@@ -220,3 +220,107 @@ def test_only_the_read_and_terminal_plan_tools_exist(monkeypatch):
             "finish_plan_iteration"} <= names
     assert not {"conclude_plan", "reopen_plan", "force_conclude_plan",
                 "waive_plan_criterion"} & names
+
+
+# ---------------------------------------------------------------------------
+# Plan MEMORY — Slice 8 (AP-MT Kanban 4135bf3b-9510-819c-bef0-d50d2440cf90)
+# ---------------------------------------------------------------------------
+
+def test_get_plan_memory_reaches_the_memory_endpoint(monkeypatch):
+    req = _call(monkeypatch, "get_plan_memory", {"slug": "my-plan"},
+                payload={"memory": {}, "version": 0})
+    assert req.method == "GET"
+    assert req.url.path == "/api/plans/my-plan/memory"
+
+
+def test_update_plan_memory_writes_the_callers_OWN_ext_subtree(monkeypatch):
+    """The writer key goes in the PATH, not the body.
+
+    That is the whole scoping contract: the endpoint replaces
+    `ext[<writer_key>]` and nothing else, and it is what lets this tool take
+    no version echo. A handler that sent the key in the body instead would
+    hit `PUT /memory` — the human FULL-REPLACE path — which would blank
+    every other writer's subtree and 409 on the missing version.
+    """
+    req = _call(monkeypatch, "update_plan_memory",
+                {"slug": "my-plan", "writer_key": "kanban-sweeper",
+                 "value": {"cursor": "abc"}},
+                payload={"memory": {}, "version": 1})
+    assert req.method == "PUT"
+    assert req.url.path == "/api/plans/my-plan/memory/ext/kanban-sweeper"
+    assert json.loads(req.content) == {"value": {"cursor": "abc"}}
+
+
+def test_update_plan_memory_OMITS_the_shared_fields_it_was_not_given(monkeypatch):
+    """`summary`/`state` are shared, and absent means "leave them alone".
+
+    Sending them as explicit nulls would be the same thing server-side
+    today, but it makes this layer depend on that reading; omitting them
+    keeps the contract in one place. Getting this wrong in the other
+    direction — sending `""` — would silently blank the summary every
+    steward prompt renders.
+    """
+    req = _call(monkeypatch, "update_plan_memory",
+                {"slug": "my-plan", "writer_key": "a", "value": 1},
+                payload={"memory": {}, "version": 1})
+    body = json.loads(req.content)
+    assert "summary" not in body
+    assert "state" not in body
+
+
+def test_update_plan_memory_forwards_the_shared_fields_when_given(monkeypatch):
+    req = _call(monkeypatch, "update_plan_memory",
+                {"slug": "my-plan", "writer_key": "a", "value": 1,
+                 "summary": "two cards left", "state": {"pass": 4}},
+                payload={"memory": {}, "version": 1})
+    assert json.loads(req.content) == {"value": 1, "summary": "two cards left",
+                                       "state": {"pass": 4}}
+
+
+def test_a_null_value_is_still_sent(monkeypatch):
+    """`ext["x"] = null` is a writer saying "I have no state", which is
+    different from the key being absent — so `value` is always in the body,
+    unlike the two optional shared fields."""
+    req = _call(monkeypatch, "update_plan_memory",
+                {"slug": "my-plan", "writer_key": "a", "value": None},
+                payload={"memory": {}, "version": 1})
+    assert json.loads(req.content) == {"value": None}
+
+
+def test_update_plan_memory_declares_what_it_requires():
+    """A required field missing from the schema is a field the model will
+    omit, producing a 422 the agent reads as a tool bug."""
+    schema = _tool("update_plan_memory").inputSchema
+    assert set(schema["required"]) == {"slug", "writer_key", "value"}
+    assert set(schema["properties"]) == {"slug", "writer_key", "value",
+                                         "summary", "state"}
+
+
+def test_the_memory_descriptions_carry_the_three_rules_an_agent_needs():
+    """The prompt already carries summary/state/version/ext_keys every
+    cycle, so the two things an agent can only learn here are: use a STABLE
+    writer key, and omitting `summary` preserves it. The 64 KiB ceiling is
+    the third — a 413 with no explanation reads as a transient failure to
+    retry, which is the worst possible reaction to it."""
+    desc = _tool("update_plan_memory").description
+    assert "stable key" in desc
+    assert "omit" in desc.lower()
+    assert "64 KiB" in desc
+    assert "413" in desc
+    read_desc = _tool("get_plan_memory").description
+    assert "ext" in read_desc
+
+
+def test_the_memory_tools_exist_and_no_full_replace_tool_does(monkeypatch):
+    """There must be no agent-facing FULL-REPLACE tool.
+
+    The whole-document `PUT /memory` is the human editor's path: it takes a
+    version echo, it 409s on a stale one, and it can blank every other
+    writer's subtree. An agent reaching it would turn a scoped write that
+    cannot lose data into one that can — the same "no tool exposes it"
+    discipline force/waive/reopen already get above.
+    """
+    names = {t.name for t in asyncio.run(mcp_server._list_tools())}
+    assert {"get_plan_memory", "update_plan_memory"} <= names
+    assert not {"replace_plan_memory", "put_plan_memory",
+                "set_plan_memory"} & names
