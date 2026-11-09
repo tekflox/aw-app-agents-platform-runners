@@ -107,11 +107,15 @@ REAL_HOME = os.environ.get("HOME") or "/home/ubuntu"
 #: but a full clone of the plugins repo the CLI drops in `creds/.tmp/plugins`
 #: (a 23 MB git pack plus assets, 5,491 files), re-cloned every single run.
 #:
-#: Age is the right discriminator and the margin is what makes it safe: a run
-#: that is still executing has a dir minutes old, and nothing here runs for
-#: days. Two days is far beyond any run's life and still bounds the total at
-#: roughly two days of traffic.
-ISOLATED_KEEP_SECONDS = int(os.environ.get("AW_RUNNER_ISOLATED_KEEP_SECONDS") or 2 * 86400)
+#: Age is the right discriminator, measured as time since the newest write
+#: anywhere in the dir (see _recent_activity), so a run that is still
+#: executing is never a candidate however long it has been going.
+#:
+#: Was two days; cut to three hours on 2026-11-09. At ~400 runs/day and
+#: ~127 MB each, two days of copies was ~100 GB and took the 436 GB root disk
+#: to 96% twice in one week. Three idle hours is far beyond the end of any
+#: run — the copy is only read at its start — and bounds the pool at a few GB.
+ISOLATED_KEEP_SECONDS = int(os.environ.get("AW_RUNNER_ISOLATED_KEEP_SECONDS") or 3 * 3600)
 
 #: What the per-run creds copy leaves behind.
 #:
@@ -181,8 +185,13 @@ ISOLATED_KEEP_SECONDS = int(os.environ.get("AW_RUNNER_ISOLATED_KEEP_SECONDS") or
 #: here explicitly anyway so a future reorg of `plugins/` can't silently
 #: resurrect it — a headless runner job has no business copying, let alone
 #: dialing, a third party's MCP endpoint on the shared account's OAuth.
+#:
+#: `generated_images` joined 2026-11-09: images the CLI has generated for the
+#: shared account, ~39 MB of the ~127 MB each run copied — an OUTPUT of past
+#: runs that nothing reads back from a staged copy.
 CREDS_COPY_IGNORE = ("isolated", "sessions", "cache", ".tmp", "tmp", "packages",
-                      "app-server-control", "app-server-daemon", "openai-curated-remote")
+                      "app-server-control", "app-server-daemon", "openai-curated-remote",
+                      "generated_images")
 
 
 def _creds_copy_ignore(directory: str, names: list[str]) -> set[str]:
@@ -276,20 +285,34 @@ def _recent_activity(entry: "Path") -> float:
     spends an hour appending to state_5.sqlite leaves its run dir looking
     exactly as old as the moment it was created.
 
-    One level down is where the evidence is (creds/ gains and loses files
-    throughout a run) and is one listdir, not a walk of 5,491 files. Combined
-    with a window measured in days it means an active run is never a
-    candidate — which is the property this whole function has to have.
+    Two levels down is where the evidence is: creds/ is the child, and the
+    files inside it (state_5.sqlite, its WAL, logs) are what a live run keeps
+    writing without ever changing creds/'s own mtime. That is one listdir per
+    child, not a walk of 5,491 files. With the window now measured in hours
+    rather than days, counting those files is what keeps an hours-long run
+    from looking idle — it is the property this whole function has to have.
     """
     newest = entry.stat().st_mtime
     try:
-        for child in entry.iterdir():
-            try:
-                newest = max(newest, child.stat().st_mtime)
-            except OSError:
-                continue
+        children = list(entry.iterdir())
     except OSError:
-        pass
+        return newest
+    for child in children:
+        try:
+            st = child.stat()
+        except OSError:
+            continue
+        newest = max(newest, st.st_mtime)
+        if not stat.S_ISDIR(st.st_mode):
+            continue
+        try:
+            for grandchild in child.iterdir():
+                try:
+                    newest = max(newest, grandchild.stat().st_mtime)
+                except OSError:
+                    continue
+        except OSError:
+            continue
     return newest
 CONTAINER_SOCKET = os.environ.get("AW_CONTAINER_SOCKET")
 

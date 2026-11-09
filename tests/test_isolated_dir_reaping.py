@@ -100,10 +100,37 @@ def test_an_undeletable_entry_never_fails_the_dispatch(tmp_path, monkeypatch):
     _reap_isolated_dirs(tmp_path)  # must not raise
 
 
-def test_the_window_is_far_longer_than_any_run():
-    """The safety margin IS the design. A value near a run's duration would
-    turn this from housekeeping into a race."""
-    assert ISOLATED_KEEP_SECONDS >= 86400
+def test_the_window_is_hours_not_days():
+    """Two days of ~127 MB copies was ~100 GB and filled the root disk twice in
+    a week (2026-11-09). The window must stay short enough to bound the pool,
+    and long enough that it is a margin rather than a race."""
+    assert 3600 <= ISOLATED_KEEP_SECONDS <= 12 * 3600
+
+
+def test_a_run_that_only_writes_inside_creds_is_never_a_candidate(tmp_path):
+    """With a window of hours, the dir's and creds/'s own mtimes no longer
+    cover a long run: appending to state_5.sqlite moves neither. The newest
+    FILE inside creds/ has to count, or a live run looks idle."""
+    running = _aged(tmp_path / "run-sqlite", ISOLATED_KEEP_SECONDS * 10)
+    db = running / "creds" / "state_5.sqlite"
+    db.write_text("rows")  # a fresh file inside creds/ ...
+    when = time.time() - ISOLATED_KEEP_SECONDS * 10
+    for p in (running / "creds", running):  # ... while every directory looks ancient
+        os.utime(p, (when, when))
+    _reap_isolated_dirs(tmp_path)
+    assert running.exists()
+
+
+def test_a_dir_whose_files_are_all_idle_is_reaped(tmp_path):
+    old = _aged(tmp_path / "run-idle", ISOLATED_KEEP_SECONDS + 60)
+    db = old / "creds" / "state_5.sqlite"
+    db.write_text("rows")
+    when = time.time() - ISOLATED_KEEP_SECONDS - 60
+    os.utime(db, (when, when))
+    for p in (old / "creds", old):
+        os.utime(p, (when, when))
+    _reap_isolated_dirs(tmp_path)
+    assert not old.exists()
 
 
 def test_several_at_once(tmp_path):

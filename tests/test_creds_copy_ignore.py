@@ -56,6 +56,8 @@ def _creds_tree(root: Path) -> Path:
     for slot in ("arg0", "arg0-linux"):
         (src / "tmp" / slot / "codex-arg0fV11dV").mkdir(parents=True)
         (src / "tmp" / slot / "codex-arg0fV11dV" / "codex").write_text("A" * 1100)
+    (src / "generated_images").mkdir()
+    (src / "generated_images" / "img.png").write_text("P" * 400)
     (src / "skills").mkdir()
     (src / "auth.json").write_text("{}")
     (src / "config.toml").write_text("")
@@ -157,3 +159,12 @@ def test_the_copy_is_dramatically_smaller(tmp_path):
     before = sum(f.stat().st_size for f in src.rglob("*") if f.is_file())
     after = sum(f.stat().st_size for f in dst.rglob("*") if f.is_file())
     assert after < before / 2, f"copy is {after} of {before} bytes — the bulk survived"
+
+
+def test_generated_images_are_not_copied(tmp_path):
+    """THE 2026-11-09 FIX. ~39 of every ~127 MB per run: past output of the
+    shared account, never read back from a per-run copy."""
+    src = _creds_tree(tmp_path)
+    dst = tmp_path / "copy"
+    _copy(src, dst)
+    assert not (dst / "generated_images").exists()
