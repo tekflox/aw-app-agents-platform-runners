@@ -116,6 +116,24 @@ def test_cold_path_uses_aw_run_id_env_fallback(tmp_path):
     assert "AW-Card: card1" in msg
 
 
+def test_a_dashed_uuid_run_id_is_normalized_to_bare_hex(tmp_path):
+    """aw-shared-workflows' code-review-reusable.yml provenance-gate requires
+    `^AW-Run-Id: [0-9a-f]{32}$` -- no dashes. Some run-id producers emit a
+    dashed UUID; this hook must still stamp something the gate accepts
+    rather than passing the dashed form through verbatim. Live failure:
+    agents-platform-multitenant PR #32, "no commit ... carries a well-formed
+    AW-Run-Id trailer" despite a real (just dashed) run id being present."""
+    repo = _init_repo(tmp_path)
+
+    result = _commit(repo, tmp_path, "a.txt", "first",
+                      AW_RUN_ID="4d86fe4e-451f-4c4c-8da7-0368afb2a99e")
+
+    assert result.returncode == 0, result.stderr
+    msg = _last_message(repo, tmp_path)
+    assert "AW-Run-Id: 4d86fe4e451f4c4c8da70368afb2a99e" in msg
+    assert "-" not in msg.split("AW-Run-Id:")[1].split("\n")[0]
+
+
 def test_no_identity_available_is_a_silent_noop(tmp_path):
     """A human committing from outside a runner container (or any context
     that never set AW_RUN_ID/current_run_id up) must see no trailers and no
