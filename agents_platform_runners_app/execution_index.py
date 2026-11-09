@@ -69,8 +69,14 @@ _config: dict = {}
 # warm_watchers_started/resolved are the direct fingerprint of the dominant
 # root cause: start_after_stream_done's watcher thread is killed silently by
 # any restart of this (Tier-1, in-process) app before it ever reaches a
-# resolution branch — a persistent, growing gap between the two is proof of
-# exactly that, and nothing else in this system can show it.
+# resolution branch. Neither is ever decremented, so their difference is a
+# lifetime counter that only grows — it is reported in doctor `detail` as
+# raw data, but the doctor no longer gates on it (card 4135bf3b-9510-8132-
+# 880e-ce48d0644338, 2026-11-09: that gate was a permanently-red ratchet by
+# construction). The windowed, self-clearing signal for this same leak is
+# `warm_watchers_orphaned` below, fed by the in-flight registry
+# (``_INFLIGHT_KEY``) and the sweep's adoption pass — see
+# docs/design/execution-index-warm-watcher-inflight-registry.md.
 #
 # indexed:kb / indexed:exec are the DUAL-WRITE half of the aw-app-kb
 # migration (docs/design/execution-index-migration-off-aw-app-kb.md §3.3
@@ -95,6 +101,7 @@ COUNTER_NAMES = (
     "skipped:other",
     "warm_watchers_started",
     "warm_watchers_resolved",
+    "warm_watchers_orphaned",
     "retry_exhausted",
 )
 
@@ -185,6 +192,21 @@ EXEC_INDEX_DEFAULT_URL = "http://127.0.0.1:9408"
 _RETRY_QUEUE_KEY = "execution_index:retry_queue"
 _RETRY_MAX_ATTEMPTS = 24  # ~1 day of hourly sweeps before giving up on an entry
 
+# In-flight warm-watcher registry (card 4135bf3b-9510-8132-880e-
+# ce48d0644338): a Redis HASH of run_id -> start epoch, written right where
+# warm_watchers_started increments and cleared in _wait()'s own `finally` on
+# every resolution branch. _wait() always self-resolves within
+# _WATCHER_DEADLINE_S, so an entry still present past that deadline is a
+# PROVABLY dead thread (killed outright by a restart/crash before it ever
+# reached a resolution branch) — age alone makes adoption race-free across
+# WORKERS=N, no liveness probing needed. ORPHAN_ADOPT_AFTER_S adds an extra
+# hour of slack on top of the deadline before the sweep adopts an entry, so
+# a watcher that is merely slow to get its sweep tick is never mistaken for
+# a crashed one.
+_INFLIGHT_KEY = "execution_index:warm_watchers_inflight"
+_WATCHER_DEADLINE_S = 24 * 3600
+ORPHAN_ADOPT_AFTER_S = _WATCHER_DEADLINE_S + 3600
+
 _counter_lock = threading.Lock()
 _counter_client = None
 _counter_client_url: str | None = None
@@ -237,6 +259,30 @@ def _incr(name: str) -> None:
             pipe.execute()
     except Exception:
         log.debug("execution index: could not increment counter %s", name, exc_info=True)
+
+
+def _inflight_mark(run_id: str) -> None:
+    """Best-effort HSET into the in-flight warm-watcher registry — same
+    fail-open contract as ``_incr``: a registry failure must never affect
+    watching/indexing/run delivery."""
+    try:
+        client = _counter_redis_client()
+        if client is not None:
+            client.hset(_INFLIGHT_KEY, run_id, str(time.time()))
+    except Exception:
+        log.debug("execution index: could not register inflight watcher run=%s", run_id,
+                 exc_info=True)
+
+
+def _inflight_clear(run_id: str) -> None:
+    """Best-effort HDEL counterpart to ``_inflight_mark``."""
+    try:
+        client = _counter_redis_client()
+        if client is not None:
+            client.hdel(_INFLIGHT_KEY, run_id)
+    except Exception:
+        log.debug("execution index: could not clear inflight watcher run=%s", run_id,
+                 exc_info=True)
 
 
 def _queue_retry(run_id: str, reason: str) -> None:
@@ -732,14 +778,51 @@ def sweep_retry_queue(config: dict | None = None) -> dict[str, int]:
     ``skipped:gate`` exclusion (not a failure); any other skip leaves it
     queued for the next sweep, up to ``_RETRY_MAX_ATTEMPTS`` before giving
     up (counted in ``retry_exhausted`` so a permanently stuck entry is
-    visible instead of silently disappearing)."""
-    result = {"queued": 0, "indexed": 0, "gated": 0, "requeued": 0, "exhausted": 0}
+    visible instead of silently disappearing).
+
+    Before draining, adopts any in-flight warm-watcher entry
+    (``_INFLIGHT_KEY``) older than ``ORPHAN_ADOPT_AFTER_S`` — a watcher
+    thread provably killed outright by a restart/crash before it ever
+    reached one of ``_wait()``'s resolution branches, so it never queued
+    itself for retry the normal way. Adopted entries flow into the same
+    retry queue as any other failure (``warm_watcher_orphaned``) and are
+    counted in ``warm_watchers_orphaned`` (never ``warm_watchers_resolved``
+    — the lifetime counters are reported data, never reinterpreted)."""
+    result = {"queued": 0, "indexed": 0, "gated": 0, "requeued": 0, "exhausted": 0,
+             "adopted": 0}
     try:
         client = _counter_redis_client()
     except Exception:
         client = None
     if client is None:
         return result
+    try:
+        inflight = client.hgetall(_INFLIGHT_KEY)
+    except Exception:
+        log.warning("execution index: retry sweep could not read the inflight registry",
+                    exc_info=True)
+        inflight = {}
+    now = time.time()
+    for run_id, started_at in inflight.items():
+        try:
+            age = now - float(started_at)
+        except (TypeError, ValueError):
+            age = ORPHAN_ADOPT_AFTER_S + 1  # malformed entry — adopt it too
+        if age > ORPHAN_ADOPT_AFTER_S:
+            # Queue first, THEN clear the inflight entry — not the other
+            # order. A crash between the two calls must leave the run
+            # recoverable from at least one of the two structures; clearing
+            # inflight first would lose it from both if the process dies
+            # before _queue_retry runs, reintroducing exactly the silent
+            # loss this registry exists to prevent.
+            _queue_retry(run_id, "watcher_orphaned")
+            try:
+                client.hdel(_INFLIGHT_KEY, run_id)
+            except Exception:
+                log.debug("execution index: could not clear adopted inflight entry %s",
+                         run_id, exc_info=True)
+            _incr("warm_watchers_orphaned")
+            result["adopted"] += 1
     try:
         entries = client.hgetall(_RETRY_QUEUE_KEY)
     except Exception:
@@ -768,7 +851,7 @@ def sweep_retry_queue(config: dict | None = None) -> dict[str, int]:
             else:
                 result["requeued"] += 1
                 client.hset(_RETRY_QUEUE_KEY, run_id, f"{attempts}:{original_reason}")
-    if result["queued"]:
+    if result["queued"] or result["adopted"]:
         log.info("execution index: retry sweep %s", result)
     return result
 
@@ -795,6 +878,32 @@ def retry_queue_snapshot() -> dict[str, dict[str, Any]] | None:
         attempts_raw, _, reason = str(value).partition(":")
         result[run_id] = {"attempts": int(attempts_raw or 0), "reason": reason}
     return result
+
+
+def inflight_snapshot() -> dict[str, Any] | None:
+    """Read-only view of the in-flight warm-watcher registry for the
+    doctor's ``detail`` — count plus the oldest entry's age, so a stuck
+    adoption pass (problem (b) in ``routes.py``) is visible without a
+    redis-cli session. ``None`` when Redis itself is unavailable — same
+    contract as ``counters_snapshot``."""
+    try:
+        client = _counter_redis_client()
+    except Exception:
+        client = None
+    if client is None:
+        return None
+    try:
+        entries = client.hgetall(_INFLIGHT_KEY)
+    except Exception:
+        return None
+    now = time.time()
+    ages = []
+    for started_at in entries.values():
+        try:
+            ages.append(now - float(started_at))
+        except (TypeError, ValueError):
+            continue
+    return {"count": len(entries), "oldest_age_s": max(ages) if ages else 0}
 
 
 def start(run_id: str) -> threading.Thread | None:
@@ -826,7 +935,7 @@ def start_after_stream_done(run_id: str, redis_url: str) -> threading.Thread | N
             client = redis.Redis.from_url(redis_url, decode_responses=True,
                                           socket_connect_timeout=5, socket_timeout=30)
             cursor = "0-0"
-            deadline = time.monotonic() + 24 * 3600
+            deadline = time.monotonic() + _WATCHER_DEADLINE_S
             key = f"run:{run_id}:events"
             while time.monotonic() < deadline:
                 batches = client.xread({key: cursor}, count=100, block=5000)
@@ -843,6 +952,12 @@ def start_after_stream_done(run_id: str, redis_url: str) -> threading.Thread | N
             log.warning("execution index: warm completion watch failed run=%s: %s", run_id, exc)
             _incr("warm_watchers_resolved")
         finally:
+            # Clears the inflight registry on every one of the three
+            # resolution branches above (done sentinel / deadline / this
+            # exception handler) — the one thing that must NOT happen is a
+            # resolved watcher leaving a stale entry behind for the sweep
+            # to later misclassify as orphaned.
+            _inflight_clear(run_id)
             if client is not None:
                 try:
                     client.close()
@@ -856,9 +971,17 @@ def start_after_stream_done(run_id: str, redis_url: str) -> threading.Thread | N
         # and warm_watchers_resolved is the direct fingerprint of a watcher
         # thread killed by a restart of this (Tier-1, in-process) app before
         # it ever reached one of _wait()'s three resolution branches above —
-        # see this module's module-level COUNTER_NAMES comment.
+        # see this module's module-level COUNTER_NAMES comment. The inflight
+        # registry is the recovery mechanism for exactly that case — see
+        # _inflight_mark/ORPHAN_ADOPT_AFTER_S and sweep_retry_queue's
+        # adoption pass.
         _incr("warm_watchers_started")
-        thread.start()
+        _inflight_mark(run_id)
+        try:
+            thread.start()
+        except Exception:
+            _inflight_clear(run_id)
+            raise
         return thread
     except Exception as exc:
         log.warning("execution index: could not watch warm run=%s: %s", run_id, exc)

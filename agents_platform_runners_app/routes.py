@@ -41,15 +41,19 @@ _runner_status = runner_registration_mod.runner_status
 
 log = logging.getLogger("aw_apps.agents_platform_runners.routes")
 
-# /execution-index/doctor thresholds. Both are heuristics, not measured
-# ceilings — there is no history of "normal" concurrent in-flight warm
-# watcher count to calibrate against yet, since the counters this reads
-# did not exist before this fix. Chosen to be well above the handful of
-# warm turns normally in flight at once (a watcher resolves within seconds
-# of its run's "done" sentinel) while still catching the bug's signature
-# (a gap that only grows) long before it reaches the ~75% scale measured
-# live on 2026-10-16.
-_WARM_WATCHER_GAP_THRESHOLD = 20
+# Card 4135bf3b-9510-8132-880e-ce48d0644338, 2026-11-09: the warm-watcher
+# gap check used to gate on the LIFETIME warm_watchers_started/resolved
+# difference against a fixed threshold — a counter that is never
+# decremented, so the gate was a permanently-red ratchet by construction
+# (measured history: 4 → 8 → 23 → 56 → 81 → 84, never down). Replaced below
+# by three windowed, self-clearing checks fed by the in-flight registry
+# (execution_index_mod.inflight_snapshot) — see
+# docs/design/execution-index-warm-watcher-inflight-registry.md. The
+# lifetime counters are still reported in ``detail`` as raw data; nothing
+# gates on them anymore.
+_WARM_WATCHER_ORPHANED_THRESHOLD = 50
+_ADOPTION_STUCK_AFTER_S = (
+    execution_index_mod.ORPHAN_ADOPT_AFTER_S + 2 * 3600)
 
 # Kanban observability:execution-index-doctor-false-alarm-from-gate-
 # exclusions: the failure ratio below is computed from WINDOWED counters
@@ -284,11 +288,10 @@ def build_routes(config: dict | None = None, *, kanban_sweep_status: dict | None
     @app.get("/execution-index/doctor")
     async def execution_index_doctor() -> dict:
         """``contributes.doctor`` entry for the same counters — ``ok=False``
-        when either fingerprint of the silent-drop bug shows up: a growing
-        warm_watchers_started/resolved gap (watcher threads killed by a
-        restart before they ever indexed their run), or a windowed failure
-        ratio above threshold once there is enough eligible volume in the
-        window to judge it by.
+        when any of this hook's own windowed, self-clearing signals fire:
+        a windowed failure ratio above threshold (eligible-volume gated),
+        restart churn in the warm-watcher orphan rate, the adoption
+        machinery itself stuck, or a permanently-exhausted retry.
 
         The failure ratio reads ``counters_window_snapshot`` (the last
         ``WINDOW_LOOKBACK_HOURS``), not the lifetime counters: lifetime
@@ -301,8 +304,13 @@ def build_routes(config: dict | None = None, *, kanban_sweep_status: dict | None
         (a prefix rule, so a newly-discovered ``skipped:other:<Exc>`` name
         counts with no code change), and the denominator excludes
         ``skipped:gate`` too, so an eligible run is one the indexer should
-        have indexed. The warm-watcher gap check above stays on lifetime
-        counters deliberately — see the design doc for why."""
+        have indexed.
+
+        The warm-watcher gap check used to gate on a LIFETIME counter
+        difference that never resets — removed (card 4135bf3b-9510-8132-
+        880e-ce48d0644338, 2026-11-09; see the design doc). Lifetime
+        ``warm_watchers_started``/``resolved`` are still reported below in
+        ``detail.counters`` as raw data, but nothing gates on them."""
         counters = execution_index_mod.counters_snapshot()
         window_counters = execution_index_mod.counters_window_snapshot()
         if any(v is None for v in counters.values()) or any(v is None for v in window_counters.values()):
@@ -312,9 +320,7 @@ def build_routes(config: dict | None = None, *, kanban_sweep_status: dict | None
                 "window_hours": execution_index_mod.WINDOW_LOOKBACK_HOURS,
                 "problems": ["Redis unavailable — counters cannot be read"],
             }}
-        started = counters["warm_watchers_started"]
-        resolved = counters["warm_watchers_resolved"]
-        gap = started - resolved
+        inflight = execution_index_mod.inflight_snapshot()
 
         attempted_w = window_counters["attempted"]
         gate_w = window_counters.get("skipped:gate", 0)
@@ -354,11 +360,38 @@ def build_routes(config: dict | None = None, *, kanban_sweep_status: dict | None
                     f"{_exec_index_base()} but that service does not answer /status "
                     f"({exec_detail['error']}) — every exec_post write is being lost")
 
-        if gap > _WARM_WATCHER_GAP_THRESHOLD:
+        # (a) Restart churn: orphans now RECOVER via the hourly sweep's
+        # adoption pass, so a growing orphan rate in the window is churn,
+        # not loss — threshold is ~4-5x the measured 11/day.
+        orphaned_w = window_counters.get("warm_watchers_orphaned", 0)
+        if orphaned_w > _WARM_WATCHER_ORPHANED_THRESHOLD:
             problems.append(
-                f"warm_watchers_started ({started}) exceeds warm_watchers_resolved "
-                f"({resolved}) by {gap} — the fingerprint of a watcher thread killed "
-                f"by a restart of this app before it ever indexed its run")
+                f"warm_watchers_orphaned ({orphaned_w}) in the last "
+                f"{execution_index_mod.WINDOW_LOOKBACK_HOURS}h window exceeds "
+                f"{_WARM_WATCHER_ORPHANED_THRESHOLD} — warm-watcher threads are being "
+                f"killed by restarts faster than normal (orphans are recovered by the "
+                f"hourly sweep, so this is churn, not loss)")
+
+        # (b) The adoption machinery itself is dead — sweep not ticking, or
+        # 'watchdog:tasks' not granted (plugin.py degrades silently in that
+        # case; this is its designed backstop). A healthy in-flight entry
+        # never survives past ORPHAN_ADOPT_AFTER_S, so anything older than
+        # that PLUS a further 2h grace means the sweep has stopped adopting.
+        if inflight is not None and inflight["count"] and inflight["oldest_age_s"] > _ADOPTION_STUCK_AFTER_S:
+            problems.append(
+                f"an in-flight warm-watcher entry is {inflight['oldest_age_s']:.0f}s old — "
+                f"older than the {_ADOPTION_STUCK_AFTER_S:.0f}s adoption backstop — the "
+                f"hourly retry-sweep adoption pass appears to have stopped running")
+
+        # (c) Actual permanent loss: retry_exhausted is the only remaining
+        # path to losing a run forever (the failure-ratio numerator above
+        # only sums skipped:* and never sees this).
+        exhausted_w = window_counters.get("retry_exhausted", 0)
+        if exhausted_w > 0:
+            problems.append(
+                f"retry_exhausted ({exhausted_w}) in the last "
+                f"{execution_index_mod.WINDOW_LOOKBACK_HOURS}h window — these runs are "
+                f"permanently lost from the execution index")
 
         detail_extra: dict = {}
         if eligible < _FAILURE_RATIO_MIN_SAMPLE:
@@ -377,6 +410,7 @@ def build_routes(config: dict | None = None, *, kanban_sweep_status: dict | None
             "counters_window": window_counters,
             "window_hours": execution_index_mod.WINDOW_LOOKBACK_HOURS,
             "exec_index_service": exec_detail,
+            "warm_watchers_inflight": inflight,
             **detail_extra,
             "problems": problems,
         }}
