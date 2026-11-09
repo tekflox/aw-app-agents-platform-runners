@@ -221,6 +221,34 @@ def _creds_copy_ignore(directory: str, names: list[str]) -> set[str]:
     return ignored
 
 
+def _creds_copy_ignore_for(spec: dict, src_root: "Path"):
+    """``ignore`` callback for the PER-RUN staged creds copy of one CLI.
+
+    A CLI that names ``creds_copy_allow`` gets an ALLOWLIST at the top level of
+    its creds dir — only those entries are copied (everything under an allowed
+    directory still is) — layered on _creds_copy_ignore's denylist and
+    file-type check. Every other CLI keeps the denylist alone, unchanged.
+
+    An allowlist rather than yet another denylist entry because the denylist
+    has been outgrown four times (staging checkout, package tree, codex's own
+    tmp, then 39 MB of generated_images) — each a new directory codex began
+    writing into its home that was then copied into every run. The set this
+    copy is actually READ for is two files and does not grow.
+    """
+    allow = spec.get("creds_copy_allow")
+    if not allow:
+        return _creds_copy_ignore
+    root = os.fspath(src_root)
+
+    def _ignore(directory: str, names: list[str]) -> set[str]:
+        ignored = set(_creds_copy_ignore(directory, names))
+        if os.path.normpath(directory) == os.path.normpath(root):
+            ignored |= {n for n in names if n not in allow}
+        return ignored
+
+    return _ignore
+
+
 def _reap_isolated_dirs(parent: "Path") -> None:
     """Remove isolated run dirs older than ISOLATED_KEEP_SECONDS.
 
@@ -607,6 +635,13 @@ CLI_SPECS: dict[str, dict] = {
         # see the staging note in _build_spawn().
         "home_env": "CODEX_HOME",
         "creds_dir": ".codex", "creds_file": None,
+        # The per-run staged copy carries ONLY these two. Verified 2026-11-09
+        # against codex 0.167: a CODEX_HOME holding nothing but auth.json runs
+        # a turn and populates itself (skills, sqlite, sessions) on first use,
+        # so the other ~127 MB per run (state_5.sqlite, logs, plugins, ...) is
+        # copied to be mounted read-only and never opened. See
+        # _creds_copy_ignore_for.
+        "creds_copy_allow": ("auth.json", "config.toml"),
     },
     "copilot": {
         "bin": "copilot", "subcmd": None, "prompt_flag": "-p",
@@ -2134,7 +2169,7 @@ def _build_container_kwargs(job: dict, client=None) -> tuple[str, list[str], dic
             if creds_copy.exists():
                 shutil.rmtree(creds_copy, ignore_errors=True)
             shutil.copytree(_real_home / creds_dir, creds_copy,
-                            ignore=_creds_copy_ignore)
+                            ignore=_creds_copy_ignore_for(spec, _real_home / creds_dir))
             if cli == "codex" and (creds_copy / "config.toml").is_file():
                 # So a brand-new shared $CODEX_HOME inherits the warm-token
                 # header patch the first time it's ever populated from this
