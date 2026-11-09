@@ -25,7 +25,11 @@ from pathlib import Path
 
 import pytest
 
-from agents_platform_runners_app.execute import CREDS_COPY_IGNORE
+from agents_platform_runners_app.execute import (
+    CLI_SPECS,
+    CREDS_COPY_IGNORE,
+    _creds_copy_ignore_for,
+)
 
 
 def _creds_tree(root: Path) -> Path:
@@ -168,3 +172,60 @@ def test_generated_images_are_not_copied(tmp_path):
     dst = tmp_path / "copy"
     _copy(src, dst)
     assert not (dst / "generated_images").exists()
+
+
+def _copy_for(spec: dict, src: Path, dst: Path) -> None:
+    shutil.copytree(src, dst, ignore=_creds_copy_ignore_for(spec, src))
+
+
+def test_codex_stages_only_what_the_copy_is_read_for(tmp_path):
+    """THE REDESIGN (2026-11-09). The per-run copy is mounted read-only and
+    read for exactly two things: auth.json (the host-side auth resync) and
+    config.toml (the first-population guard). Anything else was ~127 MB of
+    state_5.sqlite, logs and plugins copied into every run and never opened."""
+    src = _creds_tree(tmp_path)
+    (src / "logs_2.sqlite").write_text("L" * 100)
+    (src / "memories_1.sqlite").write_text("M" * 100)
+    (src / "some-dir-codex-adds-next-year").mkdir()
+    dst = tmp_path / "copy"
+    _copy_for(CLI_SPECS["codex"], src, dst)
+    assert sorted(p.name for p in dst.iterdir()) == ["auth.json", "config.toml"]
+
+
+def test_the_allowlist_is_top_level_only(tmp_path):
+    """What lives UNDER an allowed directory is not second-guessed."""
+    src = tmp_path / "src"
+    (src / "keep" / "nested" / "deep").mkdir(parents=True)
+    (src / "keep" / "nested" / "deep" / "f").write_text("x")
+    (src / "drop").mkdir()
+    dst = tmp_path / "copy"
+    _copy_for({"creds_copy_allow": ("keep",)}, src, dst)
+    assert (dst / "keep" / "nested" / "deep" / "f").is_file()
+    assert not (dst / "drop").exists()
+
+
+def test_a_cli_without_an_allowlist_keeps_the_denylist_behaviour(tmp_path):
+    src = _creds_tree(tmp_path)
+    dst = tmp_path / "copy"
+    _copy_for({}, src, dst)
+    assert (dst / "plugins" / "real-plugin" / "manifest.json").is_file()
+    assert (dst / "state_5.sqlite").is_file()
+    assert not (dst / "packages").exists()
+
+
+def test_sockets_are_still_skipped_under_an_allowlist(tmp_path):
+    """The file-type check must survive layering, or the Errno 6 crash that
+    motivated it comes back the day a socket lands inside an allowed dir."""
+    import socket
+    src = tmp_path / "src"
+    (src / "keep").mkdir(parents=True)
+    (src / "keep" / "real").write_text("x")
+    s = socket.socket(socket.AF_UNIX)
+    s.bind(str(src / "keep" / "daemon.sock"))
+    try:
+        dst = tmp_path / "copy"
+        _copy_for({"creds_copy_allow": ("keep",)}, src, dst)
+    finally:
+        s.close()
+    assert (dst / "keep" / "real").is_file()
+    assert not (dst / "keep" / "daemon.sock").exists()
