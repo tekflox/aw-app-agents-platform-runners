@@ -441,6 +441,77 @@ def test_a_soft_deleted_agent_is_restored_on_reseed():
     assert platform.restores == ["/api/agents/sec-reviewer/restore"]
 
 
+# --- plans ------------------------------------------------------------------
+#
+# A Plan references an agent (follow_up_agent_slug) and a workflow
+# (follow_up_workflow_slug) by slug, so ORDER seeds it after both — and it
+# carries a restore route, same trap as targets/agents above.
+
+PLAN_SPEC = {"plans": [{"slug": "kanban-sweep", "name": "Kanban Sweep",
+                       "purpose": "scan for stale cards",
+                       "cadence_seconds": 3600,
+                       "follow_up_agent_slug": "kanban-sweeper"}]}
+
+
+def test_a_plan_is_created():
+    platform = FakePlatform()
+    assert _seed(platform, PLAN_SPEC) == {"plans": 1}
+    assert platform.posts == [("/api/plans", {
+        "slug": "kanban-sweep", "name": "Kanban Sweep",
+        "purpose": "scan for stale cards", "cadence_seconds": 3600,
+        "follow_up_agent_slug": "kanban-sweeper"})]
+
+
+def test_plans_are_seeded_after_workflows_and_before_evals():
+    platform = FakePlatform()
+    spec = {
+        "workflows": [{"slug": "wf1", "name": "WF1", "kind": "review", "graph": {}}],
+        "evals": [{"slug": "ev1", "name": "EV1", "target_kind": "agent",
+                  "target_slug": "sec-reviewer", "dataset": [], "metric": "judge_llm"}],
+        **PLAN_SPEC,
+    }
+    _seed(platform, spec)
+    assert [path for path, _ in platform.posts] == [
+        "/api/workflows", "/api/plans", "/api/evals"]
+
+
+def test_follow_up_workflow_slug_survives_the_create_post():
+    # Not yet a PlanIn field on agents-platform-multitenant's master (its
+    # own PR #43) — kept in ENDPOINTS["plans"] anyway, relying on Pydantic's
+    # default extra="ignore" there, so this app forward-compats the moment
+    # that PR lands with no second deploy needed here.
+    platform = FakePlatform()
+    _seed(platform, {"plans": [{"slug": "kanban-sweep", "name": "Kanban Sweep",
+                               "follow_up_workflow_slug": "kanban-sweep-wf"}]})
+    _, body = platform.posts[0]
+    assert body["follow_up_workflow_slug"] == "kanban-sweep-wf"
+
+
+def test_unknown_fields_are_dropped_from_a_plan_payload():
+    platform = FakePlatform()
+    _seed(platform, {"plans": [{"slug": "p", "name": "P",
+                               "some_future_manifest_key": "x"}]})
+    _, body = platform.posts[0]
+    assert "some_future_manifest_key" not in body
+
+
+def test_a_plan_that_already_exists_is_left_alone():
+    platform = FakePlatform(existing={"/api/plans": ["kanban-sweep"]})
+    assert _seed(platform, PLAN_SPEC) == {}
+    assert platform.posts == []
+    assert platform.restores == []
+
+
+def test_a_soft_deleted_plan_is_restored_on_reseed():
+    # Same trap as targets/agents above: the slug is absent from the LIST
+    # (soft-deleted rows excluded there), so the pre-check says "create it",
+    # and the platform's own create route 409s on the tombstoned slug.
+    platform = FakePlatform(post_status=409,
+                            deleted={"/api/plans": {"kanban-sweep"}})
+    assert _seed(platform, PLAN_SPEC) == {}
+    assert platform.restores == ["/api/plans/kanban-sweep/restore"]
+
+
 def test_write_state_reads_workspace_from_the_env_file_not_just_process_env(
         monkeypatch, tmp_path):
     """runner-dynamic-workspace-slug (Perna C): a raw ``os.environ.get`` here
