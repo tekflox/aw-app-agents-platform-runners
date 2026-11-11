@@ -284,7 +284,7 @@ def test_create_plan_forwards_only_the_exposed_fields(monkeypatch):
                {"slug": "biz-growth", "name": "Growth", "kind": "operation",
                 "purpose": "grow MRR", "needs_strategy": "see doc",
                 "delivery_criteria": [{"text": "x"}], "cadence_seconds": 3600,
-                "budget_tokens": 1000, "budget_usd": 5.0,
+                "budget_tokens": 1000, "budget_usd": 5.0, "budget_window": "month",
                 "auto_conclude": False, "follow_up_agent_slug": "business-steward",
                 # Not part of PlanIn at all — would 422 if forwarded as-is.
                 "bogus_field": "nope"})
@@ -294,8 +294,19 @@ def test_create_plan_forwards_only_the_exposed_fields(monkeypatch):
     assert body == {"slug": "biz-growth", "name": "Growth", "kind": "operation",
                     "purpose": "grow MRR", "needs_strategy": "see doc",
                     "delivery_criteria": [{"text": "x"}], "cadence_seconds": 3600,
-                    "budget_tokens": 1000, "budget_usd": 5.0,
+                    "budget_tokens": 1000, "budget_usd": 5.0, "budget_window": "month",
                     "auto_conclude": False, "follow_up_agent_slug": "business-steward"}
+
+
+def test_create_plan_schema_declares_budget_window_with_the_right_values():
+    """day/week/month, NOT daily/weekly/monthly — confirmed against
+    `BUDGET_WINDOWS` in agents-platform-multitenant's
+    `core/plan_invariants.py`. Round 2 review finding: the wrong spelling
+    would 422 on `activate_plan` for every operation-kind plan, since
+    `PlanIn`/`PlanUpdate` validate server-side against the real enum."""
+    for tool_name in ("create_plan", "update_plan"):
+        prop = _tool(tool_name).inputSchema["properties"]["budget_window"]
+        assert set(prop["enum"]) == {None, "day", "week", "month"}
 
 
 def test_create_plan_declares_slug_and_name_as_required():
@@ -339,13 +350,14 @@ def test_update_plan_forwards_only_the_allowed_fields(monkeypatch):
     req = _call(monkeypatch, "update_plan",
                {"slug": "biz-growth", "purpose": "new purpose",
                 "needs_strategy": "new strategy", "cadence_seconds": 7200,
-                "budget_tokens": 2000, "budget_usd": 10.0, "tags": ["q4"]})
+                "budget_tokens": 2000, "budget_usd": 10.0,
+                "budget_window": "week", "tags": ["q4"]})
     assert req.method == "PUT"
     assert req.url.path == "/api/plans/biz-growth"
     assert json.loads(req.content) == {
         "purpose": "new purpose", "needs_strategy": "new strategy",
         "cadence_seconds": 7200, "budget_tokens": 2000, "budget_usd": 10.0,
-        "tags": ["q4"]}
+        "budget_window": "week", "tags": ["q4"]}
 
 
 def test_update_plan_drops_status_kind_auto_conclude_and_follow_up_agent(monkeypatch):
@@ -368,6 +380,48 @@ def test_update_plan_schema_does_not_even_declare_the_excluded_fields():
     schema = _tool("update_plan").inputSchema
     for excluded in ("status", "kind", "auto_conclude", "follow_up_agent_slug"):
         assert excluded not in schema["properties"]
+
+
+def test_an_operation_plan_create_then_activate_round_trip_carries_budget_window(monkeypatch):
+    """Round-2 review finding: before `budget_window` was exposed, an agent
+    creating a `kind='operation'` plan through this surface had NO way to
+    satisfy `activation_gate_violations`'s hard requirement for it — the
+    plan was permanently stuck in `draft`, with no tool (not even
+    `update_plan`) able to ever set the missing field. This is the round
+    trip that gap broke: create with `budget_window` set, then activate —
+    both calls through the SAME mock (two separate `_call(...)`s would each
+    re-monkeypatch the real `httpx.AsyncClient`, so the second clobbers the
+    first's transport instead of composing with it).
+    """
+    recorder: list = []
+    responses = [
+        httpx.Response(200, json={"slug": "ops-plan", "kind": "operation",
+                                  "budget_window": "day", "status": "draft"}),
+        httpx.Response(200, json={"slug": "ops-plan", "status": "active"}),
+    ]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        recorder.append(request)
+        return responses[len(recorder) - 1]
+
+    real_async_client = httpx.AsyncClient
+
+    def fake_async_client(*a, **kw):
+        kw["transport"] = httpx.MockTransport(handler)
+        return real_async_client(*a, **kw)
+
+    monkeypatch.setattr(mcp_server.httpx, "AsyncClient", fake_async_client)
+
+    asyncio.run(mcp_server._call_tool(
+        "create_plan", {"slug": "ops-plan", "name": "Ops", "kind": "operation",
+                        "purpose": "keep the lights on", "budget_window": "day"}))
+    asyncio.run(mcp_server._call_tool("activate_plan", {"slug": "ops-plan"}))
+
+    assert len(recorder) == 2
+    create_req, activate_req = recorder
+    assert json.loads(create_req.content)["budget_window"] == "day"
+    assert activate_req.method == "POST"
+    assert activate_req.url.path == "/api/plans/ops-plan/activate"
 
 
 # -- record_plan_criterion: read-modify-write over one criterion --

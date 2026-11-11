@@ -1614,6 +1614,10 @@ async def _list_tools() -> list[Tool]:
                  "cadence_seconds": {"type": ["integer", "null"]},
                  "budget_tokens": {"type": ["integer", "null"]},
                  "budget_usd": {"type": ["number", "null"]},
+                 "budget_window": {"type": ["string", "null"], "enum": [None, "day", "week", "month"],
+                                   "description": ("REQUIRED for kind='operation' before "
+                                                   "`activate_plan` will accept it — a "
+                                                   "'project' plan must leave this null.")},
                  "auto_conclude": {"type": "boolean",
                                    "description": "See the tool description above — defaults true."},
                  "follow_up_agent_slug": {"type": "string",
@@ -1634,11 +1638,12 @@ async def _list_tools() -> list[Tool]:
         Tool(name="update_plan",
              description=("Patch a Plan's mutable metadata: purpose, "
                           "needs_strategy, cadence_seconds, budget_tokens, "
-                          "budget_usd, tags. Deliberately does NOT accept status, "
-                          "kind, auto_conclude or follow_up_agent_slug, even if "
-                          "you pass them — status moves only through the "
-                          "dedicated transitions (activate_plan etc., themselves "
-                          "human-gated for force/waive/reopen), and auto_conclude/"
+                          "budget_usd, budget_window, tags. Deliberately does "
+                          "NOT accept status, kind, auto_conclude or "
+                          "follow_up_agent_slug, even if you pass them — status "
+                          "moves only through the dedicated transitions "
+                          "(activate_plan etc., themselves human-gated for "
+                          "force/waive/reopen), and auto_conclude/"
                           "follow_up_agent_slug would let an agent hand itself "
                           "conclusion authority or redirect its own steward "
                           "assignment. Use `record_plan_criterion` to touch "
@@ -1650,6 +1655,10 @@ async def _list_tools() -> list[Tool]:
                  "cadence_seconds": {"type": ["integer", "null"]},
                  "budget_tokens": {"type": ["integer", "null"]},
                  "budget_usd": {"type": ["number", "null"]},
+                 "budget_window": {"type": ["string", "null"], "enum": [None, "day", "week", "month"],
+                                   "description": ("REQUIRED for kind='operation' before "
+                                                   "`activate_plan` will accept it — a "
+                                                   "'project' plan must leave this null.")},
                  "tags": {"type": "array", "items": {"type": "string"}},
              }, "required": ["slug"]}),
         Tool(name="record_plan_criterion",
@@ -3473,7 +3482,8 @@ async def _dispatch_tool(name: str, arguments: dict[str, Any] | None) -> list[Te
             body = {k: v for k, v in args.items() if k in (
                 "slug", "name", "kind", "purpose", "needs_strategy",
                 "delivery_criteria", "cadence_seconds", "budget_tokens",
-                "budget_usd", "auto_conclude", "follow_up_agent_slug")}
+                "budget_usd", "budget_window", "auto_conclude",
+                "follow_up_agent_slug")}
             r = await c.post(f"{BASE}/api/plans", json=body)
             return _err(r.status_code, r.text) if r.status_code != 200 else _ok(r.json())
         if name == "activate_plan":
@@ -3491,7 +3501,7 @@ async def _dispatch_tool(name: str, arguments: dict[str, Any] | None) -> list[Te
             slug = args["slug"]
             body = {k: v for k, v in args.items() if k in (
                 "purpose", "needs_strategy", "cadence_seconds",
-                "budget_tokens", "budget_usd", "tags")}
+                "budget_tokens", "budget_usd", "budget_window", "tags")}
             r = await c.put(f"{BASE}/api/plans/{slug}", json=body)
             return _err(r.status_code, r.text) if r.status_code != 200 else _ok(r.json())
         if name == "record_plan_criterion":
