@@ -795,13 +795,24 @@ async def _list_tools() -> list[Tool]:
                           "on the card does not do it. That auto-resume was deliberately "
                           "disabled in 2026-07: a comment could silently make the agent pick "
                           "the card back up and sign it off within seconds, with no human "
-                          "checkpoint in between. Calling this is the checkpoint."),
+                          "checkpoint in between. Calling this is the checkpoint.\n\n"
+                          "By default this resumes the NEWEST run tied to the card — which can "
+                          "be a qa-* review or a narrow sub-dispatch rather than the session "
+                          "that is actually deciding the card, since run_agent_async inherits "
+                          "the caller's notion_task_id. Pass run_id to resume a specific run "
+                          "instead of the newest one; it must already belong to this card "
+                          "(cross-card use is rejected) and still goes through the same "
+                          "resumability checks as the default lookup."),
              inputSchema={"type": "object",
                           "properties": {
                               "page_id": {"type": "string",
                                           "description": "Notion page id of the card. Optional — falls back to this run's own NOTION_TASK_ID context."},
                               "message": {"type": "string",
                                           "description": "What to say to the agent. Becomes its next turn's input."},
+                              "run_id": {"type": "string",
+                                         "description": "Resume this specific run instead of the newest one tied to the card — e.g. "
+                                                         "the newest non-qa work run the sweeper picked out by hand. Must belong to "
+                                                         "this card's notion_task_id; a run tied to a different card is rejected (400)."},
                           },
                           "required": ["message"]}),
         Tool(name="register_callback",
@@ -2826,21 +2837,36 @@ async def _dispatch_tool(name: str, arguments: dict[str, Any] | None) -> list[Te
                 return _err(400, "page_id is required — this run is not tied to a Kanban card, "
                                  "so there is nothing to infer it from.")
 
-            # category="work" excludes monitor/wrapper dispatches (e.g.
-            # monitor-shell) from "the run for this card" — without it, a
-            # wrapper row carrying its own session_id would be resumed as if
-            # it were the real coding session (Kanban
-            # 4115bf3b-9510-8156-9e5e-f6c772ad2538).
-            r = await c.get(f"{BASE}/api/runs",
-                            params={"notion_task_id": page_id, "category": "work", "limit": 1})
-            if r.status_code != 200:
-                return _err(r.status_code, r.text)
-            runs = r.json() or []
-            if not runs:
-                return _err(404, f"no agents-platform run found for card {page_id} — nothing to "
-                                 "resume. Dispatch one first (run_ready_cards, or move the card "
-                                 "to Ready).")
-            planned = kanban_dispatch.resume_payload(runs[0], page_id, message)
+            run_id = (args.get("run_id") or "").strip()
+            if run_id:
+                # Explicit selector: resume THIS run, not whatever is newest.
+                # Still has to belong to the card — resuming a run_id lifted
+                # from a different card would let a caller impersonate this
+                # card's identity on an unrelated session.
+                one = await c.get(f"{BASE}/api/runs/{run_id}")
+                if one.status_code != 200:
+                    return _err(one.status_code, one.text)
+                run = one.json() or {}
+                if (run.get("notion_task_id") or "") != page_id:
+                    return _err(400, f"run {run_id} is not tied to card {page_id} — refusing to "
+                                     "resume a different card's run under this card's identity.")
+            else:
+                # category="work" excludes monitor/wrapper dispatches (e.g.
+                # monitor-shell) from "the run for this card" — without it, a
+                # wrapper row carrying its own session_id would be resumed as if
+                # it were the real coding session (Kanban
+                # 4115bf3b-9510-8156-9e5e-f6c772ad2538).
+                r = await c.get(f"{BASE}/api/runs",
+                                params={"notion_task_id": page_id, "category": "work", "limit": 1})
+                if r.status_code != 200:
+                    return _err(r.status_code, r.text)
+                runs = r.json() or []
+                if not runs:
+                    return _err(404, f"no agents-platform run found for card {page_id} — nothing to "
+                                     "resume. Dispatch one first (run_ready_cards, or move the card "
+                                     "to Ready).")
+                run = runs[0]
+            planned = kanban_dispatch.resume_payload(run, page_id, message)
             if isinstance(planned, str):
                 return _err(409, planned)
             path, payload = planned
