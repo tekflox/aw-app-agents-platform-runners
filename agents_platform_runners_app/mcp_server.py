@@ -1519,11 +1519,25 @@ async def _list_tools() -> list[Tool]:
                                                "umbrella ABOVE Targets — see `get_plan`.")},
                  "limit": {"type": "integer"},
              }}),
-        # ---- Plans (the umbrella above Targets) — read + the steward's
-        # terminal call. Plan umbrella Slice 3. The management surface
-        # (create/edit/attach/conclude) is Slice 5 and deliberately absent
-        # here: force, waive and reopen are human-only at every layer, and a
-        # tool that exposed them would be the one bypass of that rule.
+        # ---- Plans (the umbrella above Targets) — read, the management
+        # surface (Plan umbrella Slice 5) and the steward's terminal call.
+        # conclude_plan, reopen_plan, pause/resume and delete are
+        # deliberately absent from this connector, now and later: force,
+        # waive and reopen stay human-only at every layer, and a tool that
+        # exposed any of them would be the one bypass of that rule.
+        Tool(name="list_plans",
+             description=("List Plans — the umbrella ABOVE Targets. Each Plan is "
+                          "one longer-running purpose iterated on a cadence until "
+                          "its exit clause is satisfied (an `operation` plan has "
+                          "no exit clause and runs indefinitely instead). Use this "
+                          "to find an existing Plan before creating a new one."),
+             inputSchema={"type": "object", "properties": {
+                 "include_deleted": {"type": "boolean"},
+                 "status": {"type": "string",
+                            "description": "Filter by status: draft|active|paused|concluded|abandoned."},
+                 "q": {"type": "string", "description": "Search slug/name/purpose."},
+                 "limit": {"type": "integer"},
+             }}),
         Tool(name="get_plan",
              description=("Fetch one Plan by slug — purpose, strategy, delivery "
                           "criteria with their evidence, cadence, guardrails and "
@@ -1552,6 +1566,95 @@ async def _list_tools() -> list[Tool]:
                           "properties": {"slug": {"type": "string"},
                                          "limit": {"type": "integer"}},
                           "required": ["slug"]}),
+        Tool(name="create_plan",
+             description=("Create a new Plan — the umbrella ABOVE Targets. Starts "
+                          "as `draft`; call `activate_plan` once it has a purpose, "
+                          "a strategy, at least one `required` delivery criterion "
+                          "and a valid cadence (an `operation` plan skips the exit "
+                          "clause but still needs a budget window).\n\n"
+                          "**Pass `auto_conclude=false` explicitly for a business "
+                          "plan.** The column default is `true` — omitting this "
+                          "silently lets the plan self-conclude the moment every "
+                          "attached Target finishes, which reverses the intended "
+                          "propose-only behavior rather than leaving it unset."),
+             inputSchema={"type": "object", "properties": {
+                 "slug": {"type": "string"},
+                 "name": {"type": "string"},
+                 "kind": {"type": "string", "enum": ["project", "operation"],
+                          "description": ("'project' (has an exit clause, the "
+                                          "default) or 'operation' (ongoing, no "
+                                          "exit clause, budget tracked per "
+                                          "recurring window).")},
+                 "purpose": {"type": "string"},
+                 "needs_strategy": {"type": "string"},
+                 "delivery_criteria": {"type": "array", "items": {"type": "object"},
+                                       "description": ("Each item: {text, required "
+                                                       "(default true)}. At least "
+                                                       "one `required` criterion is "
+                                                       "needed before `activate_plan` "
+                                                       "will accept a 'project' plan.")},
+                 "cadence_seconds": {"type": ["integer", "null"]},
+                 "budget_tokens": {"type": ["integer", "null"]},
+                 "budget_usd": {"type": ["number", "null"]},
+                 "auto_conclude": {"type": "boolean",
+                                   "description": "See the tool description above — defaults true."},
+                 "follow_up_agent_slug": {"type": "string",
+                                          "description": "Agent dispatched each cadence tick. Defaults to 'plan-steward'."},
+             }, "required": ["slug", "name"]}),
+        Tool(name="activate_plan",
+             description=("draft -> active. Gated server-side: purpose, "
+                          "needs_strategy, at least one `required` delivery "
+                          "criterion, and a valid cadence must already be set "
+                          "(an `operation` plan is exempt from the criteria/cadence "
+                          "half, but still needs a budget window). On refusal the "
+                          "server names every missing/invalid field at once — that "
+                          "400 is surfaced to you verbatim, not summarized, so read "
+                          "it rather than retrying blind."),
+             inputSchema={"type": "object",
+                          "properties": {"slug": {"type": "string"}},
+                          "required": ["slug"]}),
+        Tool(name="update_plan",
+             description=("Patch a Plan's mutable metadata: purpose, "
+                          "needs_strategy, cadence_seconds, budget_tokens, "
+                          "budget_usd, tags. Deliberately does NOT accept status, "
+                          "kind, auto_conclude or follow_up_agent_slug, even if "
+                          "you pass them — status moves only through the "
+                          "dedicated transitions (activate_plan etc., themselves "
+                          "human-gated for force/waive/reopen), and auto_conclude/"
+                          "follow_up_agent_slug would let an agent hand itself "
+                          "conclusion authority or redirect its own steward "
+                          "assignment. Use `record_plan_criterion` to touch "
+                          "delivery_criteria."),
+             inputSchema={"type": "object", "properties": {
+                 "slug": {"type": "string"},
+                 "purpose": {"type": "string"},
+                 "needs_strategy": {"type": "string"},
+                 "cadence_seconds": {"type": ["integer", "null"]},
+                 "budget_tokens": {"type": ["integer", "null"]},
+                 "budget_usd": {"type": ["number", "null"]},
+                 "tags": {"type": "array", "items": {"type": "string"}},
+             }, "required": ["slug"]}),
+        Tool(name="record_plan_criterion",
+             description=("Update ONE delivery criterion's status and/or append "
+                          "evidence to it — a read-modify-write over the whole-"
+                          "document `PUT /{slug}/criteria`, scoped here to a "
+                          "single criterion so you never have to resend every "
+                          "other one. The appended evidence's `run_id` is always "
+                          "YOUR OWN run, injected automatically — never something "
+                          "you pass, because evidence that didn't carry who "
+                          "actually produced it would be unverifiable.\n\n"
+                          "`status` may only be 'pending' or 'satisfied' — "
+                          "'waived' stays human-only (through the Plan UI or a "
+                          "forced conclusion), never through this tool. A 404 "
+                          "means `criterion_id` doesn't exist on this Plan — read "
+                          "`get_plan` first to find it."),
+             inputSchema={"type": "object", "properties": {
+                 "slug": {"type": "string"},
+                 "criterion_id": {"type": "string"},
+                 "status": {"type": "string", "enum": ["pending", "satisfied"]},
+                 "note": {"type": "string", "description": "Evidence note."},
+                 "url": {"type": "string", "description": "Evidence URL (e.g. a PR)."},
+             }, "required": ["slug", "criterion_id"]}),
         Tool(name="finish_plan_iteration",
              description=("TERMINAL call for a plan-steward iteration — close YOUR "
                           "current iteration with the decision you took. Call this "
@@ -3315,6 +3418,18 @@ async def _dispatch_tool(name: str, arguments: dict[str, Any] | None) -> list[Te
                 params["limit"] = str(args["limit"])
             r = await c.get(f"{BASE}/api/targets", params=params)
             return _err(r.status_code, r.text) if r.status_code != 200 else _ok(r.json())
+        if name == "list_plans":
+            params = {}
+            if args.get("include_deleted"):
+                params["include_deleted"] = "true"
+            if args.get("status"):
+                params["status"] = args["status"]
+            if args.get("q"):
+                params["q"] = args["q"]
+            if args.get("limit"):
+                params["limit"] = str(args["limit"])
+            r = await c.get(f"{BASE}/api/plans", params=params)
+            return _err(r.status_code, r.text) if r.status_code != 200 else _ok(r.json())
         if name == "get_plan":
             r = await c.get(f"{BASE}/api/plans/{args['slug']}")
             return _err(r.status_code, r.text) if r.status_code != 200 else _ok(r.json())
@@ -3327,6 +3442,70 @@ async def _dispatch_tool(name: str, arguments: dict[str, Any] | None) -> list[Te
                 params["limit"] = str(args["limit"])
             r = await c.get(f"{BASE}/api/plans/{args['slug']}/iterations", params=params)
             return _err(r.status_code, r.text) if r.status_code != 200 else _ok(r.json())
+        if name == "create_plan":
+            body = {k: v for k, v in args.items() if k in (
+                "slug", "name", "kind", "purpose", "needs_strategy",
+                "delivery_criteria", "cadence_seconds", "budget_tokens",
+                "budget_usd", "auto_conclude", "follow_up_agent_slug")}
+            r = await c.post(f"{BASE}/api/plans", json=body)
+            return _err(r.status_code, r.text) if r.status_code != 200 else _ok(r.json())
+        if name == "activate_plan":
+            r = await c.post(f"{BASE}/api/plans/{args['slug']}/activate")
+            return _err(r.status_code, r.text) if r.status_code != 200 else _ok(r.json())
+        if name == "update_plan":
+            # FIELD-RESTRICTED (card 4155bf3b-9510-81bd-b1c9-dda6df622e73):
+            # built from an explicit allowlist rather than forwarding `args`
+            # wholesale, because AP-MT's own `PlanUpdate` DOES accept
+            # `auto_conclude`/`follow_up_agent_slug` (unlike `status`/`kind`,
+            # which it silently drops) — a generic forward here would let an
+            # agent hand itself conclusion authority or redirect its own
+            # steward assignment, so the restriction has to live on this
+            # side, not rely on the backend to refuse it.
+            slug = args["slug"]
+            body = {k: v for k, v in args.items() if k in (
+                "purpose", "needs_strategy", "cadence_seconds",
+                "budget_tokens", "budget_usd", "tags")}
+            r = await c.put(f"{BASE}/api/plans/{slug}", json=body)
+            return _err(r.status_code, r.text) if r.status_code != 200 else _ok(r.json())
+        if name == "record_plan_criterion":
+            # `run_id` on the appended evidence is the CALLER'S OWN run,
+            # never model-supplied (same rule `finish_plan_iteration`'s
+            # `run_id` and `create_target`'s `claimed_by_run_id` follow) —
+            # evidence that didn't carry who actually produced it would be
+            # unverifiable, so this refuses outright rather than recording
+            # evidence with no provenance.
+            rid = _caller_run_id(args)
+            if not rid:
+                return _err(400, "cannot record evidence: no caller run id is "
+                                 "available in this session — there is no path "
+                                 "for evidence with no provenance.")
+            status = args.get("status")
+            if status is not None and status not in ("pending", "satisfied"):
+                return _err(400, f"status must be 'pending' or 'satisfied', not "
+                                 f"{status!r} — 'waived' stays human-only.")
+            slug = args["slug"]
+            cid = args["criterion_id"]
+            r = await c.get(f"{BASE}/api/plans/{slug}")
+            if r.status_code != 200:
+                return _err(r.status_code, r.text)
+            criteria = r.json().get("delivery_criteria") or []
+            match = next((cr for cr in criteria if str(cr.get("id")) == str(cid)), None)
+            if match is None:
+                return _err(404, f"criterion {cid!r} not found on plan {slug!r}")
+            updated = dict(match)
+            if status is not None:
+                updated["status"] = status
+            entry: dict[str, Any] = {"run_id": rid}
+            if args.get("note"):
+                entry["note"] = args["note"]
+            if args.get("url"):
+                entry["url"] = args["url"]
+            updated["evidence"] = list(updated.get("evidence") or []) + [entry]
+            new_criteria = [updated if str(cr.get("id")) == str(cid) else cr
+                            for cr in criteria]
+            r2 = await c.put(f"{BASE}/api/plans/{slug}/criteria",
+                             json={"delivery_criteria": new_criteria})
+            return _err(r2.status_code, r2.text) if r2.status_code != 200 else _ok(r2.json())
         if name == "finish_plan_iteration":
             # `run_id` is the CALLER'S OWN run, resolved the same way every
             # other self-referential tool here does it (see `_caller_run_id`:
