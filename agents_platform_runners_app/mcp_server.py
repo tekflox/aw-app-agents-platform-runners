@@ -1647,7 +1647,18 @@ async def _list_tools() -> list[Tool]:
                           "'waived' stays human-only (through the Plan UI or a "
                           "forced conclusion), never through this tool. A 404 "
                           "means `criterion_id` doesn't exist on this Plan — read "
-                          "`get_plan` first to find it."),
+                          "`get_plan` first to find it.\n\n"
+                          "LAST-WRITE-WINS: there is no version check between "
+                          "the read and the write, same cost `PUT /{slug}/"
+                          "criteria` already carries for every caller (Plan has "
+                          "no version column at all — see `PlanCriteriaIn`). "
+                          "Two calls racing on the SAME plan (different "
+                          "criteria or the same one) can have the later one "
+                          "silently overwrite the earlier one's change with no "
+                          "error to either caller. Fine for the normal "
+                          "one-writer-at-a-time case; do not rely on this for "
+                          "anything that needs two agents writing the same "
+                          "plan's criteria concurrently."),
              inputSchema={"type": "object", "properties": {
                  "slug": {"type": "string"},
                  "criterion_id": {"type": "string"},

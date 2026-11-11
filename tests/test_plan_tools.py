@@ -469,6 +469,19 @@ def test_record_plan_criterion_schema_excludes_waived():
     assert set(enum) == {"pending", "satisfied"}
 
 
+def test_record_plan_criterion_description_discloses_the_lost_update_risk():
+    """Code review finding (PR #21): the GET-then-PUT here has no version
+    check — Plan carries no version column at all, so this is the same
+    last-write-wins cost `PUT /{slug}/criteria` already has for every
+    caller, not something this tool could fix on its own. The honest
+    response is disclosure, same as `PlanCriteriaIn`'s own docstring gives
+    on the backend side — not a fake lock this layer cannot actually
+    enforce."""
+    desc = _tool("record_plan_criterion").description
+    assert "last-write-wins" in desc.lower()
+    assert "no version" in desc.lower()
+
+
 # ---------------------------------------------------------------------------
 # Plan MEMORY — Slice 8 (AP-MT Kanban 4135bf3b-9510-819c-bef0-d50d2440cf90)
 # ---------------------------------------------------------------------------
