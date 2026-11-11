@@ -3323,7 +3323,27 @@ async def _dispatch_tool(name: str, arguments: dict[str, Any] | None) -> list[Te
             # same as omitting them but relies on the server reading it that
             # way — building the body from what was sent keeps the contract
             # in one place.
-            body: dict = {"value": args.get("value")}
+            #
+            # `inputSchema` here is advisory only — this server is
+            # hand-rolled stdio, not the `mcp` SDK, so nothing validates a
+            # tool call's arguments against it. A model that means to send
+            # the object `{"schema_version": 1, ...}` can still send the
+            # STRING `'{"schema_version": 1, ...}'` instead, and nothing
+            # upstream of here would catch it (confirmed live twice, card
+            # 4145bf3b-9510-81c1-b5c5-f7e5be2ae13d). Auto-correct that one
+            # specific shape — a string that itself decodes to a dict or
+            # list is essentially never an intentional scalar value, it is
+            # the double-encoding mistake — rather than silently storing a
+            # string the caller almost certainly didn't mean to write.
+            value = args.get("value")
+            if isinstance(value, str):
+                try:
+                    decoded = json.loads(value)
+                except ValueError:
+                    decoded = None
+                if isinstance(decoded, (dict, list)):
+                    value = decoded
+            body: dict = {"value": value}
             if args.get("summary") is not None:
                 body["summary"] = args["summary"]
             if args.get("state") is not None:

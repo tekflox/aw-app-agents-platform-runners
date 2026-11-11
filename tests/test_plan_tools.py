@@ -296,19 +296,31 @@ def test_update_plan_memory_declares_what_it_requires():
                                          "summary", "state"}
 
 
-def test_update_plan_memory_value_is_not_left_untyped():
-    """An untyped `value` is exactly how two live kanban-sweeper runs ended
-    up passing a json.dumps'd STRING instead of the native object they
-    meant (card 4145bf3b-9510-81c1-b5c5-f7e5be2ae13d, 2026-11-11) — a
-    caller then has to parse the subtree before reaching its keys. `value`
-    still has to accept any JSON value per the tool's own design (a
-    steward's state need not be an object), so this only pins the schema
-    to an explicit type list rather than leaving it absent."""
-    schema = _tool("update_plan_memory").inputSchema["properties"]["value"]
-    assert set(schema["type"]) == {"object", "array", "string", "number",
-                                   "boolean", "null"}
-    assert "json-encoded string" in schema["description"].lower() or \
-        "json.dumps" in schema["description"]
+def test_update_plan_memory_auto_decodes_a_double_encoded_object(monkeypatch):
+    """Two live kanban-sweeper runs passed a `json.dumps(...)`'d STRING as
+    `value` instead of the native object they meant (card
+    4145bf3b-9510-81c1-b5c5-f7e5be2ae13d, 2026-11-11) — `ext["kanban-
+    sweeper"]` landed in `Plan.memory` as a string, so a reader had to
+    parse it before reaching `.iterations[0]`. `inputSchema` here is
+    advisory only (this server has no jsonschema validation at all, see
+    the dispatch branch), so the fix has to live in the dispatch, not the
+    schema: a string that itself decodes to a dict/list is auto-corrected
+    to the decoded object before it is forwarded."""
+    double_encoded = json.dumps({"schema_version": 1, "iterations": [{"seq": 1}]})
+    req = _call(monkeypatch, "update_plan_memory",
+                {"slug": "my-plan", "writer_key": "a", "value": double_encoded},
+                payload={"memory": {}, "version": 1})
+    assert json.loads(req.content) == {
+        "value": {"schema_version": 1, "iterations": [{"seq": 1}]}}
+
+
+def test_update_plan_memory_leaves_a_genuine_string_value_alone(monkeypatch):
+    """Not every string is a mistake — a steward whose whole ext value IS a
+    plain string (not JSON-shaped) must still be able to write it."""
+    req = _call(monkeypatch, "update_plan_memory",
+                {"slug": "my-plan", "writer_key": "a", "value": "just a note"},
+                payload={"memory": {}, "version": 1})
+    assert json.loads(req.content) == {"value": "just a note"}
 
 
 def test_the_memory_descriptions_carry_the_three_rules_an_agent_needs():
