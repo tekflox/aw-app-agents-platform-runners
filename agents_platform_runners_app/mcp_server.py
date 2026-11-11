@@ -343,6 +343,12 @@ def _target_spec_schema() -> dict:
             "tags":              {"type": "array", "items": {"type": "string"}},
             "notes":             {"type": "string"},
             "created_by":        {"type": ["string", "null"]},
+            "plan_slug":         {"type": ["string", "null"],
+                                  "description": ("Claim this Target under a Plan at "
+                                                  "creation time. If omitted, the server "
+                                                  "auto-claims it from your own run's "
+                                                  "Plan context when there is one (no "
+                                                  "action needed from you for that case).")},
         },
         "required": ["slug", "name"],
     }
@@ -364,6 +370,10 @@ def _target_patch_schema() -> dict:
             "status":            {"type": ["string", "null"], "enum": [None, "active", "completed", "cancelled", "abandoned"]},
             "tags":              {"type": ["array", "null"], "items": {"type": "string"}},
             "notes":             {"type": ["string", "null"]},
+            "plan_slug":         {"type": ["string", "null"],
+                                  "description": ("Attach/detach this Target to a Plan "
+                                                  "by slug. Empty string detaches, same "
+                                                  "as omitting a plan entirely.")},
         },
         "required": ["slug"],
     }
@@ -1663,7 +1673,7 @@ async def _list_tools() -> list[Tool]:
         Tool(name="update_target",
              description=("Patch a Target — set status to 'completed'/'cancelled' to "
                           "stamp ended_at, attach plan_canvas_id / report_canvas_id, "
-                          "or update budgets."),
+                          "update budgets, or attach/detach a Plan via `plan_slug`."),
              inputSchema=_target_patch_schema()),
         Tool(name="delete_target",
              description=("Soft-delete by default (recoverable). Pass `hard:true` for "
@@ -3382,6 +3392,19 @@ async def _dispatch_tool(name: str, arguments: dict[str, Any] | None) -> list[Te
             r = await c.get(f"{BASE}/api/targets/{args['slug']}")
             return _err(r.status_code, r.text) if r.status_code != 200 else _ok(r.json())
         if name == "create_target":
+            # `claimed_by_run_id` is the caller's OWN run, resolved the same
+            # way every other self-referential tool here does it (see
+            # `_caller_run_id`) — never model-supplied, because a model that
+            # could name any run could claim a Target under another run's
+            # Plan. UNCONDITIONAL overwrite, including the None case: a
+            # walrus-guarded `if _rid := ...: args[...] = _rid` would leave a
+            # model-supplied value in `args` untouched whenever no caller run
+            # resolves, which is exactly the forgery this field exists to
+            # rule out — caught on review (PR #20) before merge. The server
+            # only USES this when no explicit `plan_slug` was given (parent-
+            # chain auto-claim); sending it unconditionally costs nothing on
+            # the explicit-claim or no-plan-context paths.
+            args["claimed_by_run_id"] = _caller_run_id(args)
             r = await c.post(f"{BASE}/api/targets", json=args)
             return _err(r.status_code, r.text) if r.status_code != 200 else _ok(r.json())
         if name == "update_target":
