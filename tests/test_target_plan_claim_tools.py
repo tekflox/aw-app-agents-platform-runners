@@ -130,14 +130,29 @@ def test_create_target_ignores_a_model_supplied_claimed_by_run_id(monkeypatch):
     assert body["claimed_by_run_id"] == "run-real"
 
 
-def test_create_target_omits_claimed_by_run_id_when_no_caller_run_exists(monkeypatch):
+def test_create_target_sends_a_null_claimed_by_run_id_when_no_caller_run_exists(monkeypatch):
     """Unlike `finish_plan_iteration`, a Target can always be created with
     no Plan context at all — this must not become a hard error, just a
     Target with no claim (the backend leaves plan_id NULL)."""
     monkeypatch.delenv("AW_RUN_ID", raising=False)
     body = json.loads(_call(monkeypatch, "create_target",
                             {"slug": "us1924311", "name": "t"}).content)
-    assert "claimed_by_run_id" not in body
+    assert body["claimed_by_run_id"] is None
+
+
+def test_create_target_overwrites_a_forged_run_id_even_with_no_caller_run(monkeypatch):
+    """Review finding (PR #20): a walrus-guarded `if _rid := ...: args[...] =
+    _rid` skips the overwrite entirely when no caller run resolves, leaving
+    a model-supplied `claimed_by_run_id` in `args` untouched — exactly the
+    forgery this field exists to rule out, and exactly the combination
+    `test_create_target_ignores_a_model_supplied_claimed_by_run_id` above
+    does NOT cover (it always sets AW_RUN_ID first). The fix overwrites
+    unconditionally, including to None."""
+    monkeypatch.delenv("AW_RUN_ID", raising=False)
+    body = json.loads(_call(monkeypatch, "create_target",
+                            {"slug": "us1924311", "name": "t",
+                             "claimed_by_run_id": "someone-elses-run"}).content)
+    assert body["claimed_by_run_id"] is None
 
 
 def test_create_target_sends_claimed_by_run_id_even_with_an_explicit_plan_slug(monkeypatch):

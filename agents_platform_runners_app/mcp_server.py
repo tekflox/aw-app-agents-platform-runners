@@ -3396,11 +3396,15 @@ async def _dispatch_tool(name: str, arguments: dict[str, Any] | None) -> list[Te
             # way every other self-referential tool here does it (see
             # `_caller_run_id`) — never model-supplied, because a model that
             # could name any run could claim a Target under another run's
-            # Plan. The server only USES it when no explicit `plan_slug` was
-            # given (parent-chain auto-claim); always sending it costs
-            # nothing on the explicit-claim or no-plan-context paths.
-            if _rid := _caller_run_id(args):
-                args["claimed_by_run_id"] = _rid
+            # Plan. UNCONDITIONAL overwrite, including the None case: a
+            # walrus-guarded `if _rid := ...: args[...] = _rid` would leave a
+            # model-supplied value in `args` untouched whenever no caller run
+            # resolves, which is exactly the forgery this field exists to
+            # rule out — caught on review (PR #20) before merge. The server
+            # only USES this when no explicit `plan_slug` was given (parent-
+            # chain auto-claim); sending it unconditionally costs nothing on
+            # the explicit-claim or no-plan-context paths.
+            args["claimed_by_run_id"] = _caller_run_id(args)
             r = await c.post(f"{BASE}/api/targets", json=args)
             return _err(r.status_code, r.text) if r.status_code != 200 else _ok(r.json())
         if name == "update_target":
