@@ -470,16 +470,83 @@ def test_record_plan_criterion_schema_excludes_waived():
 
 
 def test_record_plan_criterion_description_discloses_the_lost_update_risk():
-    """Code review finding (PR #21): the GET-then-PUT here has no version
-    check — Plan carries no version column at all, so this is the same
-    last-write-wins cost `PUT /{slug}/criteria` already has for every
-    caller, not something this tool could fix on its own. The honest
-    response is disclosure, same as `PlanCriteriaIn`'s own docstring gives
-    on the backend side — not a fake lock this layer cannot actually
-    enforce."""
+    """Code review finding (PR #21): AP-MT's Plan carries no version column
+    at all, so `PUT /{slug}/criteria` is last-write-wins for ANY two
+    callers — true before this tool existed, same cost `PlanCriteriaIn`'s
+    own docstring already accepts on the backend side. The per-plan lock
+    below closes the case reachable THROUGH this connector; this
+    description is what tells a caller the residual case (a direct AP-MT
+    caller bypassing this connector entirely, e.g. the Plan UI) still
+    exists."""
     desc = _tool("record_plan_criterion").description
     assert "last-write-wins" in desc.lower()
     assert "no version" in desc.lower()
+
+
+def test_record_plan_criterion_serializes_two_concurrent_calls_on_the_same_plan(monkeypatch):
+    """The actual fix for the code review finding: two agents calling
+    `record_plan_criterion` on the SAME plan at the same time — the
+    finding's own example — must not lose either write. Forces a real
+    interleaving window (the GET handler yields control mid-flight) to
+    prove the per-plan lock, not test timing, is what keeps both writes.
+    Without the lock both GETs would land before either PUT, and the
+    second PUT would overwrite the first call's change with a stale
+    snapshot.
+    """
+    monkeypatch.setenv("AW_RUN_ID", "run-shared")
+    server_state = {"delivery_criteria": [
+        {"id": "c-1", "text": "ship MVP", "required": True,
+         "status": "pending", "evidence": []},
+        {"id": "c-2", "text": "other", "required": False,
+         "status": "pending", "evidence": []},
+    ]}
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET":
+            # Snapshot BEFORE yielding, not after: this is what makes the
+            # race deterministic rather than a coincidence of PUT having no
+            # internal await of its own. Without the lock, both calls'
+            # GETs snapshot the same original document, then both PUT their
+            # own (now stale) copy back — the second PUT always wins and
+            # the first call's change is lost. With the lock, the second
+            # call's GET cannot even START until the first call's PUT has
+            # released the lock, so its snapshot is never stale.
+            snapshot = dict(server_state)
+            await asyncio.sleep(0)
+            return httpx.Response(200, json=snapshot)
+        body = json.loads(request.content)
+        server_state["delivery_criteria"] = body["delivery_criteria"]
+        return httpx.Response(200, json=dict(server_state))
+
+    real_async_client = httpx.AsyncClient
+
+    def fake_async_client(*a, **kw):
+        kw["transport"] = httpx.MockTransport(handler)
+        return real_async_client(*a, **kw)
+
+    monkeypatch.setattr(mcp_server.httpx, "AsyncClient", fake_async_client)
+
+    async def run_both():
+        await asyncio.gather(
+            mcp_server._call_tool("record_plan_criterion",
+                                  {"slug": "p", "criterion_id": "c-1",
+                                   "status": "satisfied"}),
+            mcp_server._call_tool("record_plan_criterion",
+                                  {"slug": "p", "criterion_id": "c-2",
+                                   "status": "satisfied"}),
+        )
+
+    asyncio.run(run_both())
+    final = {c["id"]: c["status"] for c in server_state["delivery_criteria"]}
+    assert final == {"c-1": "satisfied", "c-2": "satisfied"}
+
+
+def test_record_plan_criterion_does_not_lock_across_different_plans(monkeypatch):
+    """The lock is keyed by slug — two calls on DIFFERENT plans must not
+    serialize against each other (that would be an unbounded-latency bug
+    for every unrelated plan a steward touches)."""
+    assert mcp_server._plan_criteria_lock("plan-a") is not mcp_server._plan_criteria_lock("plan-b")
+    assert mcp_server._plan_criteria_lock("plan-a") is mcp_server._plan_criteria_lock("plan-a")
 
 
 # ---------------------------------------------------------------------------

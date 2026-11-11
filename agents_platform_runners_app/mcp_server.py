@@ -142,6 +142,24 @@ def _board_client() -> "kanban_dispatch.BoardClient":
         _BOARD = kanban_dispatch.BoardClient()
     return _BOARD
 
+
+# Per-plan locks for `record_plan_criterion`'s read-modify-write (code review
+# finding, PR #21): AP-MT's `Plan.delivery_criteria` carries no version
+# column, so `PUT /{slug}/criteria` is last-write-wins for ANY two callers —
+# true before this tool existed, and still true for a caller that bypasses
+# this connector entirely (the Plan UI's own criteria editor hits AP-MT
+# directly). What this lock closes is the one case actually reachable
+# THROUGH this connector: two agents each calling `record_plan_criterion` on
+# the SAME plan concurrently, which is exactly the review finding's own
+# example. `setdefault` is safe with no `await` between the dict read and
+# write — this module is single-threaded asyncio, so nothing can interleave
+# inside one synchronous statement.
+_PLAN_CRITERIA_LOCKS: dict[str, asyncio.Lock] = {}
+
+
+def _plan_criteria_lock(slug: str) -> asyncio.Lock:
+    return _PLAN_CRITERIA_LOCKS.setdefault(slug, asyncio.Lock())
+
 # agents-platform-multitenant's require_identity() rejects every request
 # without an aw-backend-issued identity JWT (401 unauthorized) — this token
 # is that credential, provided via config (AGENTS_PLATFORM_TOKEN) so every
@@ -1648,17 +1666,15 @@ async def _list_tools() -> list[Tool]:
                           "forced conclusion), never through this tool. A 404 "
                           "means `criterion_id` doesn't exist on this Plan — read "
                           "`get_plan` first to find it.\n\n"
-                          "LAST-WRITE-WINS: there is no version check between "
-                          "the read and the write, same cost `PUT /{slug}/"
-                          "criteria` already carries for every caller (Plan has "
-                          "no version column at all — see `PlanCriteriaIn`). "
-                          "Two calls racing on the SAME plan (different "
-                          "criteria or the same one) can have the later one "
-                          "silently overwrite the earlier one's change with no "
-                          "error to either caller. Fine for the normal "
-                          "one-writer-at-a-time case; do not rely on this for "
-                          "anything that needs two agents writing the same "
-                          "plan's criteria concurrently."),
+                          "Two calls on the SAME plan are serialized against "
+                          "each other (a per-slug lock), so two agents racing "
+                          "to record different criteria at once cannot lose "
+                          "either write. That lock only covers callers going "
+                          "through this tool, though: Plan has no version "
+                          "column at all (see `PlanCriteriaIn`), so "
+                          "`PUT /{slug}/criteria` is still LAST-WRITE-WINS "
+                          "against anything that writes criteria directly — "
+                          "the Plan UI's own editor, chiefly."),
              inputSchema={"type": "object", "properties": {
                  "slug": {"type": "string"},
                  "criterion_id": {"type": "string"},
@@ -3496,26 +3512,31 @@ async def _dispatch_tool(name: str, arguments: dict[str, Any] | None) -> list[Te
                                  f"{status!r} — 'waived' stays human-only.")
             slug = args["slug"]
             cid = args["criterion_id"]
-            r = await c.get(f"{BASE}/api/plans/{slug}")
-            if r.status_code != 200:
-                return _err(r.status_code, r.text)
-            criteria = r.json().get("delivery_criteria") or []
-            match = next((cr for cr in criteria if str(cr.get("id")) == str(cid)), None)
-            if match is None:
-                return _err(404, f"criterion {cid!r} not found on plan {slug!r}")
-            updated = dict(match)
-            if status is not None:
-                updated["status"] = status
-            entry: dict[str, Any] = {"run_id": rid}
-            if args.get("note"):
-                entry["note"] = args["note"]
-            if args.get("url"):
-                entry["url"] = args["url"]
-            updated["evidence"] = list(updated.get("evidence") or []) + [entry]
-            new_criteria = [updated if str(cr.get("id")) == str(cid) else cr
-                            for cr in criteria]
-            r2 = await c.put(f"{BASE}/api/plans/{slug}/criteria",
-                             json={"delivery_criteria": new_criteria})
+            # Serializes this read-modify-write against every OTHER
+            # record_plan_criterion call on the same plan made through this
+            # connector — see _plan_criteria_lock's docstring for what this
+            # does and does not close.
+            async with _plan_criteria_lock(slug):
+                r = await c.get(f"{BASE}/api/plans/{slug}")
+                if r.status_code != 200:
+                    return _err(r.status_code, r.text)
+                criteria = r.json().get("delivery_criteria") or []
+                match = next((cr for cr in criteria if str(cr.get("id")) == str(cid)), None)
+                if match is None:
+                    return _err(404, f"criterion {cid!r} not found on plan {slug!r}")
+                updated = dict(match)
+                if status is not None:
+                    updated["status"] = status
+                entry: dict[str, Any] = {"run_id": rid}
+                if args.get("note"):
+                    entry["note"] = args["note"]
+                if args.get("url"):
+                    entry["url"] = args["url"]
+                updated["evidence"] = list(updated.get("evidence") or []) + [entry]
+                new_criteria = [updated if str(cr.get("id")) == str(cid) else cr
+                                for cr in criteria]
+                r2 = await c.put(f"{BASE}/api/plans/{slug}/criteria",
+                                 json={"delivery_criteria": new_criteria})
             return _err(r2.status_code, r2.text) if r2.status_code != 200 else _ok(r2.json())
         if name == "finish_plan_iteration":
             # `run_id` is the CALLER'S OWN run, resolved the same way every
