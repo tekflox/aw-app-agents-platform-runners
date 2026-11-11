@@ -107,6 +107,16 @@ ENDPOINTS: dict[str, tuple[str, frozenset[str]]] = {
     "workflows": ("/api/workflows", frozenset({
         "slug", "name", "description", "use_cases", "kind", "graph",
     })),
+    "plans": ("/api/plans", frozenset({
+        "slug", "name", "kind", "purpose", "needs_strategy", "cadence_seconds",
+        "budget_tokens", "budget_usd", "budget_window", "follow_up_agent_slug",
+        # follow_up_workflow_slug: not yet a PlanIn field on agents-platform-
+        # multitenant master (landing via its own PR #43). Kept here anyway —
+        # Pydantic's default extra="ignore" drops an unrecognised optional
+        # field rather than 422ing the create, so this is forward-compatible
+        # and a no-op until that column exists.
+        "follow_up_workflow_slug", "tags",
+    })),
     "evals": ("/api/evals", frozenset({
         "slug", "name", "description", "target_kind", "target_slug",
         "dataset", "metric", "metric_args",
@@ -118,15 +128,16 @@ ENDPOINTS: dict[str, tuple[str, frozenset[str]]] = {
 }
 
 #: Creation order — an Agent references the other three by slug; a Workflow's
-#: graph references agents by slug, so it comes after them; an Eval's
-#: target_slug can point at either an agent or a workflow, so it comes after
-#: both; an AgentFlow's graph references agents by slug too, so it goes
-#: last. ``targets`` goes first: nothing references a Target by slug and a
-#: Target references nothing, so it has no ordering constraint — first is as
-#: defensible a slot as any, and keeps this tuple's shape matching
-#: aw-workspace's ``KINDS``.
+#: graph references agents by slug, so it comes after them; a Plan's
+#: follow_up_agent_slug/follow_up_workflow_slug point at an agent and a
+#: workflow, so it comes after both; an Eval's target_slug can point at
+#: either an agent or a workflow, so it comes after both too; an AgentFlow's
+#: graph references agents by slug too, so it goes last. ``targets`` goes
+#: first: nothing references a Target by slug and a Target references
+#: nothing, so it has no ordering constraint — first is as defensible a slot
+#: as any, and keeps this tuple's shape matching aw-workspace's ``KINDS``.
 ORDER = ("targets", "models", "agent_configs", "groups", "agents",
-         "workflows", "evals", "agent_flows")
+         "workflows", "plans", "evals", "agent_flows")
 
 #: ``display_name`` is required by the platform's ModelIn but is pure
 #: presentation; defaulting it from the slug spares every manifest a field
@@ -138,12 +149,14 @@ DEFAULTS: dict[str, dict[str, str]] = {
 #: kind -> restore endpoint template, for kinds whose soft-delete would
 #: otherwise 409-block a reseed forever (see the module docstring's
 #: "Soft-deleted rows do not stay 409-and-forgotten forever" section).
-#: ``targets``, ``workflows`` and ``agents`` have a restore route; every
-#: other kind still uses the plain "409 == already there" rule below.
+#: ``targets``, ``workflows``, ``agents`` and ``plans`` have a restore
+#: route; every other kind still uses the plain "409 == already there"
+#: rule below.
 RESTORE_ENDPOINTS: dict[str, str] = {
     "targets": "/api/targets/{slug}/restore",
     "workflows": "/api/workflows/{slug}/restore",
     "agents": "/api/agents/{slug}/restore",
+    "plans": "/api/plans/{slug}/restore",
 }
 
 
