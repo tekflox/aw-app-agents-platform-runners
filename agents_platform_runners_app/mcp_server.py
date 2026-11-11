@@ -1604,8 +1604,20 @@ async def _list_tools() -> list[Tool]:
                                 "description": ("Your subtree's key under `ext` — "
                                                 "letters/digits then . _ : - , max "
                                                 "64 chars. Normally your agent slug.")},
-                 "value": {"description": ("Whatever you want to remember. Any JSON "
-                                           "value; replaces your subtree outright.")},
+                 "value": {"type": ["object", "array", "string", "number",
+                                    "boolean", "null"],
+                           "description": ("Whatever you want to remember. Any JSON "
+                                           "value; replaces your subtree outright. If "
+                                           "what you want to remember is itself an "
+                                           "object (most stewards' is), pass that "
+                                           "object directly — NEVER a JSON-encoded "
+                                           "string of it (e.g. `json.dumps(...)`'s "
+                                           "output). Confirmed live (card "
+                                           "4145bf3b-9510-81c1-b5c5-f7e5be2ae13d, "
+                                           "2026-11-11) that the prior untyped schema "
+                                           "let a caller do exactly that, storing the "
+                                           "subtree as a string a reader then has to "
+                                           "parse before reaching its keys.")},
                  "summary": {"type": "string",
                              "description": ("OPTIONAL, SHARED. Max 2000 chars. Omit "
                                              "to leave the current summary alone.")},

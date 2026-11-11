@@ -296,6 +296,21 @@ def test_update_plan_memory_declares_what_it_requires():
                                          "summary", "state"}
 
 
+def test_update_plan_memory_value_is_not_left_untyped():
+    """An untyped `value` is exactly how two live kanban-sweeper runs ended
+    up passing a json.dumps'd STRING instead of the native object they
+    meant (card 4145bf3b-9510-81c1-b5c5-f7e5be2ae13d, 2026-11-11) — a
+    caller then has to parse the subtree before reaching its keys. `value`
+    still has to accept any JSON value per the tool's own design (a
+    steward's state need not be an object), so this only pins the schema
+    to an explicit type list rather than leaving it absent."""
+    schema = _tool("update_plan_memory").inputSchema["properties"]["value"]
+    assert set(schema["type"]) == {"object", "array", "string", "number",
+                                   "boolean", "null"}
+    assert "json-encoded string" in schema["description"].lower() or \
+        "json.dumps" in schema["description"]
+
+
 def test_the_memory_descriptions_carry_the_three_rules_an_agent_needs():
     """The prompt already carries summary/state/version/ext_keys every
     cycle, so the two things an agent can only learn here are: use a STABLE
