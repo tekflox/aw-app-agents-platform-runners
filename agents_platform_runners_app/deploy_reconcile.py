@@ -356,7 +356,12 @@ def _resolve_observation(klass: str | None, name: str, component: str, workspace
     """One (component, workspace) pair's observation, source-labelled.
     Precedence: live adapter > fresh inventory row > fresh agent evidence >
     unknown — see module docstring. Always returns the source used (or
-    ``None`` for unknown) so the evidence string can name it."""
+    ``None`` for unknown) so the evidence string can name it. A fresh
+    inventory row with no ``version`` (code-review finding on PR #33: a
+    component registered before its version field is backfilled is a
+    plausible real shape) is treated the same as a missing row — it falls
+    through to agent evidence rather than returning a bogus 'unknown' via
+    ``source="inventory"``."""
     live = _observe(klass, name, workspace)
     if not live.get("error") and live.get("observed"):
         return {"workspace": workspace, "observed": live["observed"], "source": "live",
@@ -364,7 +369,7 @@ def _resolve_observation(klass: str | None, name: str, component: str, workspace
     live_error = live.get("error")
 
     inv_row = inventory.get(component) if workspace == _this_workspace() else None
-    if inv_row is not None and not inv_row.get("stale"):
+    if inv_row is not None and not inv_row.get("stale") and inv_row.get("version"):
         return {"workspace": workspace, "observed": inv_row.get("version"),
                 "source": "inventory", "age_s": inv_row.get("age_s"), "reason": None,
                 "verdict": compare(klass, inv_row.get("version"), to_version)}
@@ -376,7 +381,8 @@ def _resolve_observation(klass: str | None, name: str, component: str, workspace
                 "verdict": compare(klass, agent_obs.get("observed"), to_version)}
 
     if inv_row is not None:
-        reason = (f"inventory row stale (age_s={inv_row.get('age_s')}); "
+        why = ("stale" if inv_row.get("stale") else "has no version")
+        reason = (f"inventory row {why} (age_s={inv_row.get('age_s')}); "
                   f"live adapter: {live_error}")
     else:
         reason = live_error or ("no observation source available (no live adapter, "

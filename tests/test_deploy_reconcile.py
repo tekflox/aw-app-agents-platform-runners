@@ -543,6 +543,28 @@ def test_stale_inventory_row_is_skipped_falls_through(monkeypatch):
     assert "stale" in row["observations"][0]["reason"]
 
 
+def test_fresh_but_version_less_inventory_row_falls_through_to_agent_evidence(monkeypatch):
+    """Code-review finding on PR #33 (round 3): a fresh (non-stale) inventory
+    row with no 'version' (a component registered before its version field
+    is backfilled) must not be accepted as source='inventory' with observed=
+    None — that silently reports 'unknown' without ever trying the agent-
+    evidence tier below it, the same bug class the live tier's own
+    `live.get("observed")` guard three lines above already avoids."""
+    _patch_observe(monkeypatch, "app", {"workspace": "aw", "observed": None,
+                                        "error": "unreachable"})
+    _patch_inventory(monkeypatch, {"app:notion": {"version": None, "stale": False,
+                                                  "age_s": 5}})
+    now = dr.time.time()
+    recent = dr.dt.datetime.fromtimestamp(now - 60, tz=dr.dt.timezone.utc).isoformat()
+    prior = json.dumps({"agent_observation": {"observed": "v0.35.1", "at": recent}})
+    board = FakeBoard({"p1": _card(QAStatus="done", DeployCheckResult=prior)})
+    result = dr.check_deployed(board, max_cards=10)
+    row = result["moved"][0]
+    obs = row["observations"][0]
+    assert obs["source"] == "agent"
+    assert obs["observed"] == "v0.35.1"
+
+
 def test_both_live_and_inventory_failing_is_unknown(monkeypatch):
     _patch_observe(monkeypatch, "app", {"workspace": "aw", "observed": None, "error": "down"})
     _patch_inventory(monkeypatch, {}, error="backend unreachable")
