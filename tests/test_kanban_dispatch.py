@@ -11,6 +11,7 @@ Run: python -m pytest tests/test_kanban_dispatch.py
 from __future__ import annotations
 
 import asyncio
+import json
 import sys
 from pathlib import Path
 
@@ -297,6 +298,32 @@ def test_card_asks_for_the_body_and_comments(monkeypatch):
     kd.BoardClient().card("p1")
     assert "include_body=true" in seen["url"]
     assert "include_comments=true" in seen["url"]
+
+
+def test_add_comment_posts_to_the_comment_endpoint(monkeypatch):
+    """Regression: kanban_check_deployed called board.add_comment() against
+    a BoardClient that had no such method at all — AttributeError on the
+    first live run (never caught by tests, since deploy_reconcile's own
+    tests use a local FakeBoard double that DID implement it)."""
+    monkeypatch.setenv("AW_WORKSPACE_API_KEY", "k")
+    seen = {}
+
+    class R:
+        def read(self): return b"{}"
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+
+    def capture(req, timeout=None):
+        seen["url"] = req.full_url
+        seen["method"] = req.get_method()
+        seen["body"] = json.loads(req.data.decode())
+        return R()
+
+    monkeypatch.setattr(kd.urllib.request, "urlopen", capture)
+    kd.BoardClient().add_comment("p1", "hello")
+    assert seen["url"].endswith("/api/apps/notion/kanban/comment")
+    assert seen["method"] == "POST"
+    assert seen["body"] == {"page_id": "p1", "text": "hello"}
 
 
 def test_the_watchdog_addresses_the_board_over_loopback(monkeypatch):

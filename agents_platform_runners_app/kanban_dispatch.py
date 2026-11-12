@@ -182,6 +182,10 @@ class BoardClient:
         return self._request("POST", f"{NOTION_PREFIX}/kanban/move",
                              {"page_id": page_id, "status": status})
 
+    def add_comment(self, page_id: str, text: str) -> dict:
+        return self._request("POST", f"{NOTION_PREFIX}/kanban/comment",
+                             {"page_id": page_id, "text": text})
+
     def set_property(self, page_id: str, name: str, value) -> dict:
         return self._request("POST", f"{NOTION_PREFIX}/kanban/set-property",
                              {"page_id": page_id, "property": name, "value": value})
