@@ -27,6 +27,7 @@ import json
 import os
 import re
 import sys
+import time
 from typing import Any
 
 import httpx
@@ -100,6 +101,7 @@ def _agents_base_transport() -> httpx.AsyncHTTPTransport:
 # "no third-party imports" property.
 from . import kanban_dispatch  # noqa: E402
 from . import deploy_reconcile  # noqa: E402
+from . import work_loop as work_loop_mod  # noqa: E402
 from . import platform_base  # noqa: E402
 from . import telegram_report as telegram_report_mod  # noqa: E402
 
@@ -814,7 +816,13 @@ async def _list_tools() -> list[Tool]:
                           },
                           "required": []}),
         Tool(name="kanban_check_deployed",
-             description=("Deterministic Ready-to-Deploy/Testing reconciliation (architect "
+             description=("ALIAS — superseded by `work_loop(loops=[\"deploy\"])`, which "
+                          "returns this exact same shape under its `deploy` key plus "
+                          "`work_orders`/`actions_taken`/`loops_skipped`. Kept live as a thin "
+                          "wrapper over work_loop's shared internals during the migration "
+                          "(Kanban 4165bf3b-9510-810d, phase 1) — same inputs, same output, "
+                          "nothing to change in an existing caller.\n\n"
+                          "Deterministic Ready-to-Deploy/Testing reconciliation (architect "
                           "decision, Kanban 4165bf3b-9510-8162-89d0-dca46ba66481, extended by "
                           "the v2 inventory design on 4165bf3b-9510-812c). Reads each card's "
                           "DeployComponent/DeployWorkspaces/DeployToVersion/DeployEnv and "
@@ -865,6 +873,73 @@ async def _list_tools() -> list[Tool]:
                                           "description": "Report verdicts/observations without moving any card, commenting, stamping, or dispatching QA."},
                               "max_cards": {"type": "integer", "default": 25,
                                            "description": "Max cards to consider per status when scanning the lane (ignored when page_id is given). Response's `truncated` flag tells you if the lane has more."},
+                          },
+                          "required": []}),
+        Tool(name="work_loop",
+             description=("Deterministic orchestrator that keeps Kanban cards (and, once "
+                          "phases 2/3 land, open PRs and Plans) moving — architect design, "
+                          "Kanban 4165bf3b-9510-810d. Runs every mechanical check itself and "
+                          "hands anything needing real judgment to the aw-manager agent as a "
+                          "Mode B work-order list (`{page_id, reason, evidence, "
+                          "suggested_action}` — the exact contract already documented in "
+                          "aw-manager's own SKILL.md); contains NO LLM call of its own.\n\n"
+                          "`loops` (default `[\"deploy\",\"attention\"]`) selects which "
+                          "sections run, independently error-isolated — a dead loop reports "
+                          "in `errors` and every other requested loop still runs:\n"
+                          "- `deploy`: calls the UNCHANGED `kanban_check_deployed` reconciler "
+                          "(`kanban_check_deployed` itself is now a thin alias over this same "
+                          "internal) — verdicts, moves, QA dispatch and the batched deploy "
+                          "reminder are all exactly as before, just returned under this tool's "
+                          "`deploy` key.\n"
+                          "- `attention`: the merged In-Progress + Need-Human candidate list "
+                          "(aw-app-notion's `list_cards_need_attention`, unchanged there), each "
+                          "candidate annotated with the LastSweptAt back-off "
+                          "(`backoff: \"eligible\"|\"backed_off\"`, read-only — the write still "
+                          "belongs to whoever actually touches the card) and a pre-computed "
+                          "`agent_activity` signal absorbing the Manager's own two-call "
+                          "`list_runs` run-check verbatim (`state: \"live\"|\"recent\"|"
+                          "\"stale\"|\"none\"|\"unknown\"`, qa-* dispatches excluded from the "
+                          "pinned lookup) — so the Manager no longer re-derives it. "
+                          "`qualifies_for_dispatch` is true only when `backoff==\"eligible\"` "
+                          "AND `agent_activity.state` is `\"stale\"` or `\"none\"`; every "
+                          "qualifying candidate becomes one `work_orders` entry. `reping` "
+                          "(default true here — this IS the keep-things-in-motion entry "
+                          "point) passes through to the Need-Human re-ping branch.\n"
+                          "- `ready`/`prs`/`plans`: `ready` thinly wraps the existing "
+                          "`run_ready_cards` sweep; `prs`/`plans` are reserved enum values not "
+                          "implemented yet — requesting either comes back in `loops_skipped` "
+                          "as `\"<name>: not implemented\"`, never an error, so a caller can "
+                          "opt in early.\n\n"
+                          "`page_id` restricts every requested loop to that one card. "
+                          "`dry_run` is TOTAL across every loop — no moves, comments, stamps, "
+                          "reping writes, QA dispatches, or Manager dispatch; report only. "
+                          "`dispatch_manager` (default false): when true and `work_orders` is "
+                          "non-empty (and not a dry run), fires `manager` directly with the "
+                          "work-order list as input — after a best-effort dedup probe for an "
+                          "already in-flight manager run — so a cron/Plan can call this with "
+                          "no workflow glue; leave it false to consume `work_orders` yourself "
+                          "(e.g. from a workflow node) instead.\n\n"
+                          "Response: `{ok, dry_run, boards, deploy?, attention?, ready?, "
+                          "work_orders, actions_taken, loops_skipped, manager_dispatch, "
+                          "errors}` — `actions_taken` is everything this call already DID "
+                          "(moves, re-pings, QA dispatches), `work_orders` is everything it "
+                          "found but did NOT decide on its own."),
+             inputSchema={"type": "object",
+                          "properties": {
+                              "loops": {"type": "array", "items": {"type": "string"},
+                                       "description": "Which sections to run: deploy, attention, ready, prs, plans. Default [\"deploy\",\"attention\"]. prs/plans are reserved — not yet implemented."},
+                              "page_id": {"type": "string",
+                                         "description": "Restrict every requested loop to this one card instead of scanning."},
+                              "limit": {"type": "integer", "default": 10,
+                                       "description": "Attention-loop candidate cap (clamped 1-25) and ready-loop sweep limit."},
+                              "max_cards": {"type": "integer", "default": 25,
+                                           "description": "Deploy-loop max cards per status when scanning the lane."},
+                              "reping": {"type": "boolean", "default": True,
+                                        "description": "Re-ping a Need Human card whose last human ping is >=12h old. Defaults true here (unlike the old list_kanban_cards_need_attention, which defaults false) — work_loop IS the keep-things-in-motion entry point."},
+                              "dry_run": {"type": "boolean", "default": False,
+                                         "description": "Report only — no moves, comments, stamps, reping writes, QA dispatch, or Manager dispatch, across every loop."},
+                              "dispatch_manager": {"type": "boolean", "default": False,
+                                                   "description": "If true and work_orders is non-empty (and not dry_run), fire the manager agent directly with the work-order list, after a dedup probe for an already in-flight manager run."},
                           },
                           "required": []}),
         Tool(name="invoke_kanban_agent",
@@ -2730,6 +2805,123 @@ def _deploy_qa_input(row: dict) -> str:
             "the card.")
 
 
+async def _deploy_followups(c: httpx.AsyncClient, board: "kanban_dispatch.BoardClient",
+                            result: dict) -> None:
+    """QA dispatch + batched reminder glue for a ``check_deployed()`` result
+    — a platform concern (QA dispatch is an agents-platform run, the
+    reminder relay is AP-MT's own ``/api/telegram/report``), so it stays
+    here rather than in ``deploy_reconcile.py``/``work_loop.py``, the same
+    way ``sweep_ready`` leaves platform dispatch to its caller's
+    ``PlatformClient``. Mutates ``result`` in place — exactly what the
+    ``kanban_check_deployed`` handler always did inline; factored out here
+    so the new ``work_loop`` tool's ``deploy`` section gets the identical
+    treatment instead of a second, drifting copy (card instructions item
+    #4 — the old tool becomes a thin alias over these shared internals)."""
+    if result.get("dry_run"):
+        return
+    candidates = result.get("moved", []) + result.get("still_waiting", [])
+    for row in candidates:
+        if not row.get("qa_dispatch_needed"):
+            continue
+        body = {"input": {"input": _deploy_qa_input(row)},
+                "target_slug": row.get("target_slug") or kanban_dispatch.DEFAULT_TARGET_SLUG,
+                "notion_task_id": row["page_id"], "qa_rerun": True,
+                "workspace": _own_workspace()}
+        try:
+            qr = await c.post(f"{BASE}/api/agents/qa-sonnet/run", json=body)
+            if qr.status_code == 200:
+                row["qa_dispatch"] = {"run_id": qr.json().get("run_id")}
+                await asyncio.to_thread(deploy_reconcile.mark_qa_dispatched, board, row["page_id"])
+            else:
+                row["qa_dispatch"] = {"error": f"{qr.status_code} {qr.text[:200]}"}
+        except Exception as exc:
+            row["qa_dispatch"] = {"error": str(exc)}
+
+    reminder_rows = [row for row in candidates if row.get("reminder_due")]
+    if reminder_rows:
+        def _send_reminder(title: str, text: str) -> dict:
+            return telegram_report_mod.send_with_credentials(BASE, _TOKEN, title, text)
+        result["reminder"] = await asyncio.to_thread(
+            deploy_reconcile.send_batched_reminders, board, reminder_rows, _send_reminder)
+
+
+async def _work_loop_list_runs(c: httpx.AsyncClient, *, notion_task_id: str | None = None,
+                               category: str | None = None,
+                               limit: int = 20) -> "tuple[list[dict] | None, str | None]":
+    """The ``ListRunsFn`` work_loop's attention loop calls for its run-check
+    — same ``GET /api/runs`` this app's own ``list_runs`` tool already
+    fronts (handler below), reused rather than re-derived (card instructions
+    item #5). Never raises: a transport/HTTP failure comes back as
+    ``(None, "...")`` so one candidate's run-check fails CLOSED
+    (``agent_activity: unknown``) instead of taking down the whole pass."""
+    params: dict[str, str] = {"limit": str(limit), "summary": "true"}
+    if notion_task_id:
+        params["notion_task_id"] = notion_task_id
+    if category:
+        params["category"] = category
+    try:
+        r = await c.get(f"{BASE}/api/runs", params=params)
+    except Exception as exc:
+        return None, str(exc)
+    if r.status_code != 200:
+        return None, f"{r.status_code} {r.text[:200]}"
+    try:
+        return r.json() or [], None
+    except Exception as exc:
+        # A 200 with a malformed/empty body (code-review finding, PR #36) —
+        # without this, r.json() raising escaped this function despite the
+        # docstring's "never raises", and was caught by run_work_loop's
+        # per-LOOP guard instead of failing just the one candidate.
+        return None, f"malformed /api/runs response: {exc}"
+
+
+async def _dispatch_manager_once(c: httpx.AsyncClient, work_orders: list[dict]) -> dict:
+    """The optional ``dispatch_manager=true`` hook (design §2) — fires the
+    Manager with ``work_orders`` as a Mode B payload. AP-MT has no
+    server-side dedup for a card-less ``manager`` dispatch (only ``qa-*``
+    gets the 409 guard, design §9 "Manager-dispatch dedup") — this client-
+    side probe for an already pending/running manager run on the same
+    target is what stops a 6h-cadence overlap from double-dispatching while
+    a slow prior run is still going. Not airtight (a manager run started
+    the instant after this probe still races it) — the same class of gap
+    ``check_deployed``'s own per-pass concurrency note already accepts as
+    operational, not closed here."""
+    try:
+        probe = await c.get(f"{BASE}/api/runs",
+                            params={"limit": "20", "summary": "true",
+                                    "target_slug": kanban_dispatch.DEFAULT_TARGET_SLUG})
+    except Exception as exc:
+        return {"error": f"dedup probe failed: {exc}"}
+    if probe.status_code == 200:
+        try:
+            probe_rows = probe.json() or []
+        except Exception as exc:
+            # Same guard as _work_loop_list_runs (code-review finding, PR
+            # #36) — a malformed 200 body here must not escape this
+            # function and take the whole work_loop call's already-
+            # computed work_orders/actions_taken/sections down with it.
+            return {"error": f"malformed dedup-probe response: {exc}"}
+        for row in probe_rows:
+            if (row.get("source_slug") == "manager"
+                    and (row.get("status") or "").lower() in ("pending", "running")):
+                return {"skipped": "manager run already in flight", "run_id": row.get("id")}
+    lines = [f"page_id: {o['page_id']}\nreason: {o.get('reason', '')}\n"
+            f"evidence: {o.get('evidence', '')}\nsuggested_action: {o.get('suggested_action', '')}"
+            for o in work_orders]
+    body = {"input": {"input": "work_loop work orders:\n\n" + "\n\n".join(lines)},
+            "target_slug": kanban_dispatch.DEFAULT_TARGET_SLUG, "workspace": _own_workspace()}
+    try:
+        resp = await c.post(f"{BASE}/api/agents/manager/run", json=body)
+    except Exception as exc:
+        return {"error": f"dispatch failed: {exc}"}
+    if resp.status_code != 200:
+        return {"error": f"{resp.status_code} {resp.text[:200]}"}
+    try:
+        return {"run_id": (resp.json() or {}).get("run_id")}
+    except Exception as exc:
+        return {"error": f"malformed dispatch response: {exc}"}
+
+
 async def _poll_run(c: httpx.AsyncClient, run_id: str, *, timeout_s: int = 900) -> dict:
     for _ in range(timeout_s):
         await asyncio.sleep(1.0)
@@ -3042,6 +3234,11 @@ async def _dispatch_tool(name: str, arguments: dict[str, Any] | None) -> list[Te
             return _ok(result)
 
         if name == "kanban_check_deployed":
+            # Thin alias (card instructions item #4) — the exact same
+            # check_deployed() call plus the exact same QA-dispatch/reminder
+            # follow-ups as before, just factored into `_deploy_followups`
+            # so `work_loop`'s `deploy` section gets identical treatment
+            # instead of a second, drifting copy. External shape unchanged.
             try:
                 result = await asyncio.to_thread(
                     deploy_reconcile.check_deployed, _board_client(),
@@ -3050,56 +3247,49 @@ async def _dispatch_tool(name: str, arguments: dict[str, Any] | None) -> list[Te
                     max_cards=int(args.get("max_cards") or deploy_reconcile.DEFAULT_MAX_CARDS))
             except kanban_dispatch.BoardUnavailable as exc:
                 return _err(503, f"could not read the Kanban board — {exc}")
-            # QA dispatch is a platform call, not a board one — kept out of
-            # deploy_reconcile.py the same way kanban_dispatch.sweep_ready
-            # leaves platform dispatch to its caller's PlatformClient.
-            #
-            # Scan BOTH moved and still_waiting, not just this pass's
-            # moved_testing rows: `qa_dispatch_needed` is independent of the
-            # move-on-transition guard specifically so a card already
-            # sitting in Testing from a PRIOR pass whose dispatch failed
-            # gets retried here too (code-review finding on PR #23 — the
-            # original version only tried once, on the move itself, and a
-            # failed POST stranded the card in Testing forever).
-            if not result.get("dry_run"):
-                candidates = result.get("moved", []) + result.get("still_waiting", [])
-                for row in candidates:
-                    if not row.get("qa_dispatch_needed"):
-                        continue
-                    body = {"input": {"input": _deploy_qa_input(row)},
-                            "target_slug": row.get("target_slug") or kanban_dispatch.DEFAULT_TARGET_SLUG,
-                            "notion_task_id": row["page_id"], "qa_rerun": True,
-                            "workspace": _own_workspace()}
-                    try:
-                        qr = await c.post(f"{BASE}/api/agents/qa-sonnet/run", json=body)
-                        if qr.status_code == 200:
-                            row["qa_dispatch"] = {"run_id": qr.json().get("run_id")}
-                            await asyncio.to_thread(deploy_reconcile.mark_qa_dispatched,
-                                                    _board_client(), row["page_id"])
-                        else:
-                            row["qa_dispatch"] = {"error": f"{qr.status_code} {qr.text[:200]}"}
-                    except Exception as exc:
-                        row["qa_dispatch"] = {"error": str(exc)}
+            await _deploy_followups(c, _board_client(), result)
+            return _ok(result)
 
-                # C4: one batched Telegram reminder per pass for every
-                # pending/partial card whose LastDeployReminderAt is
-                # absent or >12h old (deploy_reconcile._evaluate_card sets
-                # reminder_due/reminder_action). Reuses the existing
-                # Need-Human relay — AP-MT's own `/api/telegram/report` —
-                # directly, over the same authenticated BASE/_TOKEN every
-                # other platform call in this handler already uses; no
-                # loopback through this app's own `/telegram-report` route
-                # (that exists for a caller with no agents-platform
-                # credential of its own, which this process is not) and no
-                # comment-only stopgap needed.
-                reminder_rows = [row for row in candidates if row.get("reminder_due")]
-                if reminder_rows:
-                    def _send_reminder(title: str, text: str) -> dict:
-                        return telegram_report_mod.send_with_credentials(
-                            BASE, _TOKEN, title, text)
-                    result["reminder"] = await asyncio.to_thread(
-                        deploy_reconcile.send_batched_reminders, _board_client(),
-                        reminder_rows, _send_reminder)
+        if name == "work_loop":
+            loops = args.get("loops") or list(work_loop_mod.DEFAULT_LOOPS)
+            loops = [str(loop).strip() for loop in loops if str(loop).strip()]
+            page_id = (args.get("page_id") or "").strip() or None
+            dry_run = bool(args.get("dry_run"))
+            reping = bool(args.get("reping", True))
+            limit = max(work_loop_mod.MIN_ATTENTION_LIMIT,
+                       min(int(args.get("limit") or work_loop_mod.DEFAULT_ATTENTION_LIMIT),
+                           work_loop_mod.MAX_ATTENTION_LIMIT))
+            max_cards = int(args.get("max_cards") or deploy_reconcile.DEFAULT_MAX_CARDS)
+
+            async def _list_runs(**kw):
+                return await _work_loop_list_runs(c, **kw)
+
+            ctx = work_loop_mod.WorkLoopContext(
+                board=_board_client(), list_runs=_list_runs, now=time.time(),
+                dry_run=dry_run, page_id=page_id, limit=limit, max_cards=max_cards,
+                reping=reping, platform=kanban_dispatch.PlatformClient(c, BASE))
+            # run_work_loop never raises BoardUnavailable itself — every loop
+            # catches it internally and reports it in `errors` (code-review
+            # finding, PR #36: a try/except here around this call was dead
+            # code for exactly that reason). `ok` is what actually tells a
+            # total-outage pass (every requested loop failed) from a partial
+            # one — act on THAT instead.
+            result = await work_loop_mod.run_work_loop(ctx, loops)
+            if not result.get("ok"):
+                return _err(503, "work_loop: every requested loop failed — "
+                                 + "; ".join(e.get("error", "") for e in result.get("errors", [])))
+
+            if "deploy" in result:
+                await _deploy_followups(c, _board_client(), result["deploy"])
+
+            # Multi-board is explicitly out of scope (design §6) — today
+            # always the single configured board, shape-compatible with a
+            # future named-board registry.
+            result["boards"] = [{"key": None, "db_id": None, "name": "default", "default": True}]
+            result["manager_dispatch"] = None
+            if args.get("dispatch_manager") and result.get("work_orders") and not dry_run:
+                result["manager_dispatch"] = await _dispatch_manager_once(c, result["work_orders"])
+
             return _ok(result)
 
         if name == "invoke_kanban_agent":

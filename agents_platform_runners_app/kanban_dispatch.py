@@ -219,6 +219,24 @@ class BoardClient:
             raise BoardUnavailable(result.get("error") or "board refused the property write")
         return result
 
+    def need_attention(self, *, limit: int = 10, reping: bool = True) -> dict:
+        """``GET /kanban/cards-need-attention`` — the live F′ REST route
+        (sync headless wrapper over aw-app-notion's own
+        ``list_cards_need_attention``, Kanban feature:kanban-sweep-workflow-
+        f-rest-route). Already accepts ``reping`` as a query param, so no
+        aw-app-notion change was needed for this (card instructions item
+        #3's conditional "if the REST route doesn't already accept a reping
+        param" did not fire — verified against ``notion_app/routes.py``
+        before writing this method).
+
+        Response shape: ``{has_work, cards, counts: {count, scanned,
+        truncated}}``, plus ``re_pinged``/``reping`` when ``reping=True``.
+        No ``ok``-check here, same as ``card()`` above — the route itself
+        turns a board-level failure into a real non-2xx, which ``_request``
+        already raises as ``BoardUnavailable``."""
+        query = urllib.parse.urlencode({"limit": limit, "reping": str(bool(reping)).lower()})
+        return self._request("GET", f"{NOTION_PREFIX}/kanban/cards-need-attention?{query}")
+
     def properties(self, page_id: str, names: list[str] | None = None) -> dict:
         """``{property_name: value}`` — the read half of ``set_property``.
 
