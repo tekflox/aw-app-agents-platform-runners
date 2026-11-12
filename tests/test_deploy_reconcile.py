@@ -427,3 +427,277 @@ def test_dry_run_writes_nothing(monkeypatch):
     assert not board.moves
     assert not board.writes
     assert not board.comments
+
+
+# ── C3: inventory precedence (live > fresh inventory > agent evidence) ────
+
+def _patch_inventory(monkeypatch, rows: dict[str, dict], error: str | None = None):
+    monkeypatch.setattr(dr, "_inventory_fetch", lambda ws: (dict(rows), error))
+
+
+def test_inventory_fetch_without_backend_url_is_a_clean_miss(monkeypatch):
+    monkeypatch.delenv(dr._BACKEND_URL_VAR, raising=False)
+    rows, error = dr._inventory_fetch("aw")
+    assert rows == {}
+    assert dr._BACKEND_URL_VAR in error
+
+
+class _FakeHTTPResponse:
+    """Minimal stand-in for ``http.client.HTTPResponse`` as a context
+    manager — just enough for ``_http_get_json``'s ``with urlopen(...)``."""
+    def __init__(self, status: int, text: str):
+        self.status = status
+        self._text = text
+
+    def read(self):
+        return self._text.encode()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
+def test_inventory_fetch_handles_a_malformed_200_body_without_crashing(monkeypatch):
+    """Code-review finding on PR #33 (reported twice): a 200 response with a
+    non-JSON body raised json.JSONDecodeError uncaught, which — since
+    _inventory_fetch is called unguarded at the top of check_deployed(),
+    ahead of every per-card try/except — crashed the ENTIRE pass."""
+    monkeypatch.setenv(dr._BACKEND_URL_VAR, "http://backend.example")
+    monkeypatch.setattr(dr.urllib.request, "urlopen",
+                        lambda req, timeout=20.0: _FakeHTTPResponse(200, "not json"))
+    rows, error = dr._inventory_fetch("aw")
+    assert rows == {}
+    assert "malformed" in error
+
+
+def test_inventory_fetch_handles_a_wrongly_shaped_200_body_without_crashing(monkeypatch):
+    """Same failure class, one layer deeper: valid JSON that isn't the
+    expected {"components": [...]} shape (e.g. a bare JSON array) must not
+    crash on the .get("components") call either."""
+    monkeypatch.setenv(dr._BACKEND_URL_VAR, "http://backend.example")
+    monkeypatch.setattr(dr.urllib.request, "urlopen",
+                        lambda req, timeout=20.0: _FakeHTTPResponse(200, "[1, 2, 3]"))
+    rows, error = dr._inventory_fetch("aw")
+    assert rows == {}
+    assert "malformed" in error
+
+
+def test_check_deployed_survives_a_malformed_inventory_body_end_to_end(monkeypatch):
+    """The actual reported bug, reproduced through the real entry point:
+    before the fix this raised out of check_deployed() itself and failed
+    the whole kanban_check_deployed tool call for every card in the lane."""
+    monkeypatch.setenv(dr._BACKEND_URL_VAR, "http://backend.example")
+    monkeypatch.setattr(dr.urllib.request, "urlopen",
+                        lambda req, timeout=20.0: _FakeHTTPResponse(200, "not json"))
+    _patch_observe(monkeypatch, "app", {"workspace": "aw", "observed": "v0.35.1", "error": None})
+    board = FakeBoard({"p1": _card(QAStatus="done")})
+    result = dr.check_deployed(board, max_cards=10)
+    assert result["ok"] is True
+    assert "malformed" in result["inventory_error"]
+    assert result["moved"][0]["action"] == "moved_done"  # falls through to the live tier fine
+
+
+def test_live_adapter_wins_even_over_a_fresh_inventory_row(monkeypatch):
+    """'stale falls back to live' in spirit, but the stronger live-always-
+    wins case: the live adapter is tried FIRST regardless of whether the
+    inventory also has a (fresh) row — live asks the running thing right
+    now, the inventory is a cache."""
+    _patch_observe(monkeypatch, "app", {"workspace": "aw", "observed": "v0.35.1", "error": None})
+    _patch_inventory(monkeypatch, {"app:notion": {"version": "v0.1.0", "stale": False,
+                                                  "age_s": 5}})
+    board = FakeBoard({"p1": _card(QAStatus="done")})
+    result = dr.check_deployed(board, max_cards=10)
+    row = result["moved"][0]
+    assert row["observations"][0]["source"] == "live"
+    assert row["observations"][0]["observed"] == "v0.35.1"
+    assert row["action"] == "moved_done"  # v0.35.1 >= v0.35.1 target
+
+
+def test_fresh_inventory_row_wins_when_live_adapter_fails(monkeypatch):
+    _patch_observe(monkeypatch, "app", {"workspace": "aw", "observed": None,
+                                        "error": "unreachable"})
+    _patch_inventory(monkeypatch, {"app:notion": {"version": "v0.35.1", "stale": False,
+                                                  "age_s": 12.0}})
+    board = FakeBoard({"p1": _card(QAStatus="done")})
+    result = dr.check_deployed(board, max_cards=10)
+    row = result["moved"][0]
+    obs = row["observations"][0]
+    assert obs["source"] == "inventory"
+    assert obs["observed"] == "v0.35.1"
+    assert obs["age_s"] == 12.0
+    assert row["action"] == "moved_done"
+
+
+def test_stale_inventory_row_is_skipped_falls_through(monkeypatch):
+    _patch_observe(monkeypatch, "app", {"workspace": "aw", "observed": None,
+                                        "error": "unreachable"})
+    _patch_inventory(monkeypatch, {"app:notion": {"version": "v0.35.1", "stale": True,
+                                                  "age_s": 999999}})
+    board = FakeBoard({"p1": _card()})
+    result = dr.check_deployed(board, max_cards=10)
+    row = result["still_waiting"][0]
+    assert row["verdict"] == "unknown"
+    assert row["observations"][0]["source"] is None
+    assert "stale" in row["observations"][0]["reason"]
+
+
+def test_both_live_and_inventory_failing_is_unknown(monkeypatch):
+    _patch_observe(monkeypatch, "app", {"workspace": "aw", "observed": None, "error": "down"})
+    _patch_inventory(monkeypatch, {}, error="backend unreachable")
+    board = FakeBoard({"p1": _card()})
+    result = dr.check_deployed(board, max_cards=10)
+    row = result["still_waiting"][0]
+    assert row["verdict"] == "unknown"
+    assert row["observations"][0]["source"] is None
+
+
+def test_fresh_agent_evidence_is_used_as_last_resort(monkeypatch):
+    _patch_observe(monkeypatch, "app", {"workspace": "aw", "observed": None, "error": "down"})
+    _patch_inventory(monkeypatch, {})
+    now = dr.time.time()
+    recent = dr.dt.datetime.fromtimestamp(now - 60, tz=dr.dt.timezone.utc).isoformat()
+    prior = json.dumps({"agent_observation": {"observed": "v0.35.1", "source": "docker inspect",
+                                              "at": recent, "run_id": "r1"}})
+    board = FakeBoard({"p1": _card(QAStatus="done", DeployCheckResult=prior)})
+    result = dr.check_deployed(board, max_cards=10)
+    row = result["moved"][0]
+    obs = row["observations"][0]
+    assert obs["source"] == "agent"
+    assert obs["observed"] == "v0.35.1"
+    assert row["action"] == "moved_done"
+
+
+def test_agent_evidence_older_than_12h_is_ignored(monkeypatch):
+    _patch_observe(monkeypatch, "app", {"workspace": "aw", "observed": None, "error": "down"})
+    _patch_inventory(monkeypatch, {})
+    now = dr.time.time()
+    old = dr.dt.datetime.fromtimestamp(now - 13 * 3600, tz=dr.dt.timezone.utc).isoformat()
+    prior = json.dumps({"agent_observation": {"observed": "v0.35.1", "at": old}})
+    board = FakeBoard({"p1": _card(DeployCheckResult=prior)})
+    result = dr.check_deployed(board, max_cards=10)
+    row = result["still_waiting"][0]
+    assert row["verdict"] == "unknown"
+    assert row["observations"][0]["source"] is None
+
+
+def test_agent_evidence_is_scoped_to_the_workspace_it_was_recorded_for(monkeypatch):
+    """Code-review finding on PR #33: a card's agent_observation is a single
+    blob, not one per DeployWorkspaces entry — it must never be applied to
+    a workspace other than the one it actually names."""
+    def fake_app(name, ws):
+        return {"workspace": ws, "observed": None, "error": "down"}
+    monkeypatch.setitem(dr.ADAPTERS, "app", fake_app)
+    _patch_inventory(monkeypatch, {})
+    now = dr.time.time()
+    recent = dr.dt.datetime.fromtimestamp(now - 60, tz=dr.dt.timezone.utc).isoformat()
+    prior = json.dumps({"agent_observation": {"observed": "v0.35.1", "workspace": "a",
+                                              "at": recent}})
+    board = FakeBoard({"p1": _card(DeployWorkspaces=["b"], DeployCheckResult=prior)})
+    result = dr.check_deployed(board, max_cards=10)
+    row = result["still_waiting"][0]
+    obs = row["observations"][0]
+    assert obs["workspace"] == "b"
+    assert obs["source"] is None  # the 'a'-scoped evidence must not decide 'b'
+    assert row["verdict"] == "unknown"
+
+
+def test_agent_evidence_applies_only_to_its_matching_workspace_on_a_multi_ws_card(monkeypatch):
+    def fake_app(name, ws):
+        return {"workspace": ws, "observed": None, "error": "down"}
+    monkeypatch.setitem(dr.ADAPTERS, "app", fake_app)
+    _patch_inventory(monkeypatch, {})
+    now = dr.time.time()
+    recent = dr.dt.datetime.fromtimestamp(now - 60, tz=dr.dt.timezone.utc).isoformat()
+    prior = json.dumps({"agent_observation": {"observed": "v0.35.1", "workspace": "b",
+                                              "at": recent}})
+    board = FakeBoard({"p1": _card(DeployWorkspaces=["a", "b"], DeployCheckResult=prior)})
+    result = dr.check_deployed(board, max_cards=10)
+    row = result["still_waiting"][0]
+    obs_by_ws = {o["workspace"]: o for o in row["observations"]}
+    assert obs_by_ws["b"]["source"] == "agent"
+    assert obs_by_ws["a"]["source"] is None
+
+
+def test_agent_evidence_without_a_workspace_field_only_applies_to_this_workspace(monkeypatch):
+    """A workspace-less agent_observation (the shape a single-workspace card
+    naturally produces) is treated as being about this app's own workspace
+    — the only one such a card ever resolves — never about another one."""
+    def fake_app(name, ws):
+        return {"workspace": ws, "observed": None, "error": "down"}
+    monkeypatch.setitem(dr.ADAPTERS, "app", fake_app)
+    _patch_inventory(monkeypatch, {})
+    now = dr.time.time()
+    recent = dr.dt.datetime.fromtimestamp(now - 60, tz=dr.dt.timezone.utc).isoformat()
+    prior = json.dumps({"agent_observation": {"observed": "v0.35.1", "at": recent}})
+    board = FakeBoard({"p1": _card(DeployWorkspaces=["other-ws"], DeployCheckResult=prior)})
+    result = dr.check_deployed(board, max_cards=10)
+    row = result["still_waiting"][0]
+    assert row["observations"][0]["source"] is None
+
+
+def test_parse_iso_datetime_rejects_date_only_and_garbage():
+    """Architect risk #2: a date-only value must not be mistaken for fresh."""
+    assert dr._parse_iso_datetime(None) is None
+    assert dr._parse_iso_datetime("") is None
+    assert dr._parse_iso_datetime("2026-11-12") is None
+    assert dr._parse_iso_datetime("not-a-date") is None
+    assert dr._parse_iso_datetime("2026-11-12T18:51:00Z") is not None
+    assert dr._parse_iso_datetime("2026-11-12T18:51:00+00:00") is not None
+
+
+def test_evidence_names_the_source_used(monkeypatch):
+    _patch_observe(monkeypatch, "app", {"workspace": "aw", "observed": None,
+                                        "error": "unreachable"})
+    _patch_inventory(monkeypatch, {"app:notion": {"version": "v0.1.0", "stale": False,
+                                                  "age_s": 30}})
+    board = FakeBoard({"p1": _card()})  # pending: v0.1.0 < v0.35.1 target
+    result = dr.check_deployed(board, max_cards=10)
+    row = result["still_waiting"][0]
+    assert row["verdict"] == "pending"
+    assert "source=inventory" in dr._evidence(row)
+    assert "age=30s" in dr._evidence(row)
+
+
+# ── C3: DeployComponent='none' sentinel ────────────────────────────────────
+
+def test_none_sentinel_with_qa_done_moves_straight_to_done(monkeypatch):
+    board = FakeBoard({"p1": _card(DeployComponent="none", DeployToVersion="", QAStatus="done")})
+    result = dr.check_deployed(board, max_cards=10)
+    assert result["moved"][0]["verdict"] == "no_deploy_needed"
+    assert result["moved"][0]["action"] == "moved_done"
+    assert board.moves == [("p1", "done")]
+
+
+def test_none_sentinel_without_qa_done_moves_to_testing_and_needs_qa(monkeypatch):
+    board = FakeBoard({"p1": _card(DeployComponent="none", DeployToVersion="", QAStatus="")})
+    result = dr.check_deployed(board, max_cards=10)
+    row = result["moved"][0]
+    assert row["verdict"] == "no_deploy_needed"
+    assert row["action"] == "moved_testing"
+    assert row["qa_dispatch_needed"] is True
+    assert board.moves == [("p1", "Testing")]
+
+
+def test_none_sentinel_never_requires_a_deploy_to_version(monkeypatch):
+    """An empty DeployToVersion would normally be flagged 'invalid' —
+    the sentinel is the one case that's eligible without one."""
+    board = FakeBoard({"p1": _card(DeployComponent="none", DeployToVersion="")})
+    result = dr.check_deployed(board, max_cards=10)
+    assert result["moved"][0]["verdict"] == "no_deploy_needed"
+    assert "reasons" not in result["moved"][0]
+
+
+def test_none_sentinel_is_case_insensitive(monkeypatch):
+    board = FakeBoard({"p1": _card(DeployComponent="None", DeployToVersion="", QAStatus="done")})
+    result = dr.check_deployed(board, max_cards=10)
+    assert result["moved"][0]["verdict"] == "no_deploy_needed"
+
+
+def test_none_sentinel_qa_dispatch_flag_survives_until_marked(monkeypatch):
+    board = FakeBoard({"p1": _card(DeployComponent="none", DeployToVersion="", QAStatus="")})
+    dr.check_deployed(board, max_cards=10)  # moves to Testing
+    dr.mark_qa_dispatched(board, "p1")
+    result = dr.check_deployed(board, max_cards=10)
+    assert result["still_waiting"][0]["qa_dispatch_needed"] is False

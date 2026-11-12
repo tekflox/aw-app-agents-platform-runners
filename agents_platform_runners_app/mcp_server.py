@@ -814,31 +814,42 @@ async def _list_tools() -> list[Tool]:
                           "required": []}),
         Tool(name="kanban_check_deployed",
              description=("Deterministic Ready-to-Deploy/Testing reconciliation (architect "
-                          "decision, Kanban 4165bf3b-9510-8162-89d0-dca46ba66481). Reads each "
-                          "card's DeployComponent/DeployWorkspaces/DeployToVersion/DeployEnv, "
-                          "asks the LIVE component what version it's actually running "
-                          "(never CI green, never the marketplace catalog, never a git tag), "
-                          "and moves the card ONLY on a verdict transition — re-running this "
-                          "N times is N-1 no-ops.\n\n"
+                          "decision, Kanban 4165bf3b-9510-8162-89d0-dca46ba66481, extended by "
+                          "the v2 inventory design on 4165bf3b-9510-812c). Reads each card's "
+                          "DeployComponent/DeployWorkspaces/DeployToVersion/DeployEnv and "
+                          "resolves each component's actual version via three tiers, in "
+                          "order, with the evidence always naming which one was used: a LIVE "
+                          "adapter asking the running thing right now (never CI green, never "
+                          "the marketplace catalog, never a git tag) > a fresh row from "
+                          "aw-backend's push-fed component inventory (one GET per pass, not "
+                          "per card) > a fresh (<12h) agent observation left by a prior pass. "
+                          "Moves the card ONLY on a verdict transition — re-running this N "
+                          "times is N-1 no-ops.\n\n"
                           "Verdict per card: deployed (all named workspaces >= target) -> "
                           "Done if QAStatus=='done', else Testing + a qa-sonnet dispatch with "
-                          "qa_rerun=true; pending/partial -> stays put; unknown (can't "
-                          "observe, e.g. unreachable or non-semver) -> NEVER moves the card, "
-                          "3 consecutive unknowns escalate to Need Human; rolled_back "
-                          "(observed version dropped below a previously-deployed target) -> "
-                          "Need Human; invalid (empty/malformed DeployComponent or "
-                          "DeployToVersion) -> skipped, commented once.\n\n"
+                          "qa_rerun=true; DeployComponent='none' (explicit no-deployment-"
+                          "needed sentinel, DeployToVersion not required) -> no_deploy_needed, "
+                          "routed by QAStatus exactly like 'deployed'; pending/partial -> "
+                          "stays put; unknown (can't observe via any of the three tiers, e.g. "
+                          "unreachable or non-semver) -> NEVER moves the card, 3 consecutive "
+                          "unknowns escalate to Need Human; rolled_back (observed version "
+                          "dropped below a previously-deployed target) -> Need Human; invalid "
+                          "(empty/malformed DeployComponent, or empty DeployToVersion outside "
+                          "the 'none' sentinel) -> skipped, commented once.\n\n"
                           "Returns the COMPLETE lane picture every call, not just actions "
                           "taken this pass: every card moved (previous/new status + "
-                          "evidence), every card still waiting (verdict/reason + live "
-                          "observations), summary counts, explicit errors, and — if the "
+                          "evidence), every card still waiting (verdict/reason + source-"
+                          "labelled observations), summary counts, explicit errors, an "
+                          "inventory_error if the one-per-pass inventory GET failed (every "
+                          "card still falls through to the live/agent tiers), and — if the "
                           "lane has more cards than max_cards — an explicit truncated flag "
                           "plus a continuation hint (re-invoke with a higher max_cards).\n\n"
                           "Known gaps: service:<name> components have no live observation "
-                          "adapter in this runtime yet (always 'unknown'); a DeployWorkspaces "
-                          "entry naming a workspace other than this app's own is also always "
-                          "'unknown' — every credential this app holds is scoped to one "
-                          "workspace. Both fail closed (never move a card), not guessed."),
+                          "adapter in this runtime yet, falling through to the inventory/agent "
+                          "tiers; a DeployWorkspaces entry naming a workspace other than this "
+                          "app's own skips both the live adapter and the inventory (scoped to "
+                          "this workspace only) and goes straight to agent evidence. All "
+                          "fail closed to 'unknown' (never move a card), not guessed."),
              inputSchema={"type": "object",
                           "properties": {
                               "page_id": {"type": "string",
@@ -2696,6 +2707,22 @@ def _own_workspace() -> str:
     return platform_base.workspace_env("AW_WORKSPACE") or "aw"
 
 
+def _deploy_qa_input(row: dict) -> str:
+    """The QA dispatch message for one ``kanban_check_deployed`` row.
+    ``no_deploy_needed`` (DeployComponent='none', C3) has no shipped version
+    to point QA at, so it gets its own text rather than the generic
+    'verified <component> reached <to_version> live' message reading as
+    nonsense with an empty component/version."""
+    if row.get("verdict") == "no_deploy_needed":
+        return ("kanban_check_deployed: this card is marked DeployComponent='none' — no "
+                "deployment is needed. Verify the card's actual deliverable (e.g. a data "
+                "migration, a doc change) against its scope; there is no shipped version "
+                "to check.")
+    return (f"Post-deployment QA — kanban_check_deployed verified {row.get('component')} "
+            f"reached {row.get('to_version')} live. Verify the shipped change against "
+            "the card.")
+
+
 async def _poll_run(c: httpx.AsyncClient, run_id: str, *, timeout_s: int = 900) -> dict:
     for _ in range(timeout_s):
         await asyncio.sleep(1.0)
@@ -3032,10 +3059,7 @@ async def _dispatch_tool(name: str, arguments: dict[str, Any] | None) -> list[Te
                 for row in candidates:
                     if not row.get("qa_dispatch_needed"):
                         continue
-                    body = {"input": {"input": (
-                                "Post-deployment QA — kanban_check_deployed verified "
-                                f"{row.get('component')} reached {row.get('to_version')} "
-                                "live. Verify the shipped change against the card.")},
+                    body = {"input": {"input": _deploy_qa_input(row)},
                             "target_slug": row.get("target_slug") or kanban_dispatch.DEFAULT_TARGET_SLUG,
                             "notion_task_id": row["page_id"], "qa_rerun": True,
                             "workspace": _own_workspace()}
