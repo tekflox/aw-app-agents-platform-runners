@@ -49,6 +49,7 @@ flow `graph.nodes`/`graph.edges`, group `slug`/`name`/`description` — is
 only reachable here:
 
 ```bash
+mkdir -p .tmp/ap-rest          # curl -o fails on a missing parent, and -s hides it
 for p in agents agent-groups agent-flows; do
   curl -s -m 20 -H "Authorization: Bearer $T" "$B/api/$p" -o ".tmp/ap-rest/$p.json"
 done

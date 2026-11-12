@@ -153,16 +153,35 @@ the same green checkmark as a real one.
 To verify a regression test actually exercises the fix:
 
 1. **Temporarily un-apply the fix** in the file(s) it touches.
-   - Single dirty file, fix is its only local change:
-     `git stash push -- <file>`, rerun the new test(s), then restore.
-     **Never a bare `git stash` or a bare `git stash pop`** — a shared
-     checkout has one global stash stack per repo, and a concurrent
-     session's own stash landing between your push and pop ends up on top.
-     Capture the exact ref immediately after pushing (`git stash list -1`
-     → e.g. `stash@{0}`) and restore with `git stash pop stash@{0}`, even
-     with the scoped `push -- <file>` form. A bare pop once grabbed an
+   - Single dirty file, fix is its only local change — on a shared
+     checkout the **patch-file form is the safe default**, because it
+     touches no shared state at all:
+
+     ```bash
+     git diff -- <file> > /tmp/fix.patch   # save the fix
+     git apply -R /tmp/fix.patch           # un-apply it
+     # ... rerun the test(s): they must now FAIL ...
+     git apply /tmp/fix.patch              # restore
+     ```
+
+     If you do reach for the stash instead: **never a bare `git stash` or
+     a bare `git stash pop`** — a shared checkout has one global stash
+     stack per repo, and a concurrent session's own stash landing between
+     your push and pop ends up on top. A bare pop once grabbed an
      unrelated ~10-day-old stash from another session and produced merge
-     conflicts in files it had never touched.
+     conflicts in files it had never touched. **`stash@{0}` does not fix
+     that** — it is a *positional* reference into the stash reflog, which
+     resolves to whatever is on top at the moment it runs, so writing it
+     out literally reintroduces the very race you were avoiding. Resolve
+     it to an immutable commit sha once, immediately after pushing, and
+     restore by that sha:
+
+     ```bash
+     git stash push -- <file>
+     FIX=$(git rev-parse stash@{0})   # resolve NOW — a real, frozen sha
+     # ... rerun the test(s) ...
+     git stash apply "$FIX"           # position-independent
+     ```
    - Fix embedded in an otherwise-unrelated file, or you need to revert
      only part of a diff: make a targeted edit reverting the fix's logic
      (not the whole file), rerun, then restore with
