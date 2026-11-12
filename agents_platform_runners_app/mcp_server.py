@@ -101,6 +101,7 @@ def _agents_base_transport() -> httpx.AsyncHTTPTransport:
 from . import kanban_dispatch  # noqa: E402
 from . import deploy_reconcile  # noqa: E402
 from . import platform_base  # noqa: E402
+from . import telegram_report as telegram_report_mod  # noqa: E402
 
 # The Agents Platform image gallery. Same split as kanban_dispatch above and
 # for the same reason: the network logic does not belong in this file, the
@@ -833,7 +834,10 @@ async def _list_tools() -> list[Tool]:
                           "qa_rerun=true; DeployComponent='none' (explicit no-deployment-"
                           "needed sentinel, DeployToVersion not required) -> no_deploy_needed, "
                           "routed by QAStatus exactly like 'deployed'; pending/partial -> "
-                          "stays put; unknown (can't observe via any of the three tiers, e.g. "
+                          "stays put, and joins ONE batched Telegram reminder per pass (C4, "
+                          "DEPLOY_ACTIONS registry) if its own LastDeployReminderAt is absent "
+                          "or >12h old, naming component/version/the mapped action; unknown "
+                          "(can't observe via any of the three tiers, e.g. "
                           "unreachable or non-semver) -> NEVER moves the card, 3 consecutive "
                           "unknowns escalate to Need Human; rolled_back (observed version "
                           "dropped below a previously-deployed target) -> Need Human; invalid "
@@ -3076,6 +3080,26 @@ async def _dispatch_tool(name: str, arguments: dict[str, Any] | None) -> list[Te
                             row["qa_dispatch"] = {"error": f"{qr.status_code} {qr.text[:200]}"}
                     except Exception as exc:
                         row["qa_dispatch"] = {"error": str(exc)}
+
+                # C4: one batched Telegram reminder per pass for every
+                # pending/partial card whose LastDeployReminderAt is
+                # absent or >12h old (deploy_reconcile._evaluate_card sets
+                # reminder_due/reminder_action). Reuses the existing
+                # Need-Human relay — AP-MT's own `/api/telegram/report` —
+                # directly, over the same authenticated BASE/_TOKEN every
+                # other platform call in this handler already uses; no
+                # loopback through this app's own `/telegram-report` route
+                # (that exists for a caller with no agents-platform
+                # credential of its own, which this process is not) and no
+                # comment-only stopgap needed.
+                reminder_rows = [row for row in candidates if row.get("reminder_due")]
+                if reminder_rows:
+                    def _send_reminder(title: str, text: str) -> dict:
+                        return telegram_report_mod.send_with_credentials(
+                            BASE, _TOKEN, title, text)
+                    result["reminder"] = await asyncio.to_thread(
+                        deploy_reconcile.send_batched_reminders, _board_client(),
+                        reminder_rows, _send_reminder)
             return _ok(result)
 
         if name == "invoke_kanban_agent":

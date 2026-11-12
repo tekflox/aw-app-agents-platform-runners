@@ -38,6 +38,17 @@ both the live adapter and the inventory (scoped to this workspace only —
 every credential this app holds, ``AW_WORKSPACE_API_KEY`` /
 ``AGENTS_PLATFORM_TOKEN``, is scoped to exactly one workspace membership) and
 go straight to the agent-evidence tier.
+
+**C4 (this module's reminder slice)**: a ``pending``/``partial`` card stays
+put every pass, which on its own means a human can go indefinitely without
+being told a deployment is waiting. ``DEPLOY_ACTIONS`` maps a component to
+the concrete action that resolves it; a card whose own ``LastDeployReminderAt``
+is absent or >12h old joins the batch ``send_batched_reminders`` folds into
+ONE Telegram message per pass (never one per card). The relay is AP-MT's
+existing ``POST /api/telegram/report`` — the same one ``telegram_report.py``
+already wraps for aw-app-notion's loopback caller — reached directly here
+since this process already holds the credential; no new relay, no
+comment-only stopgap needed.
 """
 from __future__ import annotations
 
@@ -60,12 +71,30 @@ UNKNOWN_STREAK_LIMIT = 3
 DEFAULT_MAX_CARDS = 25
 NO_DEPLOY_SENTINEL = "none"
 AGENT_EVIDENCE_STALE_AFTER_S = 12 * 3600
+REMINDER_STALE_AFTER_S = 12 * 3600
 
 DEPLOY_PROPS = [
     "Name", "Status", "TargetSlug", "QAStatus",
     "DeployEnv", "DeployComponent", "DeployWorkspaces", "DeployToVersion",
-    "DeployFromVersion", "DeployCheckResult", "is_live",
+    "DeployFromVersion", "DeployCheckResult", "is_live", "LastDeployReminderAt",
 ]
+
+# Component -> the concrete human action that resolves it (architect
+# decision, card 4165bf3b-9510-812c). Keyed by the exact DeployComponent
+# string for service/core/remote-host — one entry each; every ``app:*``
+# component shares _APP_DEFAULT_ACTION below instead of an entry per app,
+# since the marketplace-release flow is identical for every app and a
+# per-app entry is one nobody remembers to add for the next one.
+DEPLOY_ACTIONS: dict[str, str] = {
+    "core": "deploy workspace core",
+    "remote-host": "trigger host self-update (Remote Hosts tab / console Manage)",
+    "service:aw-backend": ("run Deploy aw-backend workflow FIRST, then Deploy aw-stack "
+                           "(aw-stack alone re-pulls stale :latest)"),
+    "service:aw-knowledgeable": "push to master auto-ships; re-run release workflow if red",
+    "service:research-search": "run release workflow (known intermittent, retry once)",
+}
+
+_APP_DEFAULT_ACTION = "marketplace release then app update, or wait for auto-converge"
 
 _SEMVER_RE = re.compile(r"^v?(\d+)\.(\d+)\.(\d+)(?:[-+].*)?$")
 _SHA_RE = re.compile(r"^[0-9a-f]{7,40}$", re.IGNORECASE)
@@ -103,6 +132,23 @@ def parse_component(value: str) -> tuple[str | None, str]:
         if text.startswith(prefix):
             return prefix[:-1], text[len(prefix):]
     return None, text
+
+
+def deploy_action_text(component: str, to_version: str) -> str:
+    """Maps a DeployComponent to the concrete human action that resolves it,
+    so the batched reminder names a next step instead of just "it's not
+    deployed" (DEPLOY_ACTIONS registry above). Anything not in the registry
+    and not an ``app:*`` (an unmapped service, or a shape never seen before)
+    still names the version and nudges whoever reads it to extend the
+    registry — a reminder must never come back as "I don't know what to
+    tell you"."""
+    component = (component or "").strip()
+    if component in DEPLOY_ACTIONS:
+        return DEPLOY_ACTIONS[component]
+    klass, _name = parse_component(component)
+    if klass == "app":
+        return _APP_DEFAULT_ACTION
+    return f"deploy {component} to {to_version} — no mapped action yet, extend DEPLOY_ACTIONS"
 
 
 def compare(klass: str, observed: str | None, to_version: str) -> str:
@@ -532,8 +578,26 @@ def _evaluate_card(board: "kanban_dispatch.BoardClient", summary: dict, *,
     qa_dispatch_needed = (verdict == "deployed" and qa_status.strip().lower() != "done"
                          and not qa_dispatched)
 
+    # C4: a pending/partial card stays put every pass — without this it
+    # can sit unreminded indefinitely. Due if LastDeployReminderAt is
+    # absent or unparseable (_parse_iso_datetime rejects a date-only value
+    # the same way it does for agent evidence above — architect risk #2)
+    # or older than the 12h window. Deployed/invalid/unknown/rolled_back
+    # never set this: each of those already has its own human-facing
+    # channel (QA dispatch, the one-time invalid comment, the 3-strike
+    # Need Human escalation), and a reminder on top would be noise.
+    reminder_due = False
+    reminder_action = None
+    if verdict in ("pending", "partial"):
+        last_reminder_at = _parse_iso_datetime(props.get("LastDeployReminderAt"))
+        reminder_due = (last_reminder_at is None
+                        or (now - last_reminder_at) > REMINDER_STALE_AFTER_S)
+        if reminder_due:
+            reminder_action = deploy_action_text(component, to_version)
+
     row.update(eligible=True, verdict=verdict, observations=observations, action="none",
-              qa_dispatch_needed=qa_dispatch_needed)
+              qa_dispatch_needed=qa_dispatch_needed, reminder_due=reminder_due,
+              reminder_action=reminder_action)
     row["_stamp"] = {"verdict": verdict, "unknown_streak": streak,
                      "invalid_commented": False, "qa_dispatched": qa_dispatched}
     row["_qa_status"] = qa_status
@@ -577,6 +641,69 @@ def mark_invalid_commented(board: "kanban_dispatch.BoardClient", page_id: str) -
     silencing it (the stamp used to be written unconditionally before the
     comment was even attempted)."""
     _mark_stamp_field(board, page_id, "invalid_commented", True)
+
+
+def mark_reminder_sent(board: "kanban_dispatch.BoardClient", page_id: str, now_iso: str) -> None:
+    """Stamp ``LastDeployReminderAt`` — a real Notion datetime property,
+    not the ``DeployCheckResult`` JSON blob ``_mark_stamp_field`` writes
+    to. Called by ``send_batched_reminders`` BEFORE the Telegram send,
+    deliberately the OPPOSITE ordering from ``mark_qa_dispatched``/
+    ``mark_invalid_commented`` above (both confirmed-success-only): a lost
+    reminder (the send fails after this stamp lands) self-heals in 12h, a
+    spammed human does not (architect decision, card 4165bf3b-9510-812c).
+    ``now_iso`` is passed in rather than computed here so one batch of
+    cards shares one instant, the same way aw-app-notion's own
+    LastHumanPingAt re-ping stamps its whole due batch with one `now_iso`."""
+    board.set_property(page_id, "LastDeployReminderAt", now_iso)
+
+
+def compose_reminder_message(rows: list[dict]) -> tuple[str, str]:
+    """One Telegram message for every card due this pass — never one per
+    card (Frederico explicitly asked for a single batched reminder, same
+    shape as C5's agent-fallback batching). Pure: no board/HTTP access, so
+    the body is assertable directly without mocking the relay."""
+    title = f"Deploy reconciliation: {len(rows)} card(s) waiting on a deploy action"
+    lines = [f"- {r['title']}: {r['component']} -> {r['to_version']} "
+            f"({r['verdict']}) — {r['reminder_action']}" for r in rows]
+    return title, "\n".join(lines)
+
+
+def send_batched_reminders(board: "kanban_dispatch.BoardClient", rows: list[dict],
+                           send: Callable[[str, str], dict]) -> dict:
+    """Stamp every due card's LastDeployReminderAt BEFORE calling ``send`` —
+    see ``mark_reminder_sent``'s docstring for why that ordering is
+    deliberately reversed from this module's usual stamp-only-on-confirmed-
+    success convention. ``send`` is injected (the real caller passes AP-MT's
+    existing ``/api/telegram/report`` relay) so this stays testable with a
+    recording fake and no network access, the same way ``board`` keeps the
+    rest of this module testable.
+
+    Returns ``{"sent": False, "count": 0}`` for an empty batch — no card
+    due means nothing to send, not an error. A ``send`` failure still
+    reports the stamped ``count`` with ``sent: False`` and the error rather
+    than raising: a dead Telegram relay must not take down the whole
+    kanban_check_deployed pass, same as every other external dependency in
+    this module.
+
+    Concurrency note: what actually prevents two overlapping passes from
+    racing this function is operational (architect decision: route every
+    non-dry pass through the single scheduled task). This function's own
+    contribution is ordering, not mutual exclusion — by the time ``send``
+    runs, every row's stamp is already on the board, so even a genuinely
+    concurrent second pass reading the board right after this point sees
+    the fresh stamp and skips these cards, instead of there being a window
+    where two passes could both conclude "due" and both send."""
+    if not rows:
+        return {"sent": False, "count": 0}
+    now_iso = dt.datetime.now(dt.timezone.utc).isoformat()
+    for row in rows:
+        mark_reminder_sent(board, row["page_id"], now_iso)
+    title, text = compose_reminder_message(rows)
+    try:
+        send(title, text)
+    except Exception as exc:  # pragma: no cover - defensive, mirrors the QA-dispatch guard
+        return {"sent": False, "count": len(rows), "error": str(exc)}
+    return {"sent": True, "count": len(rows), "title": title}
 
 
 def _evidence(row: dict) -> str:
@@ -778,4 +905,6 @@ def check_deployed(board: "kanban_dispatch.BoardClient", *, page_id: str | None 
 __all__ = ["check_deployed", "parse_component", "parse_semver", "looks_like_sha", "compare",
            "observe_app", "observe_core", "observe_remote_host", "observe_service",
            "ADAPTERS", "DEPLOY_STATUSES", "DEFAULT_MAX_CARDS", "NO_DEPLOY_SENTINEL",
-           "AGENT_EVIDENCE_STALE_AFTER_S"]
+           "AGENT_EVIDENCE_STALE_AFTER_S", "REMINDER_STALE_AFTER_S", "DEPLOY_ACTIONS",
+           "deploy_action_text", "mark_reminder_sent", "compose_reminder_message",
+           "send_batched_reminders"]

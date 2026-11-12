@@ -778,3 +778,216 @@ def test_is_live_false_or_missing_does_not_short_circuit(monkeypatch):
     verdicts = {r["page_id"]: r["verdict"] for r in result["still_waiting"]}
     assert verdicts["p1"] == "pending"
     assert verdicts["p2"] == "pending"
+
+
+# ── C4: DEPLOY_ACTIONS registry ──────────────────────────────────────────
+
+def test_deploy_action_text_known_components_are_mapped_verbatim():
+    assert dr.deploy_action_text("core", "v0.1.80") == dr.DEPLOY_ACTIONS["core"]
+    assert dr.deploy_action_text("remote-host", "v1.2.3") == dr.DEPLOY_ACTIONS["remote-host"]
+    assert (dr.deploy_action_text("service:aw-backend", "abc1234")
+           == dr.DEPLOY_ACTIONS["service:aw-backend"])
+
+
+def test_deploy_action_text_app_components_share_one_default():
+    assert dr.deploy_action_text("app:notion", "v0.38.0") == dr._APP_DEFAULT_ACTION
+    assert dr.deploy_action_text("app:kb", "v1.0.0") == dr._APP_DEFAULT_ACTION
+
+
+def test_deploy_action_text_unmapped_component_is_generic_and_names_version():
+    text = dr.deploy_action_text("service:some-new-thing", "v2.0.0")
+    assert "service:some-new-thing" in text
+    assert "v2.0.0" in text
+    assert "DEPLOY_ACTIONS" in text  # nudges the reader to extend the registry
+
+
+# ── C4: reminder-due detection on pending/partial cards ─────────────────
+
+def test_pending_card_with_no_prior_reminder_is_due(monkeypatch):
+    _patch_observe(monkeypatch, "app", {"workspace": "aw", "observed": "v0.34.0", "error": None})
+    board = FakeBoard({"p1": _card()})
+    result = dr.check_deployed(board, max_cards=10)
+    row = result["still_waiting"][0]
+    assert row["verdict"] == "pending"
+    assert row["reminder_due"] is True
+    assert row["reminder_action"] == dr._APP_DEFAULT_ACTION
+
+
+def test_pending_card_reminded_recently_is_not_due_again(monkeypatch):
+    _patch_observe(monkeypatch, "app", {"workspace": "aw", "observed": "v0.34.0", "error": None})
+    now = dr.dt.datetime.now(dr.dt.timezone.utc)
+    recent = (now - dr.dt.timedelta(hours=1)).isoformat()
+    board = FakeBoard({"p1": _card(LastDeployReminderAt=recent)})
+    result = dr.check_deployed(board, max_cards=10)
+    assert result["still_waiting"][0]["reminder_due"] is False
+    assert result["still_waiting"][0]["reminder_action"] is None
+
+
+def test_pending_card_reminded_over_12h_ago_is_due_again(monkeypatch):
+    _patch_observe(monkeypatch, "app", {"workspace": "aw", "observed": "v0.34.0", "error": None})
+    now = dr.dt.datetime.now(dr.dt.timezone.utc)
+    stale = (now - dr.dt.timedelta(hours=13)).isoformat()
+    board = FakeBoard({"p1": _card(LastDeployReminderAt=stale)})
+    result = dr.check_deployed(board, max_cards=10)
+    assert result["still_waiting"][0]["reminder_due"] is True
+
+
+def test_date_only_last_reminder_at_is_treated_as_stale_not_fresh(monkeypatch):
+    """Mirrors the architect's risk #2 for agent evidence: a date-only
+    value (_parse_iso_datetime rejects it) must never read as a fresh
+    timestamp — it must fire the reminder again, not silently suppress it
+    forever."""
+    _patch_observe(monkeypatch, "app", {"workspace": "aw", "observed": "v0.34.0", "error": None})
+    board = FakeBoard({"p1": _card(LastDeployReminderAt="2026-11-12")})
+    result = dr.check_deployed(board, max_cards=10)
+    assert result["still_waiting"][0]["reminder_due"] is True
+
+
+def test_partial_verdict_is_also_reminder_due(monkeypatch):
+    def fake_app(name, ws):
+        return {"workspace": ws, "observed": "v0.35.1" if ws == "a" else "v0.1.0", "error": None}
+    monkeypatch.setitem(dr.ADAPTERS, "app", fake_app)
+    board = FakeBoard({"p1": _card(DeployWorkspaces=["a", "b"])})
+    result = dr.check_deployed(board, max_cards=10)
+    row = result["still_waiting"][0]
+    assert row["verdict"] == "partial"
+    assert row["reminder_due"] is True
+
+
+def test_deployed_card_is_never_reminder_due(monkeypatch):
+    _patch_observe(monkeypatch, "app", {"workspace": "aw", "observed": "v0.35.1", "error": None})
+    board = FakeBoard({"p1": _card(QAStatus="done")})
+    result = dr.check_deployed(board, max_cards=10)
+    assert result["moved"][0].get("reminder_due") is False
+
+
+def test_invalid_card_is_never_reminder_due():
+    board = FakeBoard({"p1": _card(DeployComponent="")})
+    result = dr.check_deployed(board, max_cards=10)
+    assert "reminder_due" not in result["still_waiting"][0]
+
+
+def test_unknown_card_is_never_reminder_due(monkeypatch):
+    _patch_observe(monkeypatch, "app", {"workspace": "aw", "observed": None, "error": "down"})
+    board = FakeBoard({"p1": _card()})
+    result = dr.check_deployed(board, max_cards=10)
+    assert result["still_waiting"][0]["reminder_due"] is False
+
+
+def test_rolled_back_card_is_never_reminder_due(monkeypatch):
+    _patch_observe(monkeypatch, "app", {"workspace": "aw", "observed": "v0.35.1", "error": None})
+    board = FakeBoard({"p1": _card(QAStatus="")})
+    dr.check_deployed(board, max_cards=10)  # moves to Testing
+    _patch_observe(monkeypatch, "app", {"workspace": "aw", "observed": "v0.35.0", "error": None})
+    result = dr.check_deployed(board, max_cards=10)  # rollback
+    row = result["moved"][0]
+    assert row["verdict"] == "rolled_back"
+    assert row["reminder_due"] is False
+
+
+def test_no_deploy_needed_sentinel_is_never_reminder_due():
+    board = FakeBoard({"p1": _card(DeployComponent="none", DeployToVersion="", QAStatus="")})
+    result = dr.check_deployed(board, max_cards=10)
+    assert "reminder_due" not in result["moved"][0]
+
+
+def test_rerun_after_a_sent_reminder_is_not_due_again_within_12h(monkeypatch):
+    """Idempotency: once the caller confirms the stamp (mark_reminder_sent),
+    the very next pass must not re-flag the same card as due."""
+    _patch_observe(monkeypatch, "app", {"workspace": "aw", "observed": "v0.34.0", "error": None})
+    board = FakeBoard({"p1": _card()})
+    result1 = dr.check_deployed(board, max_cards=10)
+    assert result1["still_waiting"][0]["reminder_due"] is True
+
+    now_iso = dr.dt.datetime.now(dr.dt.timezone.utc).isoformat()
+    dr.mark_reminder_sent(board, "p1", now_iso)
+
+    result2 = dr.check_deployed(board, max_cards=10)
+    assert result2["still_waiting"][0]["reminder_due"] is False
+
+
+# ── C4: compose_reminder_message / send_batched_reminders ────────────────
+
+def test_compose_reminder_message_is_one_message_for_every_row():
+    rows = [
+        {"title": "Card A", "component": "app:notion", "to_version": "v0.38.0",
+         "verdict": "pending", "reminder_action": "marketplace release..."},
+        {"title": "Card B", "component": "core", "to_version": "v0.1.80",
+         "verdict": "partial", "reminder_action": "deploy workspace core"},
+    ]
+    title, text = dr.compose_reminder_message(rows)
+    assert "2 card(s)" in title
+    assert "Card A" in text and "app:notion" in text
+    assert "Card B" in text and "deploy workspace core" in text
+    assert text.count("\n") == 1  # exactly two lines, one per card
+
+
+def test_send_batched_reminders_with_no_due_cards_sends_nothing():
+    board = FakeBoard({})
+    calls = []
+    result = dr.send_batched_reminders(board, [], lambda title, text: calls.append((title, text)))
+    assert result == {"sent": False, "count": 0}
+    assert not calls
+    assert not board.writes
+
+
+def test_stamp_happens_before_send_not_after():
+    """Deliberately the OPPOSITE ordering from mark_qa_dispatched/
+    mark_invalid_commented (which stamp only after a confirmed success): a
+    lost reminder self-heals in 12h, a spammed human does not (architect
+    decision, card 4165bf3b-9510-812c). Pinned here so a future edit that
+    reorders stamp-vs-send reproduces the exact spam this bias exists to
+    prevent, instead of silently passing."""
+    board = FakeBoard({"p1": _card(), "p2": _card(Name="Other")})
+    rows = [
+        {"page_id": "p1", "title": "Deploy X", "component": "app:notion",
+         "to_version": "v0.35.1", "verdict": "pending", "reminder_action": "a"},
+        {"page_id": "p2", "title": "Other", "component": "core",
+         "to_version": "v0.2.0", "verdict": "pending", "reminder_action": "b"},
+    ]
+    stamped_pages_seen_by_send = []
+
+    def fake_send(title, text):
+        stamped_pages_seen_by_send.append(
+            {pid for pid, name, _ in board.writes if name == "LastDeployReminderAt"})
+        return {"ok": True}
+
+    result = dr.send_batched_reminders(board, rows, fake_send)
+    assert result == {"sent": True, "count": 2, "title": dr.compose_reminder_message(rows)[0]}
+    assert len(board.writes) == 2
+    # Both stamps were already on the board by the time send() ran.
+    assert stamped_pages_seen_by_send == [{"p1", "p2"}]
+
+
+def test_both_stamps_share_one_instant_for_the_whole_batch():
+    board = FakeBoard({"p1": _card(), "p2": _card(Name="Other")})
+    rows = [
+        {"page_id": "p1", "title": "A", "component": "app:notion", "to_version": "v1",
+         "verdict": "pending", "reminder_action": "a"},
+        {"page_id": "p2", "title": "B", "component": "core", "to_version": "v2",
+         "verdict": "pending", "reminder_action": "b"},
+    ]
+    dr.send_batched_reminders(board, rows, lambda t, x: {"ok": True})
+    stamps = {pid: value for pid, name, value in board.writes if name == "LastDeployReminderAt"}
+    assert stamps["p1"] == stamps["p2"]
+
+
+def test_send_failure_leaves_the_stamp_in_place_self_heals_in_12h():
+    board = FakeBoard({"p1": _card()})
+    rows = [{"page_id": "p1", "title": "X", "component": "app:notion", "to_version": "v0.35.1",
+            "verdict": "pending", "reminder_action": "a"}]
+
+    def failing_send(title, text):
+        raise RuntimeError("telegram unreachable")
+
+    result = dr.send_batched_reminders(board, rows, failing_send)
+    assert result["sent"] is False
+    assert result["count"] == 1
+    assert "telegram unreachable" in result["error"]
+    assert len(board.writes) == 1, "the stamp already landed and is not rolled back"
+
+
+def test_mark_reminder_sent_writes_the_real_property_not_the_json_blob():
+    board = FakeBoard({"p1": _card()})
+    dr.mark_reminder_sent(board, "p1", "2026-11-12T19:00:00+00:00")
+    assert board.writes == [("p1", "LastDeployReminderAt", "2026-11-12T19:00:00+00:00")]

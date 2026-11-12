@@ -37,9 +37,19 @@ def _platform(config: dict) -> tuple[str, str]:
     return platform_base_mod.resolve(config).rstrip("/"), token
 
 
-def send(config: dict, title: str, text: str) -> dict:
-    base, token = _platform(config)
-    url = f"{base}/api/telegram/report"
+def send_with_credentials(base: str, token: str, title: str, text: str) -> dict:
+    """The actual relay call, split out from ``send`` so a caller that
+    already holds ``base``/``token`` outright — the runners app's own
+    mcp_server.py, which resolves both from plain env vars rather than an
+    app config dict — can reuse this instead of re-deriving a ``config``
+    shape just to call ``send``. Deploy reconciliation's C4 batched
+    reminder (deploy_reconcile.send_batched_reminders) is exactly that
+    caller: this app already holds ``AGENTS_PLATFORM_TOKEN``, so it reaches
+    AP-MT's ``/api/telegram/report`` directly rather than looping back
+    through its own ``/telegram-report`` route (which exists for callers,
+    like aw-app-notion, that have no agents-platform credential of their
+    own — see the module docstring)."""
+    url = f"{base.rstrip('/')}/api/telegram/report"
     try:
         with httpx.Client(timeout=TIMEOUT_S) as client:
             resp = client.post(url, json={"title": title, "text": text},
@@ -56,3 +66,8 @@ def send(config: dict, title: str, text: str) -> dict:
     except ValueError as exc:
         raise TelegramReportSyncError(
             "agents-platform-multitenant returned a non-JSON body") from exc
+
+
+def send(config: dict, title: str, text: str) -> dict:
+    base, token = _platform(config)
+    return send_with_credentials(base, token, title, text)
