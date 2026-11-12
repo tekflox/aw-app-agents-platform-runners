@@ -113,19 +113,34 @@ async def _deploy_loop(ctx: WorkLoopContext) -> "tuple[dict, list[dict], list[di
 
 _SINGLE_CARD_PROPS = ["Name", "Status", "LastSweptAt", "LastHumanPingAt", "HumanPingCount"]
 
+# The raw Notion option labels the attention lane cares about — same two
+# values ``need_attention``'s own board-wide scan filters to (aw-app-notion's
+# ``list_cards_need_attention``), and the same literals ``check_deployed``
+# and ``kanban_dispatch.move`` already compare against elsewhere in this app
+# ("Need Human" at deploy_reconcile.py:812/825, "In Progress" per aw-manager
+# SKILL.md's own "raw Notion option label for Batch 1's running filter").
+_ATTENTION_ELIGIBLE_STATUSES = ("In Progress", "Need Human")
+
 
 def _single_card_attention_source(board: "kanban_dispatch.BoardClient", page_id: str) -> dict:
     """``page_id`` single-card mode (design §2, same semantics as
     ``kanban_check_deployed``'s own param) — bypasses the board-wide
-    ``need_attention`` scan (In Progress + Need Human only) for the one
-    card named, regardless of its current status. Shaped exactly like
-    ``need_attention``'s own return so the rest of the loop below doesn't
-    need to know which source it came from. Reping is meaningless for a
-    single named card (it's a board-wide batched mechanism) — this source
+    ``need_attention`` scan for the one card named, but still gates on the
+    SAME status filter that scan applies (code-review finding, PR #36: a
+    page_id naming a Done/Backlog card used to still run the full backoff +
+    agent_activity pipeline and could emit a spurious work order recommending
+    resumption for a card that isn't stuck at all). Shaped exactly like
+    ``need_attention``'s own return either way, so the rest of the loop below
+    doesn't need to know which source it came from. Reping is meaningless for
+    a single named card (it's a board-wide batched mechanism) — this source
     never reports it, by design, not by omission."""
     props = board.properties(page_id, _SINGLE_CARD_PROPS)
-    card = {"page_id": page_id, "title": props.get("Name") or "",
-            "status": props.get("Status") or "",
+    status = props.get("Status") or ""
+    if status not in _ATTENTION_ELIGIBLE_STATUSES:
+        return {"has_work": False, "cards": [],
+                "counts": {"count": 0, "scanned": 1, "truncated": False},
+                "skipped_reason": f"status={status!r} is not In Progress or Need Human"}
+    card = {"page_id": page_id, "title": props.get("Name") or "", "status": status,
             "last_swept_at": props.get("LastSweptAt"),
             "last_human_ping_at": props.get("LastHumanPingAt"),
             "human_ping_count": props.get("HumanPingCount")}

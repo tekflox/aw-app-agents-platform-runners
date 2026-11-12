@@ -2865,7 +2865,14 @@ async def _work_loop_list_runs(c: httpx.AsyncClient, *, notion_task_id: str | No
         return None, str(exc)
     if r.status_code != 200:
         return None, f"{r.status_code} {r.text[:200]}"
-    return r.json() or [], None
+    try:
+        return r.json() or [], None
+    except Exception as exc:
+        # A 200 with a malformed/empty body (code-review finding, PR #36) —
+        # without this, r.json() raising escaped this function despite the
+        # docstring's "never raises", and was caught by run_work_loop's
+        # per-LOOP guard instead of failing just the one candidate.
+        return None, f"malformed /api/runs response: {exc}"
 
 
 async def _dispatch_manager_once(c: httpx.AsyncClient, work_orders: list[dict]) -> dict:

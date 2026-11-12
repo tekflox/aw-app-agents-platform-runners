@@ -363,6 +363,21 @@ def test_page_id_single_card_mode_bypasses_need_attention_scan():
     assert result["attention"]["candidates"][0]["page_id"] == "p1"
 
 
+def test_page_id_single_card_mode_skips_a_card_outside_the_attention_statuses():
+    """Code-review finding, PR #36: single-card mode used to run the full
+    backoff + agent_activity pipeline regardless of status, so a page_id
+    naming a Done/Backlog card could emit a work order recommending
+    resumption for a card that isn't stuck at all."""
+    board = FakeBoard(deploy_cards={"p1": {"Name": "X", "Status": "Done",
+                                           "LastSweptAt": None, "LastHumanPingAt": None,
+                                           "HumanPingCount": None}})
+    list_runs = make_list_runs({})
+    result = _run(_ctx(board, list_runs=list_runs, page_id="p1"), ["attention"])
+    assert result["attention"]["candidates"] == []
+    assert result["work_orders"] == []
+    assert list_runs.calls == []  # never reached the run-check
+
+
 # ── ready loop ────────────────────────────────────────────────────────────
 
 def test_ready_loop_without_a_platform_client_reports_an_error_not_a_crash():
