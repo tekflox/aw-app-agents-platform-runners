@@ -33,6 +33,7 @@ container it isn't even importable.
 from __future__ import annotations
 
 import asyncio
+import http.client
 import json
 import logging
 import os
@@ -157,9 +158,11 @@ class BoardClient:
         except urllib.error.URLError as exc:
             raise BoardUnavailable(
                 f"could not reach aw-app-notion at {base}: {exc.reason}") from None
-        except OSError as exc:
+        except (OSError, http.client.HTTPException) as exc:
             # Response-level timeouts/resets (socket.timeout == TimeoutError,
-            # ConnectionResetError, ...) raised from h.getresponse() or this
+            # ConnectionResetError, ...) and malformed-response errors
+            # (IncompleteRead, BadStatusLine — http.client.HTTPException is
+            # NOT an OSError subclass) raised from h.getresponse() or this
             # method's own resp.read() are NOT wrapped into URLError by
             # urllib — only the send phase (h.request) is. Left uncaught,
             # one of these escapes three layers up (through check_deployed's
