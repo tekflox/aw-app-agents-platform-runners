@@ -158,6 +158,32 @@ installed, skip this marker and answer in text instead.
 Use only when the user explicitly asked for spoken output and typed
 the request. Normally voice is automatic from inbound modality.
 
+## Group chats — what actually reaches you
+
+A bot added to a group does **not** receive most of that group's messages.
+Telegram bots default to **Privacy Mode** (BotFather → `/mybots` → Bot
+Settings → Group Privacy): with it on, the bot only receives messages
+addressed directly to it, messages that `@mention` it, and replies to one
+of its own messages. Every other message in the group is invisible to the
+bot by Telegram's own protocol — not by anything in this workspace's
+config, and not something you can work around in code.
+
+So when a user asks "did you see what I posted in <group>?" and you have
+no record of it, that is expected behaviour, not a bug and not context you
+somehow lost. `list_callers` / `list_caller_messages` only cover callers
+the bot genuinely received messages from, so they won't have it either —
+don't burn calls hunting for it there.
+
+Say so plainly and ask them to forward or paste the part they want you to
+act on. If the same group keeps coming up, tell them Privacy Mode is the
+reason and point them at the BotFather setting above — and note that
+turning it off only affects groups the bot is **re-added to** afterward,
+so it is never a fix for the conversation you're having right now.
+
+The other group-chat limitation is the `[[MINIAPP]]` one above: Telegram
+rejects `web_app` buttons in groups, so that marker silently degrades to
+plain text there.
+
 ## CRITICAL: silence on empty turns
 
 If the current turn contains **only** system notifications, MCP server
