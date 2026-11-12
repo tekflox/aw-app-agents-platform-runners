@@ -191,17 +191,33 @@ class BoardClient:
         return self._request("GET", f"{NOTION_PREFIX}/kanban/cards/{page_id}?{query}",
                              timeout=CARD_TIMEOUT_S)
 
-    def move(self, page_id: str, status: str) -> dict:
-        return self._request("POST", f"{NOTION_PREFIX}/kanban/move",
-                             {"page_id": page_id, "status": status})
+    def move(self, page_id: str, status: str, comment: str = "") -> dict:
+        """``comment`` is required by aw-app-notion's own ``move_card()`` for
+        ``status="need_human"`` — it refuses the move with ``{"ok": False,
+        ...}`` (not an exception) otherwise. Forward it in the same call
+        rather than a separate ``add_comment()`` first: ``move_card()``
+        already posts it before moving, so doing both would double-post."""
+        body = {"page_id": page_id, "status": status}
+        if comment:
+            body["comment"] = comment
+        result = self._request("POST", f"{NOTION_PREFIX}/kanban/move", body)
+        if isinstance(result, dict) and result.get("ok") is False:
+            raise BoardUnavailable(result.get("error") or "board refused the move")
+        return result
 
     def add_comment(self, page_id: str, text: str) -> dict:
-        return self._request("POST", f"{NOTION_PREFIX}/kanban/comment",
-                             {"page_id": page_id, "text": text})
+        result = self._request("POST", f"{NOTION_PREFIX}/kanban/comment",
+                               {"page_id": page_id, "text": text})
+        if isinstance(result, dict) and result.get("ok") is False:
+            raise BoardUnavailable(result.get("error") or "board refused the comment")
+        return result
 
     def set_property(self, page_id: str, name: str, value) -> dict:
-        return self._request("POST", f"{NOTION_PREFIX}/kanban/set-property",
-                             {"page_id": page_id, "property": name, "value": value})
+        result = self._request("POST", f"{NOTION_PREFIX}/kanban/set-property",
+                               {"page_id": page_id, "property": name, "value": value})
+        if isinstance(result, dict) and result.get("ok") is False:
+            raise BoardUnavailable(result.get("error") or "board refused the property write")
+        return result
 
     def properties(self, page_id: str, names: list[str] | None = None) -> dict:
         """``{property_name: value}`` — the read half of ``set_property``.

@@ -375,6 +375,56 @@ def test_add_comment_posts_to_the_comment_endpoint(monkeypatch):
     assert seen["body"] == {"page_id": "p1", "text": "hello"}
 
 
+def test_move_forwards_its_comment_in_the_same_request(monkeypatch):
+    """aw-app-notion's move_card() posts the comment itself, as part of the
+    SAME call that moves the card — it isn't a separate add_comment() call.
+    move() must carry it through, or need_human escalations silently no-op
+    (see move_card()'s own required-comment guard)."""
+    monkeypatch.setenv("AW_WORKSPACE_API_KEY", "k")
+    seen = {}
+
+    class R:
+        def read(self): return b'{"ok": true}'
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+
+    def capture(req, timeout=None):
+        seen["body"] = json.loads(req.data.decode())
+        return R()
+
+    monkeypatch.setattr(kd.urllib.request, "urlopen", capture)
+    kd.BoardClient().move("p1", "need_human", comment="explain the problem")
+    assert seen["body"] == {"page_id": "p1", "status": "need_human",
+                            "comment": "explain the problem"}
+
+
+def test_a_board_refused_move_raises_boardunavailable_not_a_silent_noop(monkeypatch):
+    """Live bug: move_card() returns {"ok": False, "error": "..."} (not an
+    HTTP error, not an exception) when status='need_human' has no comment.
+    Before this fix, move() returned that dict as-is with no inspection, so
+    the caller (check_deployed()) treated a refused move as a successful
+    one — reporting a card as moved to Need Human when its Status never
+    actually changed."""
+    monkeypatch.setenv("AW_WORKSPACE_API_KEY", "k")
+
+    class R:
+        def read(self):
+            return json.dumps({
+                "ok": False,
+                "error": "status='need_human' requires a comment explaining the problem",
+            }).encode()
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+
+    monkeypatch.setattr(kd.urllib.request, "urlopen", lambda *a, **kw: R())
+    try:
+        kd.BoardClient().move("p1", "need_human")
+    except kd.BoardUnavailable as exc:
+        assert "requires a comment" in str(exc)
+    else:
+        raise AssertionError("expected BoardUnavailable, not a silently-accepted refusal")
+
+
 def test_the_watchdog_addresses_the_board_over_loopback(monkeypatch):
     """The in-process watchdog runs INSIDE the workspace server, so the
     published URL sends its traffic out to the tunnel edge and back — and that
