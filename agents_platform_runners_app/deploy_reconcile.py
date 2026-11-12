@@ -273,10 +273,14 @@ ADAPTERS: dict[str, Callable[[str, str], dict]] = {
 def _inventory_fetch(workspace: str) -> tuple[dict[str, dict], str | None]:
     """ONE GET per pass for the whole lane (architect decision, C1/C3) —
     never per card. Returns ``({component: row}, None)`` on success, or
-    ``({}, error)`` on any failure: a dead/unreachable inventory must never
-    block the pass, it just leaves every card to fall through to the live
-    adapter/agent-evidence tiers (same fail-open-to-the-next-tier shape as
-    ``observe_service``'s stub)."""
+    ``({}, error)`` on any failure: a dead/unreachable/malformed inventory
+    must never block the pass, it just leaves every card to fall through to
+    the live adapter/agent-evidence tiers (same fail-open-to-the-next-tier
+    shape as ``observe_service``'s stub). Code-review finding on PR #33
+    (reported twice): a 200 response with a non-JSON or wrongly-shaped body
+    raised uncaught from here, unguarded at the top of ``check_deployed()``
+    — ahead of every per-card try/except — and crashed the ENTIRE pass for
+    every card in the lane, not just the one inventory lookup that failed."""
     base = _backend_base()
     if not base:
         return {}, f"{_BACKEND_URL_VAR} is not set for this MCP upstream"
@@ -285,10 +289,16 @@ def _inventory_fetch(workspace: str) -> tuple[dict[str, dict], str | None]:
                                       _auth_headers())
     except ObservationError as exc:
         return {}, str(exc)
+    except ValueError as exc:
+        return {}, f"malformed inventory response: {exc}"
     if status != 200:
         return {}, f"GET /api/workspaces/{workspace}/components returned {status}"
-    rows = (body or {}).get("components") or []
-    return {r["component"]: r for r in rows if r.get("component")}, None
+    try:
+        rows = (body or {}).get("components") or []
+        return ({r["component"]: r for r in rows if isinstance(r, dict) and r.get("component")},
+               None)
+    except (AttributeError, TypeError) as exc:
+        return {}, f"malformed inventory response shape: {exc}"
 
 
 def _parse_iso_datetime(value: str | None) -> float | None:

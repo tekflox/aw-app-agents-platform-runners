@@ -442,6 +442,63 @@ def test_inventory_fetch_without_backend_url_is_a_clean_miss(monkeypatch):
     assert dr._BACKEND_URL_VAR in error
 
 
+class _FakeHTTPResponse:
+    """Minimal stand-in for ``http.client.HTTPResponse`` as a context
+    manager — just enough for ``_http_get_json``'s ``with urlopen(...)``."""
+    def __init__(self, status: int, text: str):
+        self.status = status
+        self._text = text
+
+    def read(self):
+        return self._text.encode()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
+def test_inventory_fetch_handles_a_malformed_200_body_without_crashing(monkeypatch):
+    """Code-review finding on PR #33 (reported twice): a 200 response with a
+    non-JSON body raised json.JSONDecodeError uncaught, which — since
+    _inventory_fetch is called unguarded at the top of check_deployed(),
+    ahead of every per-card try/except — crashed the ENTIRE pass."""
+    monkeypatch.setenv(dr._BACKEND_URL_VAR, "http://backend.example")
+    monkeypatch.setattr(dr.urllib.request, "urlopen",
+                        lambda req, timeout=20.0: _FakeHTTPResponse(200, "not json"))
+    rows, error = dr._inventory_fetch("aw")
+    assert rows == {}
+    assert "malformed" in error
+
+
+def test_inventory_fetch_handles_a_wrongly_shaped_200_body_without_crashing(monkeypatch):
+    """Same failure class, one layer deeper: valid JSON that isn't the
+    expected {"components": [...]} shape (e.g. a bare JSON array) must not
+    crash on the .get("components") call either."""
+    monkeypatch.setenv(dr._BACKEND_URL_VAR, "http://backend.example")
+    monkeypatch.setattr(dr.urllib.request, "urlopen",
+                        lambda req, timeout=20.0: _FakeHTTPResponse(200, "[1, 2, 3]"))
+    rows, error = dr._inventory_fetch("aw")
+    assert rows == {}
+    assert "malformed" in error
+
+
+def test_check_deployed_survives_a_malformed_inventory_body_end_to_end(monkeypatch):
+    """The actual reported bug, reproduced through the real entry point:
+    before the fix this raised out of check_deployed() itself and failed
+    the whole kanban_check_deployed tool call for every card in the lane."""
+    monkeypatch.setenv(dr._BACKEND_URL_VAR, "http://backend.example")
+    monkeypatch.setattr(dr.urllib.request, "urlopen",
+                        lambda req, timeout=20.0: _FakeHTTPResponse(200, "not json"))
+    _patch_observe(monkeypatch, "app", {"workspace": "aw", "observed": "v0.35.1", "error": None})
+    board = FakeBoard({"p1": _card(QAStatus="done")})
+    result = dr.check_deployed(board, max_cards=10)
+    assert result["ok"] is True
+    assert "malformed" in result["inventory_error"]
+    assert result["moved"][0]["action"] == "moved_done"  # falls through to the live tier fine
+
+
 def test_live_adapter_wins_even_over_a_fresh_inventory_row(monkeypatch):
     """'stale falls back to live' in spirit, but the stronger live-always-
     wins case: the live adapter is tried FIRST regardless of whether the
