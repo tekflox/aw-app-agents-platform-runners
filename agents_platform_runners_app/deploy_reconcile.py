@@ -64,7 +64,7 @@ AGENT_EVIDENCE_STALE_AFTER_S = 12 * 3600
 DEPLOY_PROPS = [
     "Name", "Status", "TargetSlug", "QAStatus",
     "DeployEnv", "DeployComponent", "DeployWorkspaces", "DeployToVersion",
-    "DeployFromVersion", "DeployCheckResult",
+    "DeployFromVersion", "DeployCheckResult", "is_live",
 ]
 
 _SEMVER_RE = re.compile(r"^v?(\d+)\.(\d+)\.(\d+)(?:[-+].*)?$")
@@ -454,6 +454,23 @@ def _evaluate_card(board: "kanban_dispatch.BoardClient", summary: dict, *,
         "env": env, "component": component, "to_version": to_version,
     }
 
+    if bool(props.get("is_live")):
+        # Frederico's deterministic cleanup rule (card 4165bf3b-9510-81ea,
+        # comment 2026-11-12): is_live=true is a stronger, explicit signal
+        # than anything else this function would otherwise derive — it
+        # overrides stale QAStatus/Need Human metadata unconditionally.
+        # Short-circuits BEFORE the none-sentinel/validate/observe pipeline
+        # on purpose: a card this override applies to may have missing or
+        # stale DeployComponent/DeployToVersion fields that would otherwise
+        # read as "invalid" or escalate to Need Human, exactly the noise
+        # this cleanup exists to stop.
+        row.update(eligible=True, verdict="live_confirmed", observations=[], action="none")
+        row["_stamp"] = {"verdict": "live_confirmed", "unknown_streak": 0,
+                         "invalid_commented": False, "qa_dispatched": True}
+        row["_qa_status"] = qa_status
+        row["_streak"] = 0
+        return row
+
     if component.lower() == NO_DEPLOY_SENTINEL:
         # Explicit no-deployment-needed: never validated against a version,
         # never observed — the card itself IS the evidence. Routes purely on
@@ -651,6 +668,14 @@ def check_deployed(board: "kanban_dispatch.BoardClient", *, page_id: str | None 
         try:
             if dry_run:
                 pass
+            elif verdict == "live_confirmed":
+                if row["status"] != "Done":
+                    board.add_comment(pid, "🤖 kanban_check_deployed: is_live=true — moving "
+                                     "directly to Done (overrides QAStatus/Need Human).\n\n"
+                                     + _evidence(row))
+                    board.move(pid, "done")
+                    row["action"] = "moved_done"
+                    moved_entry = {"previous_status": row["status"], "new_status": "Done"}
             elif verdict == "invalid":
                 if not row.pop("already_reported", False):
                     board.add_comment(pid, "🤖 kanban_check_deployed: invalid — " + "; ".join(
