@@ -146,12 +146,12 @@
       {
         "id": "aw-agents-dispatch-reliability",
         "path": "skills/aw-agents-dispatch-reliability/SKILL.md",
-        "description": "What to do when a run you dispatched through this app misbehaves \u2014 a fan-out that stalls on an MCP approval gate nobody can approve, a run that died in transport versus one that died holding real work, a scheduled agent failing silently at setup, a delegate whose turn ended on a passive wait, and the same completion arriving several times through independent channels."
+        "description": "What to do when a run you dispatched through this app misbehaves \u2014 a fan-out that stalls on an MCP approval gate nobody can approve, a run that died in transport versus one that died holding real work, a scheduled agent that has been failing silently at setup, a delegate whose turn ended on a passive wait, and the same completion arriving several times through independent channels. Read this before retrying, redispatching, or acting on a dispatched run's self-report."
       },
       {
         "id": "aw-agents-platform-rest-api",
         "path": "skills/aw-agents-platform-rest-api/SKILL.md",
-        "description": "Calling the Agents Platform backend's raw REST API for anything this app's MCP tools don't cover \u2014 agent-groups, agent-flows, supervisions, runs, me \u2014 plus the two fields that exist only on raw REST (mcp_config, disable_harness_tools) and the end-to-end recipe for scoping an agent to exactly one MCP tool."
+        "description": "Calling the Agents Platform backend's raw REST API for anything this app's MCP tools don't cover \u2014 agent-groups, agent-flows, supervisions, runs, me, or a route still under development \u2014 plus the two fields that exist ONLY on raw REST (mcp_config, disable_harness_tools) and the end-to-end recipe for scoping an agent to exactly one MCP tool. Read this before re-deriving the auth dance or concluding a field doesn't exist."
       }
     ],
     "agents": {
