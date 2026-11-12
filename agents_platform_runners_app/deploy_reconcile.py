@@ -497,19 +497,24 @@ def check_deployed(board: "kanban_dispatch.BoardClient", *, page_id: str | None 
                     mark_invalid_commented(board, pid)
             elif verdict == "unknown":
                 if streak >= UNKNOWN_STREAK_LIMIT and row["status"] != "Need Human":
-                    board.add_comment(
-                        pid, f"🤖 kanban_check_deployed: {streak} consecutive unknown checks — "
-                        "escalating.\n\n" + _evidence(row))
-                    board.move(pid, "need_human")
+                    # move()'s own comment= satisfies the server's
+                    # comment-required-for-need_human rule in the same call
+                    # — a separate add_comment() then a bare move() is what
+                    # silently failed to persist (the comment landed, the
+                    # move never did, every single pass).
+                    board.move(
+                        pid, "need_human",
+                        comment=f"🤖 kanban_check_deployed: {streak} consecutive unknown checks "
+                        "— escalating.\n\n" + _evidence(row))
                     row["action"] = "needs_human"
                     moved_entry = {"previous_status": row["status"], "new_status": "Need Human"}
             elif verdict == "rolled_back":
                 if row["status"] != "Need Human":
-                    board.add_comment(
-                        pid, "🤖 kanban_check_deployed: rollback detected — the observed "
+                    board.move(
+                        pid, "need_human",
+                        comment="🤖 kanban_check_deployed: rollback detected — the observed "
                         "version dropped below a previously-deployed target.\n\n"
                         + _evidence(row))
-                    board.move(pid, "need_human")
                     row["action"] = "needs_human"
                     moved_entry = {"previous_status": row["status"], "new_status": "Need Human"}
             elif verdict == "deployed":

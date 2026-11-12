@@ -79,7 +79,7 @@ class FakeBoard:
         matching _request regression test), distinct from BoardUnavailable.
         """
         self._cards = cards
-        self.moves: list[tuple[str, str]] = []
+        self.moves: list[tuple[str, str, str]] = []
         self.comments: list[tuple[str, str]] = []
         self.writes: list[tuple[str, str, object]] = []
         self._fail_comment_for = set(fail_comment_for or ())
@@ -93,11 +93,20 @@ class FakeBoard:
         card = self._cards[page_id]
         return dict(card) if not names else {k: card.get(k) for k in names}
 
-    def move(self, page_id, status):
+    def move(self, page_id, status, comment=""):
         if page_id in self._fail_move_with_timeout_for:
             self._fail_move_with_timeout_for.discard(page_id)
             raise TimeoutError("simulated response-level socket timeout")
-        self.moves.append((page_id, status))
+        # Mirrors aw-app-notion's real move_card() rule AND kanban_dispatch's
+        # fixed BoardClient.move() (which now raises on that rejection
+        # instead of returning it unchecked) — a need_human move with no
+        # comment is refused, not silently accepted. This is what makes the
+        # regression test below fail against the pre-fix call shape
+        # (comment posted separately, move() called with none).
+        if status == "need_human" and not (comment or "").strip():
+            raise dr.kanban_dispatch.BoardUnavailable(
+                "status='need_human' requires a comment")
+        self.moves.append((page_id, status, comment))
         notion_name = {"done": "Done", "need_human": "Need Human"}.get(status, status)
         self._cards[page_id]["Status"] = notion_name
         return {"ok": True}
@@ -181,7 +190,7 @@ def test_deployed_with_qa_done_moves_straight_to_done(monkeypatch):
     board = FakeBoard({"p1": _card(QAStatus="done")})
     result = dr.check_deployed(board, max_cards=10)
     assert result["moved"][0]["action"] == "moved_done"
-    assert board.moves == [("p1", "done")]
+    assert board.moves == [("p1", "done", "")]
     assert board.comments
 
 
@@ -191,7 +200,7 @@ def test_deployed_without_qa_done_moves_to_testing(monkeypatch):
     result = dr.check_deployed(board, max_cards=10)
     assert result["moved"][0]["action"] == "moved_testing"
     assert result["moved"][0]["qa_dispatch_needed"] is True
-    assert board.moves == [("p1", "Testing")]
+    assert board.moves == [("p1", "Testing", "")]
 
 
 def test_qa_dispatch_needed_survives_a_rerun_until_marked_dispatched(monkeypatch):
@@ -203,7 +212,7 @@ def test_qa_dispatch_needed_survives_a_rerun_until_marked_dispatched(monkeypatch
     _patch_observe(monkeypatch, "app", {"workspace": "aw", "observed": "v0.35.1", "error": None})
     board = FakeBoard({"p1": _card(QAStatus="")})
     dr.check_deployed(board, max_cards=10)  # moves to Testing
-    assert board.moves == [("p1", "Testing")]
+    assert board.moves == [("p1", "Testing", "")]
 
     result2 = dr.check_deployed(board, max_cards=10)  # QA dispatch "failed" — never marked
     row2 = result2["still_waiting"][0]
@@ -270,7 +279,17 @@ def test_three_consecutive_unknowns_escalate_to_need_human(monkeypatch):
     board = FakeBoard({"p1": _card()})
     for _ in range(3):
         dr.check_deployed(board, max_cards=10)
-    assert board.moves == [("p1", "need_human")]
+    assert len(board.moves) == 1
+    pid, status, comment = board.moves[0]
+    assert (pid, status) == ("p1", "need_human")
+    # Regression (card 4165bf3b, 2026-11-12): the move must carry its own
+    # comment — a separate add_comment() then a bare move() is what the
+    # server silently rejected every single time, live, for over an hour.
+    assert "consecutive unknown checks" in comment
+    assert board._cards["p1"]["Status"] == "Need Human", (
+        "FakeBoard.move() raises when need_human has no comment — this "
+        "assertion is what actually catches a regression back to the old "
+        "add_comment()-then-bare-move() call shape")
 
 
 def test_unknown_streak_clears_on_a_successful_observation(monkeypatch):
@@ -319,24 +338,27 @@ def test_a_bare_timeout_on_one_cards_move_does_not_abort_the_whole_batch(monkeyp
     # p1's move() raised a bare TimeoutError, not BoardUnavailable — the loop
     # must still record it on the row rather than dying.
     assert rows_by_pid["p1"]["board_action_failed"]
-    assert ("p1", "need_human") not in board.moves
+    assert not any(m[:2] == ("p1", "need_human") for m in board.moves)
     # p2, evaluated AFTER p1 in the same pass, must still have been reached
     # and moved — proof the batch survived p1's uncaught-before-this-fix
     # exception type instead of losing every remaining card's result.
     assert rows_by_pid["p2"]["action"] == "moved_done"
-    assert board.moves == [("p2", "done")]
+    assert board.moves == [("p2", "done", "")]
 
 
 def test_rollback_after_a_prior_deployed_verdict_goes_to_need_human(monkeypatch):
     _patch_observe(monkeypatch, "app", {"workspace": "aw", "observed": "v0.35.1", "error": None})
     board = FakeBoard({"p1": _card(QAStatus="")})  # not done -> moved_testing, stays put
     dr.check_deployed(board, max_cards=10)
-    assert board.moves == [("p1", "Testing")]
+    assert board.moves == [("p1", "Testing", "")]
 
     # Observed version drops back below target -> rollback.
     _patch_observe(monkeypatch, "app", {"workspace": "aw", "observed": "v0.35.0", "error": None})
     dr.check_deployed(board, max_cards=10)
-    assert board.moves[-1] == ("p1", "need_human")
+    pid, status, comment = board.moves[-1]
+    assert (pid, status) == ("p1", "need_human")
+    assert "rollback detected" in comment
+    assert board._cards["p1"]["Status"] == "Need Human"
 
 
 def test_rerun_with_no_change_is_a_no_op(monkeypatch):

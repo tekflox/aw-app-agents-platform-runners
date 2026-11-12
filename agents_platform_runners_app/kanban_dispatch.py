@@ -191,17 +191,35 @@ class BoardClient:
         return self._request("GET", f"{NOTION_PREFIX}/kanban/cards/{page_id}?{query}",
                              timeout=CARD_TIMEOUT_S)
 
-    def move(self, page_id: str, status: str) -> dict:
-        return self._request("POST", f"{NOTION_PREFIX}/kanban/move",
-                             {"page_id": page_id, "status": status})
+    def move(self, page_id: str, status: str, comment: str = "") -> dict:
+        # aw-app-notion's move_card() REJECTS a move to "need_human" with an
+        # {"ok": false, "error": ...} 200 response when no comment is given
+        # (its own hard rule — a card can't land on a human with no
+        # explanation) — `comment` lets a caller satisfy that in the same
+        # call instead of posting one separately and then moving with none,
+        # which is silently rejected server-side. The `ok` check below is
+        # what makes that rejection visible at all: an unchecked body here
+        # let deploy_reconcile.py report "moved to Need Human" for a card
+        # that never left its prior status (card 4165bf3b, 2026-11-12).
+        body = self._request("POST", f"{NOTION_PREFIX}/kanban/move",
+                             {"page_id": page_id, "status": status, "comment": comment})
+        if isinstance(body, dict) and body.get("ok") is False:
+            raise BoardUnavailable(body.get("error") or "board refused the move")
+        return body
 
     def add_comment(self, page_id: str, text: str) -> dict:
-        return self._request("POST", f"{NOTION_PREFIX}/kanban/comment",
+        body = self._request("POST", f"{NOTION_PREFIX}/kanban/comment",
                              {"page_id": page_id, "text": text})
+        if isinstance(body, dict) and body.get("ok") is False:
+            raise BoardUnavailable(body.get("error") or "board refused the comment")
+        return body
 
     def set_property(self, page_id: str, name: str, value) -> dict:
-        return self._request("POST", f"{NOTION_PREFIX}/kanban/set-property",
+        body = self._request("POST", f"{NOTION_PREFIX}/kanban/set-property",
                              {"page_id": page_id, "property": name, "value": value})
+        if isinstance(body, dict) and body.get("ok") is False:
+            raise BoardUnavailable(body.get("error") or "board refused the property write")
+        return body
 
     def properties(self, page_id: str, names: list[str] | None = None) -> dict:
         """``{property_name: value}`` — the read half of ``set_property``.

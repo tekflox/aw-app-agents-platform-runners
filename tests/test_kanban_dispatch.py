@@ -375,6 +375,70 @@ def test_add_comment_posts_to_the_comment_endpoint(monkeypatch):
     assert seen["body"] == {"page_id": "p1", "text": "hello"}
 
 
+def test_move_sends_the_comment_in_the_same_call(monkeypatch):
+    """move()'s comment= satisfies aw-app-notion's own hard rule that a move
+    to need_human requires a comment in the SAME call — a separate
+    add_comment() then a bare move(status) sends no comment at all and the
+    server silently rejects it (see test_move_raises_on_ok_false below)."""
+    monkeypatch.setenv("AW_WORKSPACE_API_KEY", "k")
+    seen = {}
+
+    class R:
+        def read(self): return b'{"ok": true}'
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+
+    def capture(req, timeout=None):
+        seen["body"] = json.loads(req.data.decode())
+        return R()
+
+    monkeypatch.setattr(kd.urllib.request, "urlopen", capture)
+    kd.BoardClient().move("p1", "need_human", comment="why")
+    assert seen["body"] == {"page_id": "p1", "status": "need_human", "comment": "why"}
+
+
+def test_move_raises_on_ok_false(monkeypatch):
+    """Root cause of card 4165bf3b's false "moved to Need Human" report
+    (2026-11-12): aw-app-notion's move_card() rejects a need_human move with
+    no comment as an {"ok": false, "error": ...} 200 response, not an
+    exception. move() used to return that body as-is — deploy_reconcile.py
+    never checked it either, so a server-side rejection looked exactly like
+    success. ready_cards() already guarded this way; move()/add_comment()/
+    set_property() did not."""
+    monkeypatch.setenv("AW_WORKSPACE_API_KEY", "k")
+
+    class R:
+        def read(self):
+            return b'{"ok": false, "error": "status=\'need_human\' requires a comment"}'
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+
+    monkeypatch.setattr(kd.urllib.request, "urlopen", lambda *a, **kw: R())
+    try:
+        kd.BoardClient().move("p1", "need_human")
+    except kd.BoardUnavailable as exc:
+        assert "requires a comment" in str(exc)
+    else:
+        raise AssertionError("expected BoardUnavailable, not a silently-returned ok:false")
+
+
+def test_add_comment_raises_on_ok_false(monkeypatch):
+    monkeypatch.setenv("AW_WORKSPACE_API_KEY", "k")
+
+    class R:
+        def read(self): return b'{"ok": false, "error": "text is required"}'
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+
+    monkeypatch.setattr(kd.urllib.request, "urlopen", lambda *a, **kw: R())
+    try:
+        kd.BoardClient().add_comment("p1", "")
+    except kd.BoardUnavailable as exc:
+        assert "text is required" in str(exc)
+    else:
+        raise AssertionError("expected BoardUnavailable, not a silently-returned ok:false")
+
+
 def test_the_watchdog_addresses_the_board_over_loopback(monkeypatch):
     """The in-process watchdog runs INSIDE the workspace server, so the
     published URL sends its traffic out to the tunnel edge and back — and that
