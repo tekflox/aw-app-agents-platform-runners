@@ -191,9 +191,11 @@ class BoardClient:
         return self._request("GET", f"{NOTION_PREFIX}/kanban/cards/{page_id}?{query}",
                              timeout=CARD_TIMEOUT_S)
 
-    def move(self, page_id: str, status: str) -> dict:
-        return self._request("POST", f"{NOTION_PREFIX}/kanban/move",
-                             {"page_id": page_id, "status": status})
+    def move(self, page_id: str, status: str, comment: str = "") -> dict:
+        body = {"page_id": page_id, "status": status}
+        if comment:
+            body["comment"] = comment
+        return self._request("POST", f"{NOTION_PREFIX}/kanban/move", body)
 
     def add_comment(self, page_id: str, text: str) -> dict:
         return self._request("POST", f"{NOTION_PREFIX}/kanban/comment",

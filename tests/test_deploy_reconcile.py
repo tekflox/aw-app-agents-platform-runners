@@ -93,11 +93,23 @@ class FakeBoard:
         card = self._cards[page_id]
         return dict(card) if not names else {k: card.get(k) for k in names}
 
-    def move(self, page_id, status):
+    def move(self, page_id, status, comment=""):
         if page_id in self._fail_move_with_timeout_for:
             self._fail_move_with_timeout_for.discard(page_id)
             raise TimeoutError("simulated response-level socket timeout")
+        if status == "need_human" and not (comment or "").strip():
+            # Mirrors the real move_card()'s guard (aw-app-notion
+            # notion_app/kanban/cards.py): need_human requires a comment and
+            # returns ok:False with NO exception and NO status change when
+            # it's missing — a caller that doesn't check `ok` silently
+            # reports a card as moved when it never left its old status.
+            return {"ok": False, "error": "status='need_human' requires a comment"}
         self.moves.append((page_id, status))
+        if (comment or "").strip():
+            # Mirrors move_card()'s own "posting comment first if given" —
+            # the real board posts it as part of the atomic move, not via a
+            # separate add_comment() call.
+            self.comments.append((page_id, comment))
         notion_name = {"done": "Done", "need_human": "Need Human"}.get(status, status)
         self._cards[page_id]["Status"] = notion_name
         return {"ok": True}
@@ -271,6 +283,53 @@ def test_three_consecutive_unknowns_escalate_to_need_human(monkeypatch):
     for _ in range(3):
         dr.check_deployed(board, max_cards=10)
     assert board.moves == [("p1", "need_human")]
+
+
+def test_escalation_reports_need_human_only_if_the_move_actually_persisted(monkeypatch):
+    """Live root cause (2026-11-12, QA re-review of the previous fix): the
+    real move_card() (aw-app-notion) rejects status='need_human' with NO
+    comment — returns {"ok": False, ...}, no exception, no status change.
+    check_deployed() called board.add_comment() then board.move(pid,
+    "need_human") with no comment, so every escalation move was silently
+    rejected by the board while the tool still reported the card as moved
+    to Need Human (verified live: a kanban_check_deployed run claimed 3
+    cards moved; none of them had actually left Ready to Deploy). The fix
+    folds the comment into move() itself and checks its `ok` field — this
+    confirms the card only shows up in `moved` when the real status change
+    stuck, and `board_action_failed` is set (not a fabricated "moved_entry")
+    when it didn't.
+    """
+    _patch_observe(monkeypatch, "app", {"workspace": "aw", "observed": None,
+                                        "error": "unreachable"})
+    board = FakeBoard({"p1": _card()})
+    for _ in range(3):
+        result = dr.check_deployed(board, max_cards=10)
+    assert board._cards["p1"]["Status"] == "Need Human", (
+        "the real board must actually be moved, not just the tool's report")
+    moved_ids = [m["page_id"] for m in result["moved"]]
+    assert "p1" in moved_ids
+    assert result["moved"][0]["action"] == "needs_human"
+
+
+def test_a_rejected_move_for_any_reason_is_never_reported_as_moved(monkeypatch):
+    """Generalizes the test above: ANY ok:False move() response (not just
+    the specific missing-comment case) must leave the card in
+    still_waiting with board_action_failed set, never in `moved`. Guards
+    against a future regression that re-adds an unconditional
+    `row["action"] = ...` after board.move() without checking its result.
+    """
+    _patch_observe(monkeypatch, "app", {"workspace": "aw", "observed": None,
+                                        "error": "unreachable"})
+    board = FakeBoard({"p1": _card()})
+    for _ in range(2):
+        dr.check_deployed(board, max_cards=10)
+    monkeypatch.setattr(board, "move",
+                        lambda *a, **kw: {"ok": False, "error": "simulated board rejection"})
+    result = dr.check_deployed(board, max_cards=10)
+    assert not result["moved"]
+    waiting = {row["page_id"]: row for row in result["still_waiting"]}
+    assert waiting["p1"]["board_action_failed"] == "simulated board rejection"
+    assert board._cards["p1"]["Status"] == "Ready to Deploy", "must not be moved"
 
 
 def test_unknown_streak_clears_on_a_successful_observation(monkeypatch):

@@ -497,36 +497,51 @@ def check_deployed(board: "kanban_dispatch.BoardClient", *, page_id: str | None 
                     mark_invalid_commented(board, pid)
             elif verdict == "unknown":
                 if streak >= UNKNOWN_STREAK_LIMIT and row["status"] != "Need Human":
-                    board.add_comment(
-                        pid, f"🤖 kanban_check_deployed: {streak} consecutive unknown checks — "
-                        "escalating.\n\n" + _evidence(row))
-                    board.move(pid, "need_human")
-                    row["action"] = "needs_human"
-                    moved_entry = {"previous_status": row["status"], "new_status": "Need Human"}
+                    comment = (f"🤖 kanban_check_deployed: {streak} consecutive unknown checks — "
+                              "escalating.\n\n" + _evidence(row))
+                    move_result = board.move(pid, "need_human", comment=comment)
+                    if move_result.get("ok"):
+                        row["action"] = "needs_human"
+                        moved_entry = {"previous_status": row["status"],
+                                      "new_status": "Need Human"}
+                    else:
+                        row["board_action_failed"] = move_result.get("error") or "move rejected"
             elif verdict == "rolled_back":
                 if row["status"] != "Need Human":
-                    board.add_comment(
-                        pid, "🤖 kanban_check_deployed: rollback detected — the observed "
-                        "version dropped below a previously-deployed target.\n\n"
-                        + _evidence(row))
-                    board.move(pid, "need_human")
-                    row["action"] = "needs_human"
-                    moved_entry = {"previous_status": row["status"], "new_status": "Need Human"}
+                    comment = ("🤖 kanban_check_deployed: rollback detected — the observed "
+                              "version dropped below a previously-deployed target.\n\n"
+                              + _evidence(row))
+                    move_result = board.move(pid, "need_human", comment=comment)
+                    if move_result.get("ok"):
+                        row["action"] = "needs_human"
+                        moved_entry = {"previous_status": row["status"],
+                                      "new_status": "Need Human"}
+                    else:
+                        row["board_action_failed"] = move_result.get("error") or "move rejected"
             elif verdict == "deployed":
                 if qa_status.strip().lower() == "done":
                     if row["status"] != "Done":
-                        board.add_comment(pid, "🤖 kanban_check_deployed: deployed, QA already "
-                                         "done — moving to Done.\n\n" + _evidence(row))
-                        board.move(pid, "done")
-                        row["action"] = "moved_done"
-                        moved_entry = {"previous_status": row["status"], "new_status": "Done"}
+                        comment = ("🤖 kanban_check_deployed: deployed, QA already "
+                                  "done — moving to Done.\n\n" + _evidence(row))
+                        move_result = board.move(pid, "done", comment=comment)
+                        if move_result.get("ok"):
+                            row["action"] = "moved_done"
+                            moved_entry = {"previous_status": row["status"], "new_status": "Done"}
+                        else:
+                            row["board_action_failed"] = (
+                                move_result.get("error") or "move rejected")
                 else:
                     if row["status"] != "Testing":
-                        board.add_comment(pid, "🤖 kanban_check_deployed: deployed — moving to "
-                                         "Testing for post-deployment QA.\n\n" + _evidence(row))
-                        board.move(pid, "Testing")
-                        row["action"] = "moved_testing"
-                        moved_entry = {"previous_status": row["status"], "new_status": "Testing"}
+                        comment = ("🤖 kanban_check_deployed: deployed — moving to "
+                                  "Testing for post-deployment QA.\n\n" + _evidence(row))
+                        move_result = board.move(pid, "Testing", comment=comment)
+                        if move_result.get("ok"):
+                            row["action"] = "moved_testing"
+                            moved_entry = {"previous_status": row["status"],
+                                          "new_status": "Testing"}
+                        else:
+                            row["board_action_failed"] = (
+                                move_result.get("error") or "move rejected")
             # pending / partial: stays put, action stays "none"
         except kanban_dispatch.BoardUnavailable as exc:
             row["board_action_failed"] = str(exc)
