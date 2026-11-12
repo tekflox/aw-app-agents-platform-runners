@@ -3019,9 +3019,18 @@ async def _dispatch_tool(name: str, arguments: dict[str, Any] | None) -> list[Te
             # QA dispatch is a platform call, not a board one — kept out of
             # deploy_reconcile.py the same way kanban_dispatch.sweep_ready
             # leaves platform dispatch to its caller's PlatformClient.
+            #
+            # Scan BOTH moved and still_waiting, not just this pass's
+            # moved_testing rows: `qa_dispatch_needed` is independent of the
+            # move-on-transition guard specifically so a card already
+            # sitting in Testing from a PRIOR pass whose dispatch failed
+            # gets retried here too (code-review finding on PR #23 — the
+            # original version only tried once, on the move itself, and a
+            # failed POST stranded the card in Testing forever).
             if not result.get("dry_run"):
-                for row in result.get("moved", []):
-                    if row.get("action") != "moved_testing":
+                candidates = result.get("moved", []) + result.get("still_waiting", [])
+                for row in candidates:
+                    if not row.get("qa_dispatch_needed"):
                         continue
                     body = {"input": {"input": (
                                 "Post-deployment QA — kanban_check_deployed verified "
@@ -3032,9 +3041,12 @@ async def _dispatch_tool(name: str, arguments: dict[str, Any] | None) -> list[Te
                             "workspace": _own_workspace()}
                     try:
                         qr = await c.post(f"{BASE}/api/agents/qa-sonnet/run", json=body)
-                        row["qa_dispatch"] = ({"run_id": qr.json().get("run_id")}
-                                              if qr.status_code == 200
-                                              else {"error": f"{qr.status_code} {qr.text[:200]}"})
+                        if qr.status_code == 200:
+                            row["qa_dispatch"] = {"run_id": qr.json().get("run_id")}
+                            await asyncio.to_thread(deploy_reconcile.mark_qa_dispatched,
+                                                    _board_client(), row["page_id"])
+                        else:
+                            row["qa_dispatch"] = {"error": f"{qr.status_code} {qr.text[:200]}"}
                     except Exception as exc:
                         row["qa_dispatch"] = {"error": str(exc)}
             return _ok(result)

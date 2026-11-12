@@ -190,6 +190,22 @@ def observe_core(_name: str, workspace: str) -> dict:
     return {"workspace": ws, "observed": observed, "error": None}
 
 
+def _last_seen_sort_key(host: dict) -> float:
+    """Coerce ``last_seen_at`` to a plain float before comparing — a bare
+    ``h.get("last_seen_at") or 0`` mixes a real timestamp (whatever type
+    aw-backend happens to serialise it as) against the int fallback `0`,
+    and Python's `max()` raises TypeError the moment one host in the list
+    has a string/ISO value and another has None. Every key is now
+    guaranteed comparable, so a malformed value degrades to "oldest", not
+    a crash that `_observe`'s generic except turns into a silent, wrong
+    "unknown"."""
+    value = host.get("last_seen_at")
+    try:
+        return float(value) if value is not None else 0.0
+    except (TypeError, ValueError):
+        return 0.0
+
+
 def observe_remote_host(_name: str, workspace: str) -> dict:
     """Live ``RemoteHost.cli_version`` heartbeat via aw-backend's
     ``GET /api/workspaces/{slug}/remote-hosts`` (bulk; filtered client-side —
@@ -213,7 +229,7 @@ def observe_remote_host(_name: str, workspace: str) -> dict:
     if not hosts:
         return {"workspace": ws, "observed": None,
                 "error": f"no remote host linked to workspace {ws!r}"}
-    host = max(hosts, key=lambda h: h.get("last_seen_at") or 0)
+    host = max(hosts, key=_last_seen_sort_key)
     return {"workspace": ws, "observed": host.get("cli_version"), "error": None}
 
 
@@ -336,9 +352,23 @@ def _evaluate_card(board: "kanban_dispatch.BoardClient", summary: dict) -> dict:
 
     streak = (prior.get("unknown_streak") or 0) + 1 if verdict == "unknown" else 0
 
-    row.update(eligible=True, verdict=verdict, observations=observations, action="none")
+    # Whether a QA dispatch is still owed for this card. Deliberately NOT
+    # gated on the Status-transition guard below (status != "Testing") —
+    # that guard is what makes the MOVE idempotent, but it also means a
+    # card already sitting in Testing from a prior pass would never be
+    # looked at again. `qa_dispatched` only flips true once the caller
+    # (mcp_server.py, which owns the actual platform dispatch call)
+    # confirms success via mark_qa_dispatched() — so a failed POST here
+    # keeps this true on every subsequent pass until one succeeds, instead
+    # of being silently dropped the moment the card's Status changes.
+    qa_dispatched = bool(prior.get("qa_dispatched"))
+    qa_dispatch_needed = (verdict == "deployed" and qa_status.strip().lower() != "done"
+                         and not qa_dispatched)
+
+    row.update(eligible=True, verdict=verdict, observations=observations, action="none",
+              qa_dispatch_needed=qa_dispatch_needed)
     row["_stamp"] = {"verdict": verdict, "unknown_streak": streak,
-                     "invalid_commented": False}
+                     "invalid_commented": False, "qa_dispatched": qa_dispatched}
     row["_qa_status"] = qa_status
     row["_streak"] = streak
     return row
@@ -349,6 +379,21 @@ def _stamp(board: "kanban_dispatch.BoardClient", page_id: str, stamp: dict) -> N
     board.set_property(page_id, "DeployCheckResult", json.dumps(stamp))
     board.set_property(page_id, "LastDeployCheckAt",
                        _dt.datetime.now(_dt.timezone.utc).strftime("%Y-%m-%d"))
+
+
+def mark_qa_dispatched(board: "kanban_dispatch.BoardClient", page_id: str) -> None:
+    """Record that a QA dispatch for this card's current `deployed` verdict
+    actually succeeded — called by the caller that owns the platform POST
+    (mcp_server.py), only on a 200. Read-modify-write on DeployCheckResult so
+    a failed dispatch leaves `qa_dispatched` false and the NEXT
+    `check_deployed()` pass tries again (see `qa_dispatch_needed` above)."""
+    current = board.properties(page_id, ["DeployCheckResult"]).get("DeployCheckResult") or ""
+    try:
+        stamp = json.loads(current) if current else {}
+    except ValueError:
+        stamp = {}
+    stamp["qa_dispatched"] = True
+    board.set_property(page_id, "DeployCheckResult", json.dumps(stamp))
 
 
 def _evidence(row: dict) -> str:

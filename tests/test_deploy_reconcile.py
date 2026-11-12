@@ -137,7 +137,59 @@ def test_deployed_without_qa_done_moves_to_testing(monkeypatch):
     board = FakeBoard({"p1": _card(QAStatus="")})
     result = dr.check_deployed(board, max_cards=10)
     assert result["moved"][0]["action"] == "moved_testing"
+    assert result["moved"][0]["qa_dispatch_needed"] is True
     assert board.moves == [("p1", "Testing")]
+
+
+def test_qa_dispatch_needed_survives_a_rerun_until_marked_dispatched(monkeypatch):
+    """Code-review finding on PR #23: the original version only attempted a
+    QA dispatch on the pass that moved the card to Testing. A card already
+    sitting in Testing from a PRIOR pass (because that dispatch failed) must
+    still be reported as needing one on every subsequent pass, until the
+    caller confirms success via mark_qa_dispatched()."""
+    _patch_observe(monkeypatch, "app", {"workspace": "aw", "observed": "v0.35.1", "error": None})
+    board = FakeBoard({"p1": _card(QAStatus="")})
+    dr.check_deployed(board, max_cards=10)  # moves to Testing
+    assert board.moves == [("p1", "Testing")]
+
+    result2 = dr.check_deployed(board, max_cards=10)  # QA dispatch "failed" — never marked
+    row2 = result2["still_waiting"][0]
+    assert row2["status"] == "Testing"
+    assert row2["qa_dispatch_needed"] is True
+    assert len(board.moves) == 1, "no second move — still a no-op on Status"
+
+
+def test_mark_qa_dispatched_clears_the_flag(monkeypatch):
+    _patch_observe(monkeypatch, "app", {"workspace": "aw", "observed": "v0.35.1", "error": None})
+    board = FakeBoard({"p1": _card(QAStatus="")})
+    dr.check_deployed(board, max_cards=10)  # moves to Testing, qa_dispatch_needed=True
+
+    dr.mark_qa_dispatched(board, "p1")
+
+    result = dr.check_deployed(board, max_cards=10)
+    assert result["still_waiting"][0]["qa_dispatch_needed"] is False
+
+
+def test_qa_dispatch_not_needed_when_qa_already_done(monkeypatch):
+    _patch_observe(monkeypatch, "app", {"workspace": "aw", "observed": "v0.35.1", "error": None})
+    board = FakeBoard({"p1": _card(QAStatus="done")})
+    result = dr.check_deployed(board, max_cards=10)
+    assert result["moved"][0]["action"] == "moved_done"
+    assert result["moved"][0]["qa_dispatch_needed"] is False
+
+
+def test_last_seen_sort_key_handles_mixed_and_missing_values():
+    """Code-review finding on PR #23: max(hosts, key=lambda h: h.get(...) or
+    0) raises TypeError the moment one host's last_seen_at is a non-numeric
+    value and another's is missing/falsy — the int fallback 0 can't compare
+    against a str. Every key must come back as a plain float."""
+    assert dr._last_seen_sort_key({"last_seen_at": 100.5}) == 100.5
+    assert dr._last_seen_sort_key({"last_seen_at": None}) == 0.0
+    assert dr._last_seen_sort_key({}) == 0.0
+    assert dr._last_seen_sort_key({"last_seen_at": "not-a-number"}) == 0.0
+    hosts = [{"cli_version": "old", "last_seen_at": None},
+             {"cli_version": "new", "last_seen_at": 200.0}]
+    assert max(hosts, key=dr._last_seen_sort_key)["cli_version"] == "new"
 
 
 def test_pending_stays_put_no_move_no_comment(monkeypatch):
