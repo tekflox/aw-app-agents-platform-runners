@@ -157,6 +157,16 @@ class BoardClient:
         except urllib.error.URLError as exc:
             raise BoardUnavailable(
                 f"could not reach aw-app-notion at {base}: {exc.reason}") from None
+        except OSError as exc:
+            # Response-level timeouts/resets (socket.timeout == TimeoutError,
+            # ConnectionResetError, ...) raised from h.getresponse() or this
+            # method's own resp.read() are NOT wrapped into URLError by
+            # urllib — only the send phase (h.request) is. Left uncaught,
+            # one of these escapes three layers up (through check_deployed's
+            # per-card BoardUnavailable guard and the MCP tool handler) and
+            # kills the whole batch instead of just this card.
+            raise BoardUnavailable(
+                f"aw-app-notion at {base} did not respond in time: {exc}") from None
         try:
             return json.loads(raw.decode() or "{}")
         except ValueError:
