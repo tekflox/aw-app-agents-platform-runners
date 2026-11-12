@@ -206,6 +206,19 @@ def test_the_upstream_env_carries_the_workspace_credentials(monkeypatch):
     assert env["AW_WORKSPACE_API_KEY"] == "k-123"
 
 
+def test_the_upstream_env_also_carries_aw_backend_credentials(monkeypatch):
+    """kanban_check_deployed's core/remote-host adapters (deploy_reconcile.py)
+    need AW_BACKEND_URL + AW_WORKSPACE baked in too, same reason as the
+    AW_WORKSPACE_API_* pair above."""
+    from agents_platform_runners_app import plugin
+
+    monkeypatch.setenv("AW_BACKEND_URL", "https://api.aw.example")
+    monkeypatch.setenv("AW_WORKSPACE", "acme")
+    env = plugin.build_mcp_servers({})["agents-platform-runners"]["env"]
+    assert env["AW_BACKEND_URL"] == "https://api.aw.example"
+    assert env["AW_WORKSPACE"] == "acme"
+
+
 def test_a_missing_credential_is_omitted_not_written_blank(monkeypatch):
     """A blank value would reach the board as a 401 nobody can place; absent,
     the upstream raises its own "not set" error naming where it comes from."""
