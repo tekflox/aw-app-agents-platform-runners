@@ -313,14 +313,23 @@ def _parse_iso_datetime(value: str | None) -> float | None:
     return parsed.timestamp()
 
 
-def _fresh_agent_observation(prior: dict, now: float) -> dict | None:
+def _fresh_agent_observation(prior: dict, now: float, workspace: str) -> dict | None:
     """The lowest-trust tier: an observation a prior pass's
     ``kanban_report_deploy_observation`` call (C5) left on this card's own
     ``DeployCheckResult``, valid for 12h from its own ``at`` stamp. Returns
-    ``None`` (never a guess) when absent, shapeless, or its timestamp can't
-    be parsed — an unparseable age is not a fresh one."""
+    ``None`` (never a guess) when absent, shapeless, its timestamp can't be
+    parsed (an unparseable age is not a fresh one), or — code-review finding
+    on PR #33 — it was recorded for a DIFFERENT workspace: a card's
+    ``agent_observation`` is a single blob, not one per ``DeployWorkspaces``
+    entry, so without this check the same observation would get applied to
+    every workspace on a multi-workspace card, including ones it was never
+    actually about. An observation with no ``workspace`` of its own is
+    treated as being about this app's own workspace — the only one a
+    workspace-less card (the common, single-workspace case) ever resolves."""
     obs = prior.get("agent_observation")
     if not isinstance(obs, dict) or not obs.get("observed"):
+        return None
+    if (obs.get("workspace") or _this_workspace()) != workspace:
         return None
     at = _parse_iso_datetime(obs.get("at"))
     if at is None:
@@ -350,7 +359,7 @@ def _resolve_observation(klass: str | None, name: str, component: str, workspace
                 "source": "inventory", "age_s": inv_row.get("age_s"), "reason": None,
                 "verdict": compare(klass, inv_row.get("version"), to_version)}
 
-    agent_obs = _fresh_agent_observation(prior, now)
+    agent_obs = _fresh_agent_observation(prior, now, workspace)
     if agent_obs is not None:
         return {"workspace": workspace, "observed": agent_obs.get("observed"),
                 "source": "agent", "age_s": agent_obs.get("age_s"), "reason": None,

@@ -525,6 +525,61 @@ def test_agent_evidence_older_than_12h_is_ignored(monkeypatch):
     assert row["observations"][0]["source"] is None
 
 
+def test_agent_evidence_is_scoped_to_the_workspace_it_was_recorded_for(monkeypatch):
+    """Code-review finding on PR #33: a card's agent_observation is a single
+    blob, not one per DeployWorkspaces entry — it must never be applied to
+    a workspace other than the one it actually names."""
+    def fake_app(name, ws):
+        return {"workspace": ws, "observed": None, "error": "down"}
+    monkeypatch.setitem(dr.ADAPTERS, "app", fake_app)
+    _patch_inventory(monkeypatch, {})
+    now = dr.time.time()
+    recent = dr.dt.datetime.fromtimestamp(now - 60, tz=dr.dt.timezone.utc).isoformat()
+    prior = json.dumps({"agent_observation": {"observed": "v0.35.1", "workspace": "a",
+                                              "at": recent}})
+    board = FakeBoard({"p1": _card(DeployWorkspaces=["b"], DeployCheckResult=prior)})
+    result = dr.check_deployed(board, max_cards=10)
+    row = result["still_waiting"][0]
+    obs = row["observations"][0]
+    assert obs["workspace"] == "b"
+    assert obs["source"] is None  # the 'a'-scoped evidence must not decide 'b'
+    assert row["verdict"] == "unknown"
+
+
+def test_agent_evidence_applies_only_to_its_matching_workspace_on_a_multi_ws_card(monkeypatch):
+    def fake_app(name, ws):
+        return {"workspace": ws, "observed": None, "error": "down"}
+    monkeypatch.setitem(dr.ADAPTERS, "app", fake_app)
+    _patch_inventory(monkeypatch, {})
+    now = dr.time.time()
+    recent = dr.dt.datetime.fromtimestamp(now - 60, tz=dr.dt.timezone.utc).isoformat()
+    prior = json.dumps({"agent_observation": {"observed": "v0.35.1", "workspace": "b",
+                                              "at": recent}})
+    board = FakeBoard({"p1": _card(DeployWorkspaces=["a", "b"], DeployCheckResult=prior)})
+    result = dr.check_deployed(board, max_cards=10)
+    row = result["still_waiting"][0]
+    obs_by_ws = {o["workspace"]: o for o in row["observations"]}
+    assert obs_by_ws["b"]["source"] == "agent"
+    assert obs_by_ws["a"]["source"] is None
+
+
+def test_agent_evidence_without_a_workspace_field_only_applies_to_this_workspace(monkeypatch):
+    """A workspace-less agent_observation (the shape a single-workspace card
+    naturally produces) is treated as being about this app's own workspace
+    — the only one such a card ever resolves — never about another one."""
+    def fake_app(name, ws):
+        return {"workspace": ws, "observed": None, "error": "down"}
+    monkeypatch.setitem(dr.ADAPTERS, "app", fake_app)
+    _patch_inventory(monkeypatch, {})
+    now = dr.time.time()
+    recent = dr.dt.datetime.fromtimestamp(now - 60, tz=dr.dt.timezone.utc).isoformat()
+    prior = json.dumps({"agent_observation": {"observed": "v0.35.1", "at": recent}})
+    board = FakeBoard({"p1": _card(DeployWorkspaces=["other-ws"], DeployCheckResult=prior)})
+    result = dr.check_deployed(board, max_cards=10)
+    row = result["still_waiting"][0]
+    assert row["observations"][0]["source"] is None
+
+
 def test_parse_iso_datetime_rejects_date_only_and_garbage():
     """Architect risk #2: a date-only value must not be mistaken for fresh."""
     assert dr._parse_iso_datetime(None) is None
