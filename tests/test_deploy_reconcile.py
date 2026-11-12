@@ -9,6 +9,7 @@ Run: python -m pytest tests/test_deploy_reconcile.py
 """
 from __future__ import annotations
 
+import json
 import sys
 from pathlib import Path
 
@@ -65,17 +66,24 @@ def test_compare_service_sha_exact_match_only():
 # ── fake board ────────────────────────────────────────────────────────────
 
 class FakeBoard:
-    def __init__(self, cards: dict[str, dict], fail_comment_for: set[str] | None = None):
+    def __init__(self, cards: dict[str, dict], fail_comment_for: set[str] | None = None,
+                 fail_move_with_timeout_for: set[str] | None = None):
         """``cards``: {page_id: {**properties, "status": "..."}}.
 
         ``fail_comment_for``: page_ids whose add_comment() raises
         BoardUnavailable once — for the guard regression tests.
+
+        ``fail_move_with_timeout_for``: page_ids whose move() raises a bare
+        TimeoutError once — the real BoardClient's own un-translated shape
+        for a response-level socket timeout (see test_kanban_dispatch.py's
+        matching _request regression test), distinct from BoardUnavailable.
         """
         self._cards = cards
         self.moves: list[tuple[str, str]] = []
         self.comments: list[tuple[str, str]] = []
         self.writes: list[tuple[str, str, object]] = []
         self._fail_comment_for = set(fail_comment_for or ())
+        self._fail_move_with_timeout_for = set(fail_move_with_timeout_for or ())
 
     def ready_cards(self, status="ready", limit=50):
         return [{"page_id": pid, "title": c.get("Name", pid), "status": c["Status"]}
@@ -86,6 +94,9 @@ class FakeBoard:
         return dict(card) if not names else {k: card.get(k) for k in names}
 
     def move(self, page_id, status):
+        if page_id in self._fail_move_with_timeout_for:
+            self._fail_move_with_timeout_for.discard(page_id)
+            raise TimeoutError("simulated response-level socket timeout")
         self.moves.append((page_id, status))
         notion_name = {"done": "Done", "need_human": "Need Human"}.get(status, status)
         self._cards[page_id]["Status"] = notion_name
@@ -273,6 +284,47 @@ def test_unknown_streak_clears_on_a_successful_observation(monkeypatch):
     dr.check_deployed(board, max_cards=10)
     dr.check_deployed(board, max_cards=10)
     assert not board.moves, "streak should have reset, so this is only the 2nd unknown in a row"
+
+
+def test_a_bare_timeout_on_one_cards_move_does_not_abort_the_whole_batch(monkeypatch):
+    """The actual live root cause (2026-11-12), distinct from PR #25's already-
+    fixed BoardUnavailable case: a response-level socket timeout from a real
+    BoardClient escapes as a bare TimeoutError, not kanban_dispatch.
+    BoardUnavailable (see test_kanban_dispatch.py's matching _request
+    regression test). Before this fix, check_deployed()'s action-block guard
+    caught only BoardUnavailable, so this exact exception type propagated out
+    of the `for summary in candidates` loop and killed the whole pass with no
+    result — exactly what happened live when board.move() hung on an
+    escalation move and nothing caught the timeout that followed."""
+    _patch_observe(monkeypatch, "app", {"workspace": "aw", "observed": None,
+                                        "error": "unreachable"})
+    _patch_observe(monkeypatch, "core", {"workspace": "aw", "observed": "v0.1.80",
+                                         "error": None})
+    board = FakeBoard({
+        # Pre-seeded at streak=2 so this single call's 3rd-strike evaluation
+        # reaches UNKNOWN_STREAK_LIMIT and calls board.move() directly,
+        # without a prior pass moving p2 out of the Ready-to-Deploy lane
+        # first (which would otherwise shrink "considered" on this call).
+        "p1": _card(Name="Escalating card",
+                   DeployCheckResult=json.dumps({"unknown_streak": 2})),
+        "p2": _card(Name="Deployed card", DeployComponent="core",
+                   DeployToVersion="v0.1.80", QAStatus="done"),
+    }, fail_move_with_timeout_for={"p1"})
+
+    result = dr.check_deployed(board, max_cards=10)
+
+    assert result["ok"] is True
+    assert result["considered"] == 2
+    rows_by_pid = {r["page_id"]: r for r in result["still_waiting"] + result["moved"]}
+    # p1's move() raised a bare TimeoutError, not BoardUnavailable — the loop
+    # must still record it on the row rather than dying.
+    assert rows_by_pid["p1"]["board_action_failed"]
+    assert ("p1", "need_human") not in board.moves
+    # p2, evaluated AFTER p1 in the same pass, must still have been reached
+    # and moved — proof the batch survived p1's uncaught-before-this-fix
+    # exception type instead of losing every remaining card's result.
+    assert rows_by_pid["p2"]["action"] == "moved_done"
+    assert board.moves == [("p2", "done")]
 
 
 def test_rollback_after_a_prior_deployed_verdict_goes_to_need_human(monkeypatch):

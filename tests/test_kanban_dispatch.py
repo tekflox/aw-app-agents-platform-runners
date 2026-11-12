@@ -267,6 +267,55 @@ def test_a_404_is_reported_as_the_notion_app_being_absent(monkeypatch):
         raise AssertionError("expected BoardUnavailable")
 
 
+def test_a_response_level_timeout_is_also_reported_as_boardunavailable(monkeypatch):
+    """Root cause of the live kanban_check_deployed hang on 2026-11-12: a
+    socket timeout raised from h.getresponse()/resp.read() (the response
+    phase) is a bare TimeoutError, NOT urllib.error.URLError — only the send
+    phase (h.request) gets wrapped into URLError by urllib itself. Before
+    this fix, that bare TimeoutError escaped _request() uncaught, then
+    escaped check_deployed()'s per-card BoardUnavailable guard too, killing
+    the whole batch three layers up with no result at all."""
+    monkeypatch.setenv("AW_WORKSPACE_API_KEY", "k")
+
+    class SlowResponse:
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+        def read(self):
+            raise TimeoutError("timed out")
+
+    monkeypatch.setattr(kd.urllib.request, "urlopen", lambda *a, **kw: SlowResponse())
+    try:
+        kd.BoardClient().move("p1", "done")
+    except kd.BoardUnavailable as exc:
+        assert "did not respond in time" in str(exc)
+    else:
+        raise AssertionError("expected BoardUnavailable, not a bare TimeoutError")
+
+
+def test_a_malformed_response_body_is_also_reported_as_boardunavailable(monkeypatch):
+    """Code-review finding on this PR: http.client.HTTPException subtypes
+    (e.g. IncompleteRead, BadStatusLine — raised from the same resp.read()
+    call, but NOT OSError subclasses) are a distinct uncovered exception
+    shape in the same spot as the bare TimeoutError above."""
+    import http.client
+
+    monkeypatch.setenv("AW_WORKSPACE_API_KEY", "k")
+
+    class TruncatedResponse:
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+        def read(self):
+            raise http.client.IncompleteRead(b"partial")
+
+    monkeypatch.setattr(kd.urllib.request, "urlopen", lambda *a, **kw: TruncatedResponse())
+    try:
+        kd.BoardClient().move("p1", "done")
+    except kd.BoardUnavailable as exc:
+        assert "did not respond in time" in str(exc)
+    else:
+        raise AssertionError("expected BoardUnavailable, not a bare IncompleteRead")
+
+
 def test_ready_cards_unwraps_the_boards_envelope(monkeypatch):
     monkeypatch.setenv("AW_WORKSPACE_API_KEY", "k")
 

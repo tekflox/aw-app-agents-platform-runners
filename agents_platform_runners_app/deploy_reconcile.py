@@ -530,6 +530,14 @@ def check_deployed(board: "kanban_dispatch.BoardClient", *, page_id: str | None 
             # pending / partial: stays put, action stays "none"
         except kanban_dispatch.BoardUnavailable as exc:
             row["board_action_failed"] = str(exc)
+        except Exception as exc:  # pragma: no cover - defensive, per card
+            # Mirrors the _evaluate_card guard above: BoardUnavailable is the
+            # expected/typed shape, but a board call three layers below this
+            # (e.g. a bare socket.timeout that pre-dates kanban_dispatch's own
+            # OSError translation) must still be bounded to this one card
+            # rather than killing the whole batch's already-computed results.
+            log.warning("deploy_reconcile: card %s action failed", pid, exc_info=True)
+            row["board_action_failed"] = str(exc)
 
         if moved_entry:
             moved.append({**row, **moved_entry})
