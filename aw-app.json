@@ -142,6 +142,16 @@
         "id": "aw-image-gallery",
         "path": "skills/aw-image-gallery/SKILL.md",
         "description": "A Galeria de Imagens da Agents Platform (mini-app Telegram /images) lida pelas tools list_gallery_images / list_gallery_tags / set_gallery_tags deste MCP \u2014 puxar fotos que o usu\u00e1rio j\u00e1 enviou sem pedir reenvio, filtrar por tag, marcar tags. Migrada do app aw-crispal em 21/09/2026 junto com as tools; documenta os nomes novos por tipo de sess\u00e3o e o facto de o retorno ser s\u00f3 URLs, nunca caminhos de ficheiro."
+      },
+      {
+        "id": "aw-agents-dispatch-reliability",
+        "path": "skills/aw-agents-dispatch-reliability/SKILL.md",
+        "description": "What to do when a run you dispatched through this app misbehaves \u2014 a fan-out that stalls on an MCP approval gate nobody can approve, a run that died in transport versus one that died holding real work, a scheduled agent failing silently at setup, a delegate whose turn ended on a passive wait, and the same completion arriving several times through independent channels."
+      },
+      {
+        "id": "aw-agents-platform-rest-api",
+        "path": "skills/aw-agents-platform-rest-api/SKILL.md",
+        "description": "Calling the Agents Platform backend's raw REST API for anything this app's MCP tools don't cover \u2014 agent-groups, agent-flows, supervisions, runs, me \u2014 plus the two fields that exist only on raw REST (mcp_config, disable_harness_tools) and the end-to-end recipe for scoping an agent to exactly one MCP tool."
       }
     ],
     "agents": {

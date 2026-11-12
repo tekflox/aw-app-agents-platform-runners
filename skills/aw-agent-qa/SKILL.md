@@ -142,6 +142,89 @@ decisions, gotchas, and architecture notes specific to this codebase.
    - If no such tools exist, report the same verdict in plain text in your
      final response instead.
 
+## Mutation-test a regression test before trusting it
+
+This contract already says to run the dev's claimed fix yourself rather
+than take "added a test" on their word. It is not enough: **a passing
+regression test is not proof the fix is what makes it pass.** A vacuously
+true test — one that would pass against the pre-fix code too — hands you
+the same green checkmark as a real one.
+
+To verify a regression test actually exercises the fix:
+
+1. **Temporarily un-apply the fix** in the file(s) it touches.
+   - Single dirty file, fix is its only local change:
+     `git stash push -- <file>`, rerun the new test(s), then restore.
+     **Never a bare `git stash` or a bare `git stash pop`** — a shared
+     checkout has one global stash stack per repo, and a concurrent
+     session's own stash landing between your push and pop ends up on top.
+     Capture the exact ref immediately after pushing (`git stash list -1`
+     → e.g. `stash@{0}`) and restore with `git stash pop stash@{0}`, even
+     with the scoped `push -- <file>` form. A bare pop once grabbed an
+     unrelated ~10-day-old stash from another session and produced merge
+     conflicts in files it had never touched.
+   - Fix embedded in an otherwise-unrelated file, or you need to revert
+     only part of a diff: make a targeted edit reverting the fix's logic
+     (not the whole file), rerun, then restore with
+     `git checkout -- <file>`. **That only restores the fix if the fix is
+     already committed** — `git checkout --` resets to HEAD, so on an
+     uncommitted fix it silently discards it instead of bringing it back,
+     and you won't notice until a later diff comes up empty. Check
+     `git status`/`git diff` first: if the fix is uncommitted, either
+     commit it before mutating, or save it yourself
+     (`git diff -- <file> > /tmp/fix.patch`) and restore with
+     `git apply`.
+2. **Confirm the new test(s) FAIL** against the un-fixed code. If they
+   still pass, the test is vacuous — report that, don't approve.
+3. **Restore and confirm `git diff` is empty** before recording your
+   verdict. This is what makes the technique safe on a shared working
+   tree; leaving a dirty revert behind for a concurrent session to trip
+   over is worse than not mutation-testing at all.
+4. **For a multi-part fix, mutate each part separately**, not all at once
+   — that proves each part is independently load-bearing rather than one
+   part's test passing by accident because of the other.
+
+Coders are expected to do this on their own tests before pushing (it's in
+`aw-agent-coder`), and several have unprompted. That doesn't replace your
+pass: a coder catching their own vacuous test is cheaper, you catching one
+they missed is the point of the review.
+
+## Before trusting a live DOM, confirm you're looking at what you think
+
+A live frontend check can "confirm" a bug that does not exist. A review
+once spent ~25 tool calls chasing a phantom zero-results bug before
+discovering it had never been looking at the component under test. Three
+distinct traps, all of which produce a confident wrong verdict:
+
+- **A pinned layout/route key in `localStorage` can route you into a
+  different UI entirely.** A stale value left by a prior session (in this
+  ecosystem's workspace UI, `aw_layout_intent`) silently renders a
+  separate layout implementation baked into a different bundle — not the
+  app UI you are testing. Nothing visible on the page signals it; the
+  feature just looks broken or missing. Clear it before starting:
+  `localStorage.removeItem('<the key>')`.
+- **Hash-only navigation does not reload JS.** Navigating by URL fragment
+  alone is a same-document navigation in an SPA. After a fresh deploy it
+  keeps running the **old** already-loaded bundle indefinitely while the
+  address bar looks correct. Force a real full-URL navigation.
+- **A cached bundle lies on any app's frontend, not just one.** A review
+  of a different app's own SPA confirmed by direct API call that the
+  backend already returned the new fields, while the live DOM still showed
+  only the old rows — ~10 tool calls went into diffing asset hashes before
+  recognising a cached bundle. A hard reload bypassing cache fixed it
+  immediately.
+
+So: if a backend fix is confirmed live by direct API call but the DOM
+still shows old behaviour, **suspect a cached bundle before suspecting the
+deploy or the fix.** Before trusting any live DOM or network result,
+confirm you are looking at the component you think you are, running the
+bundle you think you are — evaluate against the real DOM rather than only
+the accessibility snapshot, start from known-clean `localStorage`, and
+force a cache-busted reload after any fresh deploy. A "bug" that
+disappears once you clear that key and force an uncached reload was never
+a bug in the deployed code, and reporting it as one sends a coder to fix
+nothing.
+
 ## Mandatory for deployable-code deliveries: commit/push, release cut, deploy by default
 
 Scope: this applies whenever the delivery touches deployable code — a
@@ -237,6 +320,11 @@ for the retry branch" is actionable, "needs more testing" is not.
 - [ ] **Unit tests exist and actually pass.** New logic has a corresponding
   test in the repo's own test-directory convention. Run it yourself — don't
   take "added a test" on the dev's word.
+- [ ] **Any regression test is mutation-tested, not just green.** Un-apply
+  the fix, confirm the test fails without it, restore and confirm a clean
+  diff — each part separately on a multi-part fix. See "Mutation-test a
+  regression test before trusting it" above; a passing test is not
+  evidence the fix is what makes it pass.
 - [ ] **The new/changed tests are actually wired into CI, not just passing
   locally.** Check the repo's CI config (path pattern, test-discovery glob,
   the job matrix) and confirm the new test file sits where the pipeline
@@ -252,6 +340,11 @@ for the retry branch" is actionable, "needs more testing" is not.
 - [ ] **Visual/UI changes have a live Playwright screenshot as evidence**
   (see the MANDATORY rule above) — repeated here because it's the most
   commonly skipped item.
+- [ ] **Any live-DOM finding was taken from a known-clean, cache-busted
+  session** — clean `localStorage`, a real full-URL navigation, no stale
+  bundle (see "Before trusting a live DOM" above). A DOM-based *failure*
+  verdict especially: confirm it survives an uncached reload before
+  reporting it.
 - [ ] **Test evidence is attached to the card/report, not just described.**
   Every review needs something concrete a human can look at without
   re-running your work: a screenshot for anything visual, or the actual log

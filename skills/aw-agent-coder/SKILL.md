@@ -173,6 +173,44 @@ the CI job's discovered path (wrong directory, wrong naming convention, not
 in the matrix) will bit-rot the first time someone doesn't know to run it by
 hand. Point at the CI config you checked, not just the test output.
 
+**Verify against the real target, not just CI.** A green pipeline proves
+the diff you touched builds and behaves as intended. It does not prove the
+thing works where it actually runs. Two shapes of that gap, both of which
+have shipped "done" work that wasn't:
+
+- **A chained install/bootstrap script only tests the steps it reaches.**
+  With `set -e`/early-`exit` semantics, fixing bug N lets the chain run
+  further and can immediately unmask bug N+1 for an entirely unrelated
+  reason nobody has hit yet. One evening on a multi-step bootstrap chain
+  surfaced this three times consecutively — a package manager that was on
+  `PATH` but couldn't install, then operational commands shelling out with
+  a `PATH` that omitted the newly-vendored bin dir, then a bash 4+ builtin
+  on a host shipping bash 3.2. Each fix was CI green, released, and passed
+  QA, and **none of them was wrong to ship** — but "CI green + QA passed"
+  on fix N told nobody whether the overall chain had been reached yet. No
+  test suite caught it, because none of them executed the real top-level
+  installer end to end against a live target. What caught it was a live run
+  on the real host after each fix landed.
+- **A deployed server does not mean an updated client.** Shipping a new
+  dispatch verb/command across a client-server protocol, with CI green and
+  a clean server deploy, proves only that the **server** understands it. An
+  already-connected client picks the verb up only after its **own**
+  self-update, which can lag by an unknown amount — tested against a real
+  already-connected client still pinned to an older build, the call comes
+  back `unknown verb`. Test against a pinned older client, not just a
+  freshly-provisioned one that pulled the latest on first connect.
+
+So, before calling either class of change done: re-run against a real
+target (or have the already-connected client re-run, accounting for
+self-update lag) and check the **next** step and the **older** client, not
+just the step you touched. A new failure surfacing immediately after your
+fix lands is not a regression and not a reason to doubt the fix — it is the
+chain reaching one step further than it used to. Treat it as the next bug
+in the same investigation. Relatedly, a handler for an unrecognised
+verb/command should degrade with a clear "unsupported — update to vX.Y.Z"
+rather than an opaque error; if it doesn't, fix that alongside the new verb
+rather than filing it separately.
+
 ## Handing off to QA
 
 **QA reviews MERGED work only.** A review of an open PR verifies claims about
@@ -244,6 +282,13 @@ When this run has a Kanban card, you'll likely need these. `ToolSearch` with
   not what you're about to do.
 - Verify your work (build/test/lint, or a manual smoke check when no
   automated check exists) before declaring the task done.
+- **If you wrote a regression test, mutation-test it before pushing** —
+  temporarily un-apply your own fix, confirm the new test actually fails
+  without it, then restore and re-verify. A test that would have passed
+  against the pre-fix code is vacuous and gives you the same green
+  checkmark as a real one. Catching your own vacuous test before push is
+  strictly better than QA catching it after; `aw-agent-qa` has the full
+  procedure and the shared-working-tree safety rules.
 - **Every exit verdict needs evidence, not a claim.** Whether you're
   reporting success, partial success, or that the task can't be done,
   include the concrete proof in your report: the command output/test

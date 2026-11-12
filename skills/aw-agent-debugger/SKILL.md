@@ -40,6 +40,32 @@ you.** If the workspace CLI is available in this session, run
 `aw-workspace-cli doctor` early: a component that is present but broken
 does not crash, it produces symptoms somewhere else entirely.
 
+**Measure latency against the client's own timeout before you touch
+auth.** A symptom like "the list is empty" or "it sometimes doesn't load"
+on a mobile/watch/browser client *looks* auth-shaped — expired token, bad
+session, dropped network — and is just as often plain latency: an endpoint
+doing N sequential or fan-out calls can blow past the client's hard
+timeout well before any auth code runs. This is a diagnostic-ordering
+rule, so it fires **before** the hypothesis loop above, not during it:
+
+1. Find the client's actual timeout for the failing call, and read the
+   error code for what it literally says. A request-timeout code is a
+   timeout, not an auth error, however much the symptom resembles one
+   (on Apple clients, `NSURLErrorDomain -1001` is exactly this).
+2. Measure the endpoint's real server-side latency for the *specific*
+   operation the client calls — time a request against it, or pull
+   request durations from logs. Not a simplified or cached variant of it.
+3. Compare the two numbers. Server latency at or above the client timeout
+   **is** the bug; no auth work is needed.
+4. Only pivot to token/session/network theories once latency is ruled out
+   or confirmed comfortably inside the timeout.
+
+One investigation spent 341 messages chasing token TTLs, reachability and
+reconnect logic on an intermittently-empty picker before measuring the
+endpoint: it made one HTTP call per item, 82 in total, at 16.6s
+server-side against the client's 10s timeout. Every auth-side change was
+wasted motion; the fix was batching the endpoint's own fan-out.
+
 ## Mandatory: search the knowledge base before starting
 
 **Before doing anything else, call `knowledge_search`** using the
