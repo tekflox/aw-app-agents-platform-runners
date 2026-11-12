@@ -31,6 +31,7 @@ from . import otel_env as otel_env_mod
 from . import platform_base as platform_base_mod
 from . import runner_registration as runner_registration_mod
 from . import shared_redis
+from . import telegram_report as telegram_report_mod
 from . import warm_pool
 
 # Re-exported for callers/tests that import RUNNERS from this module —
@@ -516,6 +517,32 @@ def build_routes(config: dict | None = None, *, kanban_sweep_status: dict | None
             return await asyncio.to_thread(notion_token_sync_mod.state, cfg)
         except notion_token_sync_mod.NotionTokenSyncError as exc:
             raise _notion_token_failure(exc) from exc
+
+    # ------------------------------------------------------------------
+    # Telegram report relay — see telegram_report.py for why this app makes
+    # the AP-MT call. Caller is aw-app-notion's reping branch over loopback
+    # (workspace X-Api-Key); this app forwards on its own agents_platform_token.
+    # ------------------------------------------------------------------
+
+    def _telegram_report_failure(exc: Exception) -> HTTPException:
+        """409 when this workspace has no agents-platform at all, 502 when it
+        has one that refused/was unreachable — same split as
+        ``_notion_token_failure``, so a caller that already knows that
+        pattern (aw-app-notion's ``apmt._call``) gets the same ``ApmtNotConfigured``
+        treatment for free."""
+        if isinstance(exc, telegram_report_mod.TelegramReportNotConfigured):
+            return HTTPException(409, str(exc))
+        return HTTPException(502, str(exc))
+
+    @app.post("/telegram-report")
+    async def telegram_report(data: dict = Body(...)) -> dict:
+        import asyncio
+
+        try:
+            return await asyncio.to_thread(
+                telegram_report_mod.send, cfg, data.get("title") or "", data.get("text") or "")
+        except telegram_report_mod.TelegramReportSyncError as exc:
+            raise _telegram_report_failure(exc) from exc
 
     @app.post("/notion-subscription")
     async def notion_subscription_register(data: dict = Body(...)) -> dict:
