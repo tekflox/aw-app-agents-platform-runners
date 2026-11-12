@@ -2893,7 +2893,15 @@ async def _dispatch_manager_once(c: httpx.AsyncClient, work_orders: list[dict]) 
     except Exception as exc:
         return {"error": f"dedup probe failed: {exc}"}
     if probe.status_code == 200:
-        for row in (probe.json() or []):
+        try:
+            probe_rows = probe.json() or []
+        except Exception as exc:
+            # Same guard as _work_loop_list_runs (code-review finding, PR
+            # #36) — a malformed 200 body here must not escape this
+            # function and take the whole work_loop call's already-
+            # computed work_orders/actions_taken/sections down with it.
+            return {"error": f"malformed dedup-probe response: {exc}"}
+        for row in probe_rows:
             if (row.get("source_slug") == "manager"
                     and (row.get("status") or "").lower() in ("pending", "running")):
                 return {"skipped": "manager run already in flight", "run_id": row.get("id")}
@@ -2908,7 +2916,10 @@ async def _dispatch_manager_once(c: httpx.AsyncClient, work_orders: list[dict]) 
         return {"error": f"dispatch failed: {exc}"}
     if resp.status_code != 200:
         return {"error": f"{resp.status_code} {resp.text[:200]}"}
-    return {"run_id": (resp.json() or {}).get("run_id")}
+    try:
+        return {"run_id": (resp.json() or {}).get("run_id")}
+    except Exception as exc:
+        return {"error": f"malformed dispatch response: {exc}"}
 
 
 async def _poll_run(c: httpx.AsyncClient, run_id: str, *, timeout_s: int = 900) -> dict:

@@ -1,8 +1,10 @@
-"""``_work_loop_list_runs`` — the ``ListRunsFn`` work_loop.py's attention
-loop calls for its run-check. Scoped to the one code-review finding (PR #36)
-this file exists to regression-test: a 200 response with a malformed body
-used to raise uncaught out of this "never raises" helper, escalating a
-single candidate's probe failure into a whole-loop failure.
+"""``_work_loop_list_runs`` / ``_dispatch_manager_once`` — the two
+``work_loop`` tool-handler helpers that talk to AP-MT over httpx. Scoped to
+the code-review findings (PR #36) this file regression-tests: a 200
+response with a malformed body used to raise uncaught out of functions
+documented to "never raise" / always return a dict, escalating a single
+candidate's (or the optional dispatch_manager hook's) failure into a
+whole-loop/whole-call failure that discarded already-computed results.
 
 Run: python -m pytest tests/test_mcp_server_work_loop.py
 """
@@ -65,3 +67,69 @@ def test_a_non_200_status_fails_closed_with_the_status_in_the_error():
     rows, error = asyncio.run(_run())
     assert rows is None
     assert error.startswith("503")
+
+
+# ── _dispatch_manager_once ────────────────────────────────────────────────
+
+def test_a_malformed_dedup_probe_body_fails_closed_instead_of_raising():
+    """Code-review finding, PR #36: the dedup probe's ``probe.json()`` was
+    unguarded, unlike ``_work_loop_list_runs`` in this same PR which was
+    specifically hardened against exactly this. A malformed 200 here used
+    to escape the whole ``work_loop`` call uncaught, discarding the
+    already-computed work_orders/actions_taken/sections."""
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, text="not json")
+
+    async def _run():
+        async with _client(handler) as c:
+            return await ms._dispatch_manager_once(c, [{"page_id": "p1"}])
+
+    result = asyncio.run(_run())
+    assert "error" in result and "malformed" in result["error"]
+
+
+def test_a_malformed_dispatch_response_body_fails_closed_instead_of_raising():
+    calls = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return httpx.Response(200, json=[])  # dedup probe: no in-flight run
+        return httpx.Response(200, text="not json")  # the dispatch POST itself
+
+    async def _run():
+        async with _client(handler) as c:
+            return await ms._dispatch_manager_once(c, [{"page_id": "p1"}])
+
+    result = asyncio.run(_run())
+    assert "error" in result and "malformed" in result["error"]
+
+
+def test_dispatch_is_skipped_when_a_manager_run_is_already_in_flight():
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=[{"id": "r-live", "source_slug": "manager",
+                                          "status": "running"}])
+
+    async def _run():
+        async with _client(handler) as c:
+            return await ms._dispatch_manager_once(c, [{"page_id": "p1"}])
+
+    result = asyncio.run(_run())
+    assert result == {"skipped": "manager run already in flight", "run_id": "r-live"}
+
+
+def test_dispatch_succeeds_with_a_well_formed_round_trip():
+    calls = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return httpx.Response(200, json=[])  # dedup probe: nothing in flight
+        return httpx.Response(200, json={"run_id": "r-new"})
+
+    async def _run():
+        async with _client(handler) as c:
+            return await ms._dispatch_manager_once(c, [{"page_id": "p1", "reason": "stale"}])
+
+    result = asyncio.run(_run())
+    assert result == {"run_id": "r-new"}
