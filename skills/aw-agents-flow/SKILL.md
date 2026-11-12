@@ -141,6 +141,86 @@ feature. Counts as a valid terminal action; no QA accountability needed.
 Rule of thumb: still needs a human/coder to build it → `mark_as_planned`;
 you also built and verified it → `mark_flow_done`.
 
+## When no `outcome` value matches what you were told to do
+
+Every `mark_flow_done` outcome **advances the card**: `success` and
+`partial` move it to `done`, `failed` moves it to `need_human`. None of them
+expresses "verdict recorded, card stays exactly where it is." So a review
+explicitly scoped to less than the whole card — one phase of a multi-phase
+epic, with other phases still unreviewed — can be handed an instruction that
+no available outcome value can honour.
+
+Recognising that is the skill. Before calling `mark_flow_done` on a review
+scoped to part of a card, check whether your dispatch said not to advance it
+yet. If it did, none of the three values is safe.
+
+What to do instead, in order:
+
+1. **Record the verdict anyway** (`set_qa_status`) — the verdict itself
+   needs to exist regardless. But see the warning below: this is *not* a
+   side-effect-free way to record one.
+2. **If you have a caller, `return_to_caller_agent`** and let them decide
+   what happens to the card. They know the whole epic's state; your
+   sub-review does not.
+3. **If you have no caller, end the turn with a plain text report** rather
+   than forcing a `mark_flow_done` that would prematurely advance the card.
+
+This is a different question from "which outcome mirrors my verdict." That
+one assumes some value fits. This is about noticing when none does.
+
+**`set_qa_status(status="done")` can itself move the card.** Writing a
+`done` QA verdict and moving the card's lane are *not* independent on this
+Kanban integration. Two separate reviews, both explicitly told not to
+advance a card, recorded their verdict this way and moved the card to Done
+as a side effect — the second one found the first had made the identical
+mistake and fixed it the same way. Treat it like `mark_flow_done`:
+
+1. Call `set_qa_status` to record the verdict.
+2. Immediately `get_kanban_card` to see whether the card's own status moved.
+3. If it moved and you were told not to advance, move it back explicitly
+   with `move_kanban_task` to its pre-review status before ending the turn.
+
+Expect this, rather than being surprised by it.
+
+The distinction is not "never call `mark_flow_done` on a sub-review" — a
+later review of the *full* epic, once every phase has actually been
+reviewed, is exactly the right moment to advance it.
+
+## Card binding is not guaranteed on an ad-hoc dispatch
+
+`page_id` on the `aw-kanban` tools, and `mark_flow_done`'s card-move, both
+rely on this run's context carrying the card (`NOTION_TASK_ID` /
+`_aw_context`). On a run genuinely dispatched **from** a card through a flow
+node, that holds and the auto-fill is the right default.
+
+On an **ad-hoc** dispatch — started directly, not from a flow node bound to
+a card — that context may be unpopulated even though a real card exists for
+the change. This app's dispatcher owns populating it, and the gap is a real
+product gap, not intended behaviour. Two symptoms, same root cause:
+
+```
+set_qa_status(status="done")                  # returns page_id: null — verdict never landed
+set_qa_status(status="done", page_id="<id>")  # explicit — this is the one that sticks
+
+mark_flow_done(outcome="success")             # call succeeds, but the card doesn't move
+get_kanban_card(page_id="<id>")               # still sitting un-moved
+move_kanban_task(page_id="<id>", ...)         # explicit fallback — this moves it
+```
+
+So:
+
+- **The moment you have the card's `page_id`** — from `get_kanban_card`,
+  `get_kanban_properties`, or because the dispatch handed it to you — hold
+  onto it and pass it explicitly on **every** card-writing call in the run,
+  rather than trying the bare form and discovering the failure from a null
+  return afterwards.
+- **A null `page_id` in a response does not mean no card exists.** It can
+  equally mean this run's context wasn't wired to one. Check before
+  concluding "no card for this review" and skipping the write.
+- **After any `mark_flow_done` on an ad-hoc dispatch, don't assume success
+  means the card moved.** If you know the `page_id`, confirm with
+  `get_kanban_card` and move it explicitly if it didn't.
+
 ## Stuck and need a human — `ask_human`
 
 Not a 4th terminal action — call mid-turn, then still end with one of the 3

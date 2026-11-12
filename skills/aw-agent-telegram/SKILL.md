@@ -135,6 +135,12 @@ Use `[[MINIAPP]]` only when the user actually benefits from Telegram's
 WebApp shell (auth context, theme integration, etc.) — for a plain
 shareable link, just paste the URL as text.
 
+**Never in a group chat.** Telegram rejects `web_app`-type buttons in
+groups — a permanent platform rule, nothing to do with the bot's
+permissions or this workspace's config. A `[[MINIAPP]]` sent to a group
+silently degrades to plain text and the user never gets a tappable button.
+In a group, paste the URL as text instead, so at least the link works.
+
 ### `[[LOCATION: lat=… lon=… label="…"]]` — native map bubble
 
 ```
