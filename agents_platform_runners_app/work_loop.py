@@ -46,7 +46,6 @@ from . import kanban_dispatch
 
 log = logging.getLogger("aw_apps.agents_platform_runners.work_loop")
 
-ALL_LOOPS = ("deploy", "attention", "ready", "prs", "plans")
 DEFAULT_LOOPS = ("deploy", "attention")
 NOT_IMPLEMENTED_LOOPS = ("prs", "plans")
 
@@ -372,6 +371,7 @@ async def run_work_loop(ctx: WorkLoopContext, loops: "list[str]") -> dict:
     errors: list[dict] = []
     loops_skipped: list[str] = []
     sections: dict[str, Any] = {}
+    attempted = 0
 
     for loop_name in loops:
         if loop_name in NOT_IMPLEMENTED_LOOPS:
@@ -381,6 +381,7 @@ async def run_work_loop(ctx: WorkLoopContext, loops: "list[str]") -> dict:
         if func is None:
             loops_skipped.append(f"{loop_name}: unknown loop")
             continue
+        attempted += 1
         try:
             section, orders, actions = await func(ctx)
         except kanban_dispatch.BoardUnavailable as exc:
@@ -394,8 +395,19 @@ async def run_work_loop(ctx: WorkLoopContext, loops: "list[str]") -> dict:
         work_orders.extend(orders)
         actions_taken.extend(actions)
 
+    # Code-review finding (PR #36, round 1 — left unfixed round 2): hardcoding
+    # ok:True regardless of `errors` made mcp_server.py's `except
+    # BoardUnavailable: return _err(503, ...)` guard around this call dead
+    # code — every loop's own BoardUnavailable is already caught right above,
+    # so it never propagates out for that guard to catch. `ok` is False only
+    # when EVERY loop actually attempted failed (a total outage reported
+    # honestly), never for a partial failure — one bad loop among several
+    # successful ones is still a usable report, same as check_deployed's own
+    # per-card errors not flipping its own `ok` to False.
+    ok = not (attempted > 0 and len(errors) == attempted)
+
     return {
-        "ok": True,
+        "ok": ok,
         "dry_run": ctx.dry_run,
         **sections,
         "work_orders": work_orders,
@@ -405,6 +417,6 @@ async def run_work_loop(ctx: WorkLoopContext, loops: "list[str]") -> dict:
     }
 
 
-__all__ = ["WorkLoopContext", "run_work_loop", "ALL_LOOPS", "DEFAULT_LOOPS",
+__all__ = ["WorkLoopContext", "run_work_loop", "DEFAULT_LOOPS",
            "NOT_IMPLEMENTED_LOOPS", "STALE_RUN_MINUTES", "MAX_RUN_CHECK_PROBES",
            "DEFAULT_ATTENTION_LIMIT", "MIN_ATTENTION_LIMIT", "MAX_ATTENTION_LIMIT"]

@@ -153,6 +153,34 @@ def test_a_dead_loop_does_not_take_down_the_others():
     result = _run(_ctx(ExplodingBoard()), ["deploy", "attention"])
     assert result["errors"] == [{"loop": "deploy", "error": "boom"}]
     assert "attention" in result  # attention still ran despite deploy's crash
+    assert result["ok"] is True, "a PARTIAL failure (one of two loops) is still a usable report"
+
+
+def test_ok_is_false_only_when_every_attempted_loop_failed():
+    """Code-review finding (PR #36, round 1 — left unfixed in round 2):
+    run_work_loop hardcoded ok:True regardless of `errors`, which made
+    mcp_server.py's `except BoardUnavailable: return _err(503, ...)` guard
+    around this call dead code — a total board outage used to come back as
+    ok:true with the errors buried in a list nobody was told to check."""
+    class ExplodingBoard(FakeBoard):
+        def ready_cards(self, status="ready", limit=50):
+            raise kd.BoardUnavailable("board is down")
+
+        def need_attention(self, *, limit=10, reping=True):
+            raise kd.BoardUnavailable("board is down")
+
+    result = _run(_ctx(ExplodingBoard()), ["deploy", "attention"])
+    assert len(result["errors"]) == 2
+    assert result["ok"] is False
+
+
+def test_ok_stays_true_when_only_reserved_loops_were_requested():
+    """Nothing was actually attempted — reserved/unknown loops don't count
+    toward the total-failure check, so this is a no-op report, not a
+    failure."""
+    result = _run(_ctx(FakeBoard()), ["prs", "plans"])
+    assert result["errors"] == []
+    assert result["ok"] is True
 
 
 # ── dry_run totality ─────────────────────────────────────────────────────

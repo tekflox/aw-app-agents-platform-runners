@@ -3268,10 +3268,16 @@ async def _dispatch_tool(name: str, arguments: dict[str, Any] | None) -> list[Te
                 board=_board_client(), list_runs=_list_runs, now=time.time(),
                 dry_run=dry_run, page_id=page_id, limit=limit, max_cards=max_cards,
                 reping=reping, platform=kanban_dispatch.PlatformClient(c, BASE))
-            try:
-                result = await work_loop_mod.run_work_loop(ctx, loops)
-            except kanban_dispatch.BoardUnavailable as exc:
-                return _err(503, f"could not read the Kanban board — {exc}")
+            # run_work_loop never raises BoardUnavailable itself — every loop
+            # catches it internally and reports it in `errors` (code-review
+            # finding, PR #36: a try/except here around this call was dead
+            # code for exactly that reason). `ok` is what actually tells a
+            # total-outage pass (every requested loop failed) from a partial
+            # one — act on THAT instead.
+            result = await work_loop_mod.run_work_loop(ctx, loops)
+            if not result.get("ok"):
+                return _err(503, "work_loop: every requested loop failed — "
+                                 + "; ".join(e.get("error", "") for e in result.get("errors", [])))
 
             if "deploy" in result:
                 await _deploy_followups(c, _board_client(), result["deploy"])
