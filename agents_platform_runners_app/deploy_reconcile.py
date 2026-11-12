@@ -497,19 +497,23 @@ def check_deployed(board: "kanban_dispatch.BoardClient", *, page_id: str | None 
                     mark_invalid_commented(board, pid)
             elif verdict == "unknown":
                 if streak >= UNKNOWN_STREAK_LIMIT and row["status"] != "Need Human":
-                    board.add_comment(
-                        pid, f"🤖 kanban_check_deployed: {streak} consecutive unknown checks — "
-                        "escalating.\n\n" + _evidence(row))
-                    board.move(pid, "need_human")
+                    # move_card() requires a comment for need_human and posts
+                    # it as part of the SAME call — a separate add_comment()
+                    # first would either double-post or (as it did before
+                    # this fix) go through while the comment-less move()
+                    # silently no-ops, since move_card() returns {"ok":
+                    # False, ...} rather than raising.
+                    board.move(pid, "need_human", comment=(
+                        f"🤖 kanban_check_deployed: {streak} consecutive unknown checks — "
+                        "escalating.\n\n" + _evidence(row)))
                     row["action"] = "needs_human"
                     moved_entry = {"previous_status": row["status"], "new_status": "Need Human"}
             elif verdict == "rolled_back":
                 if row["status"] != "Need Human":
-                    board.add_comment(
-                        pid, "🤖 kanban_check_deployed: rollback detected — the observed "
+                    board.move(pid, "need_human", comment=(
+                        "🤖 kanban_check_deployed: rollback detected — the observed "
                         "version dropped below a previously-deployed target.\n\n"
-                        + _evidence(row))
-                    board.move(pid, "need_human")
+                        + _evidence(row)))
                     row["action"] = "needs_human"
                     moved_entry = {"previous_status": row["status"], "new_status": "Need Human"}
             elif verdict == "deployed":

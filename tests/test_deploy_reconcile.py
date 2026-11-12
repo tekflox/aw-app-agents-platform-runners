@@ -93,11 +93,17 @@ class FakeBoard:
         card = self._cards[page_id]
         return dict(card) if not names else {k: card.get(k) for k in names}
 
-    def move(self, page_id, status):
+    def move(self, page_id, status, comment=""):
         if page_id in self._fail_move_with_timeout_for:
             self._fail_move_with_timeout_for.discard(page_id)
             raise TimeoutError("simulated response-level socket timeout")
+        if status == "need_human" and not (comment or "").strip():
+            # Mirrors aw-app-notion's real move_card() guard.
+            raise dr.kanban_dispatch.BoardUnavailable(
+                "status='need_human' requires a comment explaining the problem")
         self.moves.append((page_id, status))
+        if comment:
+            self.comments.append((page_id, comment))
         notion_name = {"done": "Done", "need_human": "Need Human"}.get(status, status)
         self._cards[page_id]["Status"] = notion_name
         return {"ok": True}
@@ -271,6 +277,28 @@ def test_three_consecutive_unknowns_escalate_to_need_human(monkeypatch):
     for _ in range(3):
         dr.check_deployed(board, max_cards=10)
     assert board.moves == [("p1", "need_human")]
+
+
+def test_the_need_human_escalation_carries_its_comment_on_the_move_call(monkeypatch):
+    """Live bug found 2026-11-12 while resuming the reconciliation pass this
+    PR's own fix unblocked: aw-app-notion's move_card() requires a comment
+    for status='need_human' and returns {"ok": False, ...} (not an
+    exception) without one. The OLD code called board.add_comment() THEN
+    board.move(pid, "need_human") with no comment — the comment posted, but
+    every escalation move silently no-opped, while check_deployed() still
+    reported action='needs_human' and a new_status of 'Need Human' as if it
+    had worked. FakeBoard.move() mirrors the real guard (see move() above),
+    so this test would fail the same way against the pre-fix code: it
+    would raise BoardUnavailable from board.move(), get caught by the
+    action-block guard, and board.moves would stay empty."""
+    _patch_observe(monkeypatch, "app", {"workspace": "aw", "observed": None,
+                                        "error": "unreachable"})
+    board = FakeBoard({"p1": _card()})
+    for _ in range(3):
+        result = dr.check_deployed(board, max_cards=10)
+    assert "board_action_failed" not in result["moved"][0]
+    assert board.moves == [("p1", "need_human")]
+    assert board.comments and "escalating" in board.comments[0][1]
 
 
 def test_unknown_streak_clears_on_a_successful_observation(monkeypatch):
