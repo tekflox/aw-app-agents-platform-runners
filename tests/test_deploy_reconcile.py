@@ -65,12 +65,17 @@ def test_compare_service_sha_exact_match_only():
 # ── fake board ────────────────────────────────────────────────────────────
 
 class FakeBoard:
-    def __init__(self, cards: dict[str, dict]):
-        """``cards``: {page_id: {**properties, "status": "..."}}."""
+    def __init__(self, cards: dict[str, dict], fail_comment_for: set[str] | None = None):
+        """``cards``: {page_id: {**properties, "status": "..."}}.
+
+        ``fail_comment_for``: page_ids whose add_comment() raises
+        BoardUnavailable once — for the guard regression tests.
+        """
         self._cards = cards
         self.moves: list[tuple[str, str]] = []
         self.comments: list[tuple[str, str]] = []
         self.writes: list[tuple[str, str, object]] = []
+        self._fail_comment_for = set(fail_comment_for or ())
 
     def ready_cards(self, status="ready", limit=50):
         return [{"page_id": pid, "title": c.get("Name", pid), "status": c["Status"]}
@@ -92,6 +97,9 @@ class FakeBoard:
         return {"ok": True}
 
     def add_comment(self, page_id, text):
+        if page_id in self._fail_comment_for:
+            self._fail_comment_for.discard(page_id)
+            raise dr.kanban_dispatch.BoardUnavailable("simulated Notion 5xx")
         self.comments.append((page_id, text))
         return {"ok": True}
 
@@ -121,6 +129,40 @@ def test_invalid_component_is_skipped_and_commented_once(monkeypatch):
     assert result2["still_waiting"][0]["verdict"] == "invalid"
     assert len(board.comments) == 1
     assert not board.moves
+
+
+def test_a_failed_comment_on_one_card_does_not_abort_the_whole_batch(monkeypatch):
+    """Code-review finding on PR #25: check_deployed()'s verdict branches
+    called board.add_comment()/board.move() with no guard against
+    BoardUnavailable, so one flaky card would propagate out of the whole
+    `for summary in candidates` loop and lose every other card's results."""
+    board = FakeBoard({
+        "p1": _card(DeployComponent="", Name="Bad card 1"),
+        "p2": _card(DeployComponent="", Name="Bad card 2"),
+    }, fail_comment_for={"p1"})
+    result = dr.check_deployed(board, max_cards=10)
+    assert result["ok"] is True
+    assert result["considered"] == 2
+    rows = {r["page_id"]: r for r in result["still_waiting"]}
+    assert rows["p1"]["board_action_failed"]
+    assert "board_action_failed" not in rows["p2"]
+    assert len(board.comments) == 1
+    assert board.comments[0][0] == "p2"
+
+
+def test_a_failed_invalid_comment_retries_next_pass_not_silenced_forever(monkeypatch):
+    """The sharper wrinkle the same finding named: invalid_commented used to
+    be stamped True BEFORE the comment was attempted, so a failed comment
+    was silenced forever. It must now retry."""
+    board = FakeBoard({"p1": _card(DeployComponent="", Name="Bad card")},
+                      fail_comment_for={"p1"})
+    result1 = dr.check_deployed(board, max_cards=10)
+    assert result1["still_waiting"][0]["board_action_failed"]
+    assert not board.comments
+
+    result2 = dr.check_deployed(board, max_cards=10)
+    assert "board_action_failed" not in result2["still_waiting"][0]
+    assert len(board.comments) == 1
 
 
 def test_deployed_with_qa_done_moves_straight_to_done(monkeypatch):

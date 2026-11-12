@@ -325,7 +325,12 @@ def _evaluate_card(board: "kanban_dispatch.BoardClient", summary: dict) -> dict:
         row.update(eligible=False, verdict="invalid", action="none", reasons=reasons,
                    observations=[])
         row["already_reported"] = bool(prior.get("invalid_commented"))
-        row["_stamp"] = {"verdict": "invalid", "invalid_commented": True,
+        # Carry forward, don't preset True: this stamp is written BEFORE the
+        # comment is attempted (see check_deployed), so presetting True here
+        # would permanently mark "commented" even if the comment call itself
+        # then fails — mark_invalid_commented() flips it, only after a
+        # confirmed success.
+        row["_stamp"] = {"verdict": "invalid", "invalid_commented": row["already_reported"],
                          "unknown_streak": 0}
         return row
 
@@ -381,19 +386,35 @@ def _stamp(board: "kanban_dispatch.BoardClient", page_id: str, stamp: dict) -> N
                        _dt.datetime.now(_dt.timezone.utc).strftime("%Y-%m-%d"))
 
 
-def mark_qa_dispatched(board: "kanban_dispatch.BoardClient", page_id: str) -> None:
-    """Record that a QA dispatch for this card's current `deployed` verdict
-    actually succeeded — called by the caller that owns the platform POST
-    (mcp_server.py), only on a 200. Read-modify-write on DeployCheckResult so
-    a failed dispatch leaves `qa_dispatched` false and the NEXT
-    `check_deployed()` pass tries again (see `qa_dispatch_needed` above)."""
+def _mark_stamp_field(board: "kanban_dispatch.BoardClient", page_id: str, field: str,
+                      value: Any) -> None:
+    """Read-modify-write a single field on DeployCheckResult, only after the
+    caller has confirmed the thing it describes actually succeeded — so a
+    failure leaves the field unset and the NEXT `check_deployed()` pass
+    retries, instead of a pre-set flag silently and permanently skipping it."""
     current = board.properties(page_id, ["DeployCheckResult"]).get("DeployCheckResult") or ""
     try:
         stamp = json.loads(current) if current else {}
     except ValueError:
         stamp = {}
-    stamp["qa_dispatched"] = True
+    stamp[field] = value
     board.set_property(page_id, "DeployCheckResult", json.dumps(stamp))
+
+
+def mark_qa_dispatched(board: "kanban_dispatch.BoardClient", page_id: str) -> None:
+    """Record that a QA dispatch for this card's current `deployed` verdict
+    actually succeeded — called by the caller that owns the platform POST
+    (mcp_server.py), only on a 200. See `qa_dispatch_needed` above."""
+    _mark_stamp_field(board, page_id, "qa_dispatched", True)
+
+
+def mark_invalid_commented(board: "kanban_dispatch.BoardClient", page_id: str) -> None:
+    """Record that the one-time 'invalid' comment for this card actually
+    posted — called only after a confirmed success, so a failed post retries
+    next pass instead of _evaluate_card's `already_reported` permanently
+    silencing it (the stamp used to be written unconditionally before the
+    comment was even attempted)."""
+    _mark_stamp_field(board, page_id, "invalid_commented", True)
 
 
 def _evidence(row: dict) -> str:
@@ -458,44 +479,57 @@ def check_deployed(board: "kanban_dispatch.BoardClient", *, page_id: str | None 
         verdict = row["verdict"]
         moved_entry = None
 
-        if dry_run:
-            pass
-        elif verdict == "invalid":
-            if not row.pop("already_reported", False):
-                board.add_comment(pid, "🤖 kanban_check_deployed: invalid — " + "; ".join(
-                    row.get("reasons", [])))
-        elif verdict == "unknown":
-            if streak >= UNKNOWN_STREAK_LIMIT and row["status"] != "Need Human":
-                board.add_comment(
-                    pid, f"🤖 kanban_check_deployed: {streak} consecutive unknown checks — "
-                    "escalating.\n\n" + _evidence(row))
-                board.move(pid, "need_human")
-                row["action"] = "needs_human"
-                moved_entry = {"previous_status": row["status"], "new_status": "Need Human"}
-        elif verdict == "rolled_back":
-            if row["status"] != "Need Human":
-                board.add_comment(
-                    pid, "🤖 kanban_check_deployed: rollback detected — the observed version "
-                    "dropped below a previously-deployed target.\n\n" + _evidence(row))
-                board.move(pid, "need_human")
-                row["action"] = "needs_human"
-                moved_entry = {"previous_status": row["status"], "new_status": "Need Human"}
-        elif verdict == "deployed":
-            if qa_status.strip().lower() == "done":
-                if row["status"] != "Done":
-                    board.add_comment(pid, "🤖 kanban_check_deployed: deployed, QA already "
-                                     "done — moving to Done.\n\n" + _evidence(row))
-                    board.move(pid, "done")
-                    row["action"] = "moved_done"
-                    moved_entry = {"previous_status": row["status"], "new_status": "Done"}
-            else:
-                if row["status"] != "Testing":
-                    board.add_comment(pid, "🤖 kanban_check_deployed: deployed — moving to "
-                                     "Testing for post-deployment QA.\n\n" + _evidence(row))
-                    board.move(pid, "Testing")
-                    row["action"] = "moved_testing"
-                    moved_entry = {"previous_status": row["status"], "new_status": "Testing"}
-        # pending / partial: stays put, action stays "none"
+        # Guarded per card, same as _evaluate_card/_stamp above: a transient
+        # BoardUnavailable (Notion 5xx/timeout) on one card's comment/move
+        # must not propagate out of this loop and collapse the whole pass's
+        # already-computed moved/still_waiting/counts into a single error —
+        # code-review finding on PR #25. Caught, recorded on the row, and
+        # this card simply retries next pass (nothing it already stamped
+        # above gates that retry — see mark_invalid_commented/
+        # mark_qa_dispatched, both written only on confirmed success).
+        try:
+            if dry_run:
+                pass
+            elif verdict == "invalid":
+                if not row.pop("already_reported", False):
+                    board.add_comment(pid, "🤖 kanban_check_deployed: invalid — " + "; ".join(
+                        row.get("reasons", [])))
+                    mark_invalid_commented(board, pid)
+            elif verdict == "unknown":
+                if streak >= UNKNOWN_STREAK_LIMIT and row["status"] != "Need Human":
+                    board.add_comment(
+                        pid, f"🤖 kanban_check_deployed: {streak} consecutive unknown checks — "
+                        "escalating.\n\n" + _evidence(row))
+                    board.move(pid, "need_human")
+                    row["action"] = "needs_human"
+                    moved_entry = {"previous_status": row["status"], "new_status": "Need Human"}
+            elif verdict == "rolled_back":
+                if row["status"] != "Need Human":
+                    board.add_comment(
+                        pid, "🤖 kanban_check_deployed: rollback detected — the observed "
+                        "version dropped below a previously-deployed target.\n\n"
+                        + _evidence(row))
+                    board.move(pid, "need_human")
+                    row["action"] = "needs_human"
+                    moved_entry = {"previous_status": row["status"], "new_status": "Need Human"}
+            elif verdict == "deployed":
+                if qa_status.strip().lower() == "done":
+                    if row["status"] != "Done":
+                        board.add_comment(pid, "🤖 kanban_check_deployed: deployed, QA already "
+                                         "done — moving to Done.\n\n" + _evidence(row))
+                        board.move(pid, "done")
+                        row["action"] = "moved_done"
+                        moved_entry = {"previous_status": row["status"], "new_status": "Done"}
+                else:
+                    if row["status"] != "Testing":
+                        board.add_comment(pid, "🤖 kanban_check_deployed: deployed — moving to "
+                                         "Testing for post-deployment QA.\n\n" + _evidence(row))
+                        board.move(pid, "Testing")
+                        row["action"] = "moved_testing"
+                        moved_entry = {"previous_status": row["status"], "new_status": "Testing"}
+            # pending / partial: stays put, action stays "none"
+        except kanban_dispatch.BoardUnavailable as exc:
+            row["board_action_failed"] = str(exc)
 
         if moved_entry:
             moved.append({**row, **moved_entry})
