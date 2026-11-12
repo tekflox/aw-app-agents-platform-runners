@@ -99,6 +99,7 @@ def _agents_base_transport() -> httpx.AsyncHTTPTransport:
 # lazily-ish (module-level is fine; it is stdlib-only) so this file keeps its
 # "no third-party imports" property.
 from . import kanban_dispatch  # noqa: E402
+from . import deploy_reconcile  # noqa: E402
 from . import platform_base  # noqa: E402
 
 # The Agents Platform image gallery. Same split as kanban_dispatch above and
@@ -809,6 +810,43 @@ async def _list_tools() -> list[Tool]:
                                         "description": "Max cards to consider in one sweep."},
                               "dry_run": {"type": "boolean", "default": False,
                                           "description": "Report what WOULD be dispatched without moving any card or firing anything. Do this first on a board you haven't swept before."},
+                          },
+                          "required": []}),
+        Tool(name="kanban_check_deployed",
+             description=("Deterministic Ready-to-Deploy/Testing reconciliation (architect "
+                          "decision, Kanban 4165bf3b-9510-8162-89d0-dca46ba66481). Reads each "
+                          "card's DeployComponent/DeployWorkspaces/DeployToVersion/DeployEnv, "
+                          "asks the LIVE component what version it's actually running "
+                          "(never CI green, never the marketplace catalog, never a git tag), "
+                          "and moves the card ONLY on a verdict transition — re-running this "
+                          "N times is N-1 no-ops.\n\n"
+                          "Verdict per card: deployed (all named workspaces >= target) -> "
+                          "Done if QAStatus=='done', else Testing + a qa-sonnet dispatch with "
+                          "qa_rerun=true; pending/partial -> stays put; unknown (can't "
+                          "observe, e.g. unreachable or non-semver) -> NEVER moves the card, "
+                          "3 consecutive unknowns escalate to Need Human; rolled_back "
+                          "(observed version dropped below a previously-deployed target) -> "
+                          "Need Human; invalid (empty/malformed DeployComponent or "
+                          "DeployToVersion) -> skipped, commented once.\n\n"
+                          "Returns the COMPLETE lane picture every call, not just actions "
+                          "taken this pass: every card moved (previous/new status + "
+                          "evidence), every card still waiting (verdict/reason + live "
+                          "observations), summary counts, explicit errors, and — if the "
+                          "lane has more cards than max_cards — an explicit truncated flag "
+                          "plus a continuation hint (re-invoke with a higher max_cards).\n\n"
+                          "Known gaps: service:<name> components have no live observation "
+                          "adapter in this runtime yet (always 'unknown'); a DeployWorkspaces "
+                          "entry naming a workspace other than this app's own is also always "
+                          "'unknown' — every credential this app holds is scoped to one "
+                          "workspace. Both fail closed (never move a card), not guessed."),
+             inputSchema={"type": "object",
+                          "properties": {
+                              "page_id": {"type": "string",
+                                         "description": "Check exactly this one card instead of scanning the lane."},
+                              "dry_run": {"type": "boolean", "default": False,
+                                          "description": "Report verdicts/observations without moving any card, commenting, stamping, or dispatching QA."},
+                              "max_cards": {"type": "integer", "default": 25,
+                                           "description": "Max cards to consider per status when scanning the lane (ignored when page_id is given). Response's `truncated` flag tells you if the lane has more."},
                           },
                           "required": []}),
         Tool(name="invoke_kanban_agent",
@@ -2967,6 +3005,50 @@ async def _dispatch_tool(name: str, arguments: dict[str, Any] | None) -> list[Te
                     dry_run=bool(args.get("dry_run")))
             except kanban_dispatch.BoardUnavailable as exc:
                 return _err(503, f"could not read the Kanban board — {exc}")
+            return _ok(result)
+
+        if name == "kanban_check_deployed":
+            try:
+                result = await asyncio.to_thread(
+                    deploy_reconcile.check_deployed, _board_client(),
+                    page_id=(args.get("page_id") or "").strip() or None,
+                    dry_run=bool(args.get("dry_run")),
+                    max_cards=int(args.get("max_cards") or deploy_reconcile.DEFAULT_MAX_CARDS))
+            except kanban_dispatch.BoardUnavailable as exc:
+                return _err(503, f"could not read the Kanban board — {exc}")
+            # QA dispatch is a platform call, not a board one — kept out of
+            # deploy_reconcile.py the same way kanban_dispatch.sweep_ready
+            # leaves platform dispatch to its caller's PlatformClient.
+            #
+            # Scan BOTH moved and still_waiting, not just this pass's
+            # moved_testing rows: `qa_dispatch_needed` is independent of the
+            # move-on-transition guard specifically so a card already
+            # sitting in Testing from a PRIOR pass whose dispatch failed
+            # gets retried here too (code-review finding on PR #23 — the
+            # original version only tried once, on the move itself, and a
+            # failed POST stranded the card in Testing forever).
+            if not result.get("dry_run"):
+                candidates = result.get("moved", []) + result.get("still_waiting", [])
+                for row in candidates:
+                    if not row.get("qa_dispatch_needed"):
+                        continue
+                    body = {"input": {"input": (
+                                "Post-deployment QA — kanban_check_deployed verified "
+                                f"{row.get('component')} reached {row.get('to_version')} "
+                                "live. Verify the shipped change against the card.")},
+                            "target_slug": row.get("target_slug") or kanban_dispatch.DEFAULT_TARGET_SLUG,
+                            "notion_task_id": row["page_id"], "qa_rerun": True,
+                            "workspace": _own_workspace()}
+                    try:
+                        qr = await c.post(f"{BASE}/api/agents/qa-sonnet/run", json=body)
+                        if qr.status_code == 200:
+                            row["qa_dispatch"] = {"run_id": qr.json().get("run_id")}
+                            await asyncio.to_thread(deploy_reconcile.mark_qa_dispatched,
+                                                    _board_client(), row["page_id"])
+                        else:
+                            row["qa_dispatch"] = {"error": f"{qr.status_code} {qr.text[:200]}"}
+                    except Exception as exc:
+                        row["qa_dispatch"] = {"error": str(exc)}
             return _ok(result)
 
         if name == "invoke_kanban_agent":

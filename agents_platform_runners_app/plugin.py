@@ -175,6 +175,16 @@ def build_mcp_servers(config: dict) -> dict:
                 "AGENTS_PLATFORM_TOKEN": str(token),
                 "AW_WORKSPACE_API_URL": _workspace_env("AW_WORKSPACE_API_URL"),
                 "AW_WORKSPACE_API_KEY": _workspace_env("AW_WORKSPACE_API_KEY"),
+                # kanban_check_deployed's core/remote-host adapters (deploy_reconcile.py)
+                # need aw-backend directly, not AP-MT — same "nothing from the
+                # workspace server's environment reaches this stdio child" reason
+                # as the four values above. AGENTS_PLATFORM_TOKEN doubles as the
+                # Bearer here: it's an aw-backend-issued central identity JWT
+                # (identity_token.py mints it via aw-backend's own
+                # /identity-token), so it validates against aw-backend's
+                # require_identity the same as it does against AP-MT.
+                "AW_BACKEND_URL": _workspace_env("AW_BACKEND_URL"),
+                "AW_WORKSPACE": _workspace_env("AW_WORKSPACE"),
                 # Where that child should export OTLP (mcp_otel.py). Resolved
                 # from core's Observability setting, omitted entirely when
                 # there is nothing to export to — see otel_env.py. This is
