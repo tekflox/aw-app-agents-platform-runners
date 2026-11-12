@@ -701,3 +701,80 @@ def test_none_sentinel_qa_dispatch_flag_survives_until_marked(monkeypatch):
     dr.mark_qa_dispatched(board, "p1")
     result = dr.check_deployed(board, max_cards=10)
     assert result["still_waiting"][0]["qa_dispatch_needed"] is False
+
+
+# ── is_live=true override (card 4165bf3b-9510-81ea, 2026-11-12 comment) ─
+
+def test_is_live_true_moves_a_need_human_card_directly_to_done(monkeypatch):
+    """The deterministic cleanup rule Frederico added to the card: if the
+    reconciler inspects a card and is_live is true, it moves to Done no
+    matter what QAStatus or Status says — Need Human included. Reached via
+    page_id (as check_deployed already supports for exactly-this-card
+    checks) since Need Human is not in DEPLOY_STATUSES' own sweep."""
+    board = FakeBoard({"p1": _card(Status="Need Human", QAStatus="", is_live=True,
+                                   DeployComponent="", DeployToVersion="")})
+    result = dr.check_deployed(board, page_id="p1")
+    assert result["moved"][0]["verdict"] == "live_confirmed"
+    assert result["moved"][0]["action"] == "moved_done"
+    assert board.moves == [("p1", "done")]
+
+
+def test_is_live_true_overrides_a_not_done_qa_status_in_the_normal_sweep(monkeypatch):
+    """Same override, reached through the ordinary Ready to Deploy/Testing
+    sweep this time — QAStatus is deliberately not 'done', which would
+    otherwise route to Testing, not Done."""
+    board = FakeBoard({"p1": _card(Status="Testing", QAStatus="in_progress", is_live=True)})
+    result = dr.check_deployed(board, max_cards=10)
+    assert result["moved"][0]["verdict"] == "live_confirmed"
+    assert result["moved"][0]["action"] == "moved_done"
+    assert board.moves == [("p1", "done")]
+
+
+def test_is_live_true_skips_validation_entirely(monkeypatch):
+    """Bypasses _validate() — a stale/cleanup card may have no valid
+    DeployComponent/DeployToVersion left on it at all; that must not turn
+    into an 'invalid' verdict instead of the override."""
+    board = FakeBoard({"p1": _card(Status="Ready to Deploy", DeployComponent="",
+                                   DeployToVersion="", is_live=True)})
+    result = dr.check_deployed(board, max_cards=10)
+    assert result["moved"][0]["verdict"] == "live_confirmed"
+    assert not board.comments[0][1].startswith("🤖 kanban_check_deployed: invalid")
+
+
+def test_is_live_true_already_done_is_an_idempotent_noop(monkeypatch):
+    """Re-running on a card already moved to Done must not re-comment or
+    re-move it — same idempotency contract as every other verdict branch."""
+    board = FakeBoard({"p1": _card(Status="Done", is_live=True)})
+    result = dr.check_deployed(board, page_id="p1")
+    assert result["still_waiting"][0]["verdict"] == "live_confirmed"
+    assert result["still_waiting"][0]["action"] == "none"
+    assert not board.moves
+    assert not board.comments
+
+
+def test_is_live_true_rerun_after_moving_is_also_a_noop(monkeypatch):
+    """Two consecutive check_deployed() passes over the same is_live card:
+    the first moves it to Done, so the second sweep (scoped to Ready to
+    Deploy/Testing, same as every other verdict) no longer even considers
+    it — and a direct page_id re-check confirms no further action."""
+    board = FakeBoard({"p1": _card(Status="Testing", QAStatus="", is_live=True)})
+    dr.check_deployed(board, max_cards=10)
+    assert board.moves == [("p1", "done")]
+    result2 = dr.check_deployed(board, max_cards=10)
+    assert result2["considered"] == 0, "card left both lanes once moved to Done"
+    result3 = dr.check_deployed(board, page_id="p1")
+    assert result3["still_waiting"][0]["action"] == "none"
+    assert board.moves == [("p1", "done")], "no second move"
+    assert len(board.comments) == 1, "no second comment"
+
+
+def test_is_live_false_or_missing_does_not_short_circuit(monkeypatch):
+    """Sanity check the override is opt-in, not the new default path: a
+    card with no is_live set (or explicitly False) still runs the normal
+    validate/observe pipeline."""
+    _patch_observe(monkeypatch, "app", {"workspace": "aw", "observed": "v0.34.0", "error": None})
+    board = FakeBoard({"p1": _card(is_live=False), "p2": _card()})
+    result = dr.check_deployed(board, max_cards=10)
+    verdicts = {r["page_id"]: r["verdict"] for r in result["still_waiting"]}
+    assert verdicts["p1"] == "pending"
+    assert verdicts["p2"] == "pending"
