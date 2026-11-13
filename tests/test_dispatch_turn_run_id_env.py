@@ -75,3 +75,38 @@ def test_turn_env_still_includes_notion_task_id_and_source_device():
     script = container.exec_run.call_args[0][0][2]
     assert "export NOTION_TASK_ID='task-42'" in script or "task-42" in script
     assert "export AW_SOURCE_DEVICE='telegram'" in script or "telegram" in script
+
+
+def test_turn_env_includes_aw_parent_run_id_when_present():
+    client, container = _fake_client_and_container()
+
+    warm_pool.dispatch_turn(
+        client=client, name="aw-warm-agent-session", run_id="r1",
+        prompt="hi", cli="codex", notion_task_id="task-42", source_device="telegram",
+        parent_run_id="parent-run-1",
+    )
+
+    script = container.exec_run.call_args[0][0][2]
+    parent_line = next(
+        line for line in script.splitlines() if "export AW_PARENT_RUN_ID=" in line
+    )
+    assert "parent-run-1" in parent_line
+
+
+def test_turn_env_exports_empty_aw_parent_run_id_when_absent():
+    client, container = _fake_client_and_container()
+
+    warm_pool.dispatch_turn(
+        client=client, name="aw-warm-agent-session", run_id="r1",
+        prompt="hi", cli="codex", notion_task_id="task-42", source_device="telegram",
+    )
+
+    script = container.exec_run.call_args[0][0][2]
+    parent_line = next(
+        line for line in script.splitlines() if "export AW_PARENT_RUN_ID=" in line
+    )
+    # The whole turn_env block is itself shell-quoted as one `printf` argument,
+    # so an empty value's quoting is doubled (shlex.quote(shlex.quote(''))) —
+    # assert there's no real id text, not an exact quoted-empty-string match.
+    assert "export AW_PARENT_RUN_ID=" in parent_line
+    assert "parent-run" not in parent_line

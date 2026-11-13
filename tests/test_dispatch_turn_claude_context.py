@@ -71,6 +71,35 @@ def test_claude_turn_carries_this_turns_notion_task_id():
     assert content.endswith("do the thing")
 
 
+def test_claude_header_carries_aw_parent_run_id_when_present():
+    client, _container, sock = _fake_client_and_container()
+
+    warm_pool.dispatch_turn(
+        client=client, name="aw-warm-claude-session", run_id="turn-2-run-id",
+        prompt="do the thing", cli="claude",
+        notion_task_id="task-turn-2", source_device="telegram",
+        parent_run_id="parent-run-1",
+    )
+
+    content = _sent_content(sock)
+    assert "AW_PARENT_RUN_ID=parent-run-1" in content
+
+
+def test_claude_header_omits_aw_parent_run_id_field_when_absent():
+    """Conditional append only — an absent parent_run_id must not grow every
+    root run's prompt header with an empty/noise field."""
+    client, _container, sock = _fake_client_and_container()
+
+    warm_pool.dispatch_turn(
+        client=client, name="aw-warm-claude-session", run_id="turn-2-run-id",
+        prompt="do the thing", cli="claude",
+        notion_task_id="task-turn-2", source_device="telegram",
+    )
+
+    content = _sent_content(sock)
+    assert "AW_PARENT_RUN_ID" not in content
+
+
 def test_different_turns_of_the_same_session_carry_their_own_values():
     """The exact staleness scenario: turn 1 creates the container with one
     card, turn 2 of the SAME session dispatches with a different (or no)
@@ -154,6 +183,7 @@ def test_a_raw_turn_reaches_the_container_at_position_zero():
         client=client, name="aw-warm-claude-session", run_id="compact-run",
         prompt="/compact", cli="claude",
         notion_task_id="task-1", source_device="telegram", raw_prompt=True,
+        parent_run_id="parent-run-1",
     )
 
     content = _sent_content(sock)
@@ -163,6 +193,7 @@ def test_a_raw_turn_reaches_the_container_at_position_zero():
     )
     assert "[SYSTEM]" not in content
     assert "Execution context for this turn" not in content
+    assert "AW_PARENT_RUN_ID" not in content
 
 
 def test_a_raw_clear_is_not_reframed_either():

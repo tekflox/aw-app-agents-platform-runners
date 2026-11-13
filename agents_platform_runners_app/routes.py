@@ -781,6 +781,7 @@ def build_routes(config: dict | None = None, *, kanban_sweep_status: dict | None
             "notion_task_id": body.get("notion_task_id"),
             "source_device": body.get("source_device"),
             "agent_slug": body.get("agent_slug"),
+            "parent_run_id": body.get("parent_run_id"),
             # This turn is a bare CLI slash command ("/compact") and must reach
             # the container at position 0 — the warm path's own per-turn
             # context header would displace it. See
