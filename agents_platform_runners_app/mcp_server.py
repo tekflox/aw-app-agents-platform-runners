@@ -4523,13 +4523,30 @@ async def _async_main() -> None:
 
     async def _writer() -> None:
         # The only coroutine that ever touches sys.stdout for a response —
-        # that exclusivity IS the serialization; no lock needed on this side.
+        # that exclusivity IS the serialization; no lock needed on this
+        # side. A write/flush failure (e.g. a broken pipe if the gateway
+        # closes/respawns this child while stdin is still readable) is
+        # deliberately NOT swallowed (code-review finding, PR #50):
+        # catching and continuing here would leave every future response
+        # queued into `write_queue` forever with nothing draining it —
+        # unbounded memory growth and total silent response loss for every
+        # caller, a quieter, whole-process version of the exact
+        # head-of-line-blocking failure this PR exists to fix. Logging then
+        # re-raising instead lets the exception propagate out of this task;
+        # the read loop below races stdin against this task specifically so
+        # it notices and re-raises too, crashing the whole process so
+        # aw-mcp-gateway respawns a fresh child with a working stdout.
         while True:
             item = await write_queue.get()
             if item is None:
                 break
-            sys.stdout.write(item)
-            sys.stdout.flush()
+            try:
+                sys.stdout.write(item)
+                sys.stdout.flush()
+            except Exception:
+                log.exception("mcp writer: sys.stdout write failed — crashing so the "
+                              "gateway respawns this child")
+                raise
 
     async def _handle_one(request: dict) -> None:
         nonlocal in_flight
@@ -4537,18 +4554,31 @@ async def _async_main() -> None:
         req_id = request.get("id")
         tool_name: str | None = None
         caller_run_id: str | None = None
-        if method == "tools/call":
-            params = request.get("params") or {}
-            tool_name = params.get("name")
-            caller_run_id = _caller_run_id(params.get("arguments") or {})
 
         async with semaphore:
             in_flight += 1
-            if tool_name:
-                log.info("tools/call start name=%s caller_run_id=%s in_flight=%d",
-                          tool_name, caller_run_id, in_flight)
             start = time.monotonic()
+            response: dict | None = None
             try:
+                # Extracting tool_name/caller_run_id lives INSIDE this
+                # try — code-review finding, PR #50: a `tools/call` whose
+                # `params` isn't a dict (e.g. a JSON array) or whose
+                # `arguments` is a non-dict truthy value used to raise
+                # OUTSIDE the guarded block below, dying with no response
+                # ever written for that request's id and no `log.exception`
+                # either — the caller would silently hang exactly like the
+                # head-of-line-blocking bug this PR fixes, just scoped to
+                # one bad request instead of the whole process.
+                if method == "tools/call":
+                    params = request.get("params")
+                    if isinstance(params, dict):
+                        tool_name = params.get("name")
+                        arguments = params.get("arguments")
+                        caller_run_id = _caller_run_id(
+                            arguments if isinstance(arguments, dict) else {})
+                if tool_name:
+                    log.info("tools/call start name=%s caller_run_id=%s in_flight=%d",
+                              tool_name, caller_run_id, in_flight)
                 response = await handle_request(request)
             except Exception as exc:  # noqa: BLE001 — one task's bug must not
                 # strand its own caller forever (no reply ever written for
@@ -4557,7 +4587,8 @@ async def _async_main() -> None:
                 # the way the old sequential loop's own crash-and-respawn
                 # did. `handle_request`'s "tools/call" branch already
                 # catches tool-handler exceptions itself; this is the
-                # backstop for anything else (tools/list, a future method).
+                # backstop for anything else (tools/list, a future method,
+                # or the malformed-request shapes described above).
                 log.exception("mcp request crashed: method=%s id=%s", method, req_id)
                 response = ({"jsonrpc": "2.0", "id": req_id,
                             "error": {"code": -32603, "message": f"{type(exc).__name__}: {exc}"}}
@@ -4575,7 +4606,23 @@ async def _async_main() -> None:
     writer_task = asyncio.create_task(_writer())
     try:
         while True:
-            line = await loop.run_in_executor(None, sys.stdin.readline)
+            # Races the blocking stdin read against the writer task
+            # (code-review finding, PR #50) rather than just reading in a
+            # tight loop: if `_writer` dies (see its own docstring above),
+            # this notices as soon as it happens — not whenever the NEXT
+            # stdin line happens to arrive, which could be an arbitrary
+            # delay — and re-raises immediately instead of continuing to
+            # accept requests into a `write_queue` nothing drains.
+            read_future = loop.run_in_executor(None, sys.stdin.readline)
+            done, _pending = await asyncio.wait(
+                {read_future, writer_task}, return_when=asyncio.FIRST_COMPLETED)
+            if writer_task in done:
+                read_future.cancel()
+                exc = writer_task.exception()
+                if exc is not None:
+                    raise exc
+                raise RuntimeError("mcp_server: writer task exited unexpectedly")
+            line = read_future.result()
             if not line:
                 break
             line = line.strip()
@@ -4592,7 +4639,19 @@ async def _async_main() -> None:
         pending = list(tasks)
         if pending:
             await asyncio.gather(*pending, return_exceptions=True)
-        await write_queue.put(None)
+        # Always resolve `writer_task`, never just "if it isn't done yet" —
+        # the write failure this whole function races against can land
+        # during THIS drain too (a handler queued its response, then the
+        # writer failed writing it, while we were still gathering `tasks`
+        # above). Checking `.done()` first and skipping the await when it's
+        # already True would retrieve nothing, leaving that exception to
+        # vanish as an unretrieved-task-exception log line instead of
+        # propagating — exactly the silent-loss failure mode this whole
+        # supervision exists to prevent. `await`ing an already-finished
+        # task is a no-op (or re-raises) either way, so there is no reason
+        # to special-case it.
+        if not writer_task.done():
+            await write_queue.put(None)
         await writer_task
 
 

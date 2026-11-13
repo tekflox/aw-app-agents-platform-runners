@@ -23,6 +23,14 @@ isolation the design relies on:
     running tasks — pins the asyncio invariant (a `contextvars.ContextVar`
     is copied per-`Task`, so one task's span never becomes "current" inside
     a sibling task) that makes this safe without any change to mcp_otel.py.
+(d) a malformed `tools/call` (non-dict `params`/`arguments`) gets a real
+    JSON-RPC error response instead of silently dying before `handle_request`
+    is even reached — code-review finding, PR #50: the `tool_name`/
+    `caller_run_id` extraction used to sit OUTSIDE `_handle_one`'s try/except.
+(e) a `sys.stdout.write` failure inside the dedicated writer task crashes
+    `_async_main` (so aw-mcp-gateway respawns a fresh child) instead of
+    being swallowed while `write_queue` grows forever with nothing draining
+    it — the other code-review finding, PR #50.
 
 Run: python3 -m pytest tests/test_mcp_server_concurrent_dispatch.py
 (or, per this repo's test-venv skill: /usr/bin/python3.12 -m pytest ...)
@@ -34,6 +42,8 @@ import contextvars
 import json
 import sys
 from pathlib import Path
+
+import pytest
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
@@ -195,3 +205,78 @@ def test_tool_span_context_does_not_leak_across_concurrent_tasks(monkeypatch):
 
     assert seen["alpha"] == "mcp.tool/alpha"
     assert seen["beta"] == "mcp.tool/beta"
+
+
+# ── (d) malformed tools/call shapes get an error reply, not a silent hang ──
+# Code-review finding, PR #50: `tool_name`/`caller_run_id` extraction used to
+# sit OUTSIDE `_handle_one`'s try/except (and, deeper in, `handle_request`'s
+# own `params.get("name")` assumed `params` is always a dict too) — a
+# malformed request died with no response ever written for its id, and the
+# caller would hang exactly like the head-of-line-blocking bug this whole PR
+# fixes, just scoped to one request instead of the whole process.
+
+def test_tools_call_with_non_dict_params_gets_an_error_and_does_not_block_a_good_request(monkeypatch):
+    calls = {"n": 0}
+
+    async def fake_dispatch_tool(name, arguments):
+        calls["n"] += 1
+        return [ms.TextContent(type="text", text="ok")]
+
+    monkeypatch.setattr(ms, "_dispatch_tool", fake_dispatch_tool)
+
+    bad_request = {"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                   "params": ["not", "a", "dict"]}
+    lines = [json.dumps(bad_request), json.dumps(_tool_call(2, "ok"))]
+
+    out = asyncio.run(_drive(monkeypatch, lines))
+
+    responses = {json.loads(w)["id"]: json.loads(w) for w in out.writes}
+    assert set(responses) == {1, 2}
+    assert "error" in responses[1] and responses[1]["error"]["code"] == -32603
+    assert "result" in responses[2]
+    assert calls["n"] == 1  # only the well-formed request actually dispatched
+
+
+def test_tools_call_with_non_dict_arguments_does_not_crash_before_dispatch(monkeypatch):
+    async def fake_dispatch_tool(name, arguments):
+        return [ms.TextContent(type="text", text="ok")]
+
+    monkeypatch.setattr(ms, "_dispatch_tool", fake_dispatch_tool)
+
+    bad_request = {"jsonrpc": "2.0", "id": 9, "method": "tools/call",
+                   "params": {"name": "whatever", "arguments": "not-a-dict-string"}}
+    out = asyncio.run(_drive(monkeypatch, [json.dumps(bad_request)]))
+
+    assert len(out.writes) == 1
+    response = json.loads(out.writes[0])
+    assert response["id"] == 9
+
+
+# ── (e) a writer failure crashes the process instead of being swallowed ───
+# The other code-review finding, PR #50: nothing supervised the dedicated
+# writer task. A `sys.stdout.write` failure (e.g. a broken pipe) used to die
+# silently while the main loop kept accepting requests into a `write_queue`
+# nothing drains — total silent response loss with no crash/restart signal.
+# This must instead propagate out of `_async_main` so the process exits and
+# aw-mcp-gateway respawns a healthy child.
+
+class _FailingStdout:
+    def write(self, _s: str) -> None:
+        raise OSError("simulated broken pipe")
+
+    def flush(self) -> None:
+        pass
+
+
+def test_a_broken_stdout_crashes_async_main_instead_of_being_swallowed(monkeypatch):
+    async def fake_dispatch_tool(name, arguments):
+        return [ms.TextContent(type="text", text="ok")]
+
+    monkeypatch.setattr(ms, "_dispatch_tool", fake_dispatch_tool)
+
+    fake_in = _FakeStdin([json.dumps(_tool_call(1, "x"))])
+    monkeypatch.setattr(sys, "stdin", fake_in)
+    monkeypatch.setattr(sys, "stdout", _FailingStdout())
+
+    with pytest.raises(OSError, match="simulated broken pipe"):
+        asyncio.run(ms._async_main())

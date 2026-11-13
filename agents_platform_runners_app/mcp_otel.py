@@ -192,7 +192,14 @@ def tool_span(name: str, caller_run_id: str | None = None):
     fails, so it's the only place that can log with the matching trace
     context. ``handle_request``'s own catch-all turns the exception into a
     tool-error response same as before; this only adds the log line it was
-    missing (``mcp_server.py`` imports ``logging`` nowhere at all).
+    missing.
+
+    (Historical note, card 4175bf3b-9510-811f: at the time this was
+    written, ``mcp_server.py`` imported ``logging`` nowhere at all, so this
+    module's own ``log`` was the only logger in the process. That card gave
+    ``mcp_server.py`` a dedicated stderr-only logger of its own for
+    tools/call start/done lines — `propagate = False` there, so the two
+    loggers don't conflict, but the claim above no longer holds verbatim.)
     """
     def _log_failure(exc: BaseException) -> None:
         log.error("mcp tool %s failed: %s", name, exc, exc_info=True)
