@@ -170,9 +170,11 @@ def test_prs_scan_via_route_raises_on_a_non_200_instead_of_returning_an_empty_di
         assert "502" in str(exc)
 
 
-def test_prs_scan_via_route_raises_on_a_transport_error():
+def test_prs_scan_via_route_raises_on_a_transport_error(monkeypatch):
     """Same reasoning as the 502 case — a core that is simply unreachable
     must not look like a scan that ran and found nothing."""
+    monkeypatch.setenv(ms.kanban_dispatch.API_KEY_VAR, "test-key")
+
     def handler(request: httpx.Request) -> httpx.Response:
         raise httpx.ConnectError("connection refused")
 
