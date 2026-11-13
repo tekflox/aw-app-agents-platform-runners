@@ -37,6 +37,7 @@ guard, PR #25): a dead loop is caught by ``run_work_loop`` and reported in
 """
 from __future__ import annotations
 
+import asyncio
 import dataclasses
 import logging
 from typing import Any, Awaitable, Callable
@@ -97,8 +98,6 @@ async def _deploy_loop(ctx: WorkLoopContext) -> "tuple[dict, list[dict], list[di
     in ``mcp_server.py`` exactly as it does for the ``kanban_check_deployed``
     alias — a platform concern, same split as ``sweep_ready`` leaving
     dispatch to its caller's ``PlatformClient``."""
-    import asyncio
-
     result = await asyncio.to_thread(
         deploy_reconcile.check_deployed, ctx.board,
         page_id=ctx.page_id, dry_run=ctx.dry_run, max_cards=ctx.max_cards)
@@ -256,8 +255,6 @@ async def _agent_activity(page_id: str, list_runs: ListRunsFn, now: float) -> di
 
 
 async def _attention_loop(ctx: WorkLoopContext) -> "tuple[dict, list[dict], list[dict]]":
-    import asyncio
-
     if ctx.page_id:
         raw = await asyncio.to_thread(_single_card_attention_source, ctx.board, ctx.page_id)
     else:
@@ -362,6 +359,29 @@ async def run_work_loop(ctx: WorkLoopContext, loops: "list[str]") -> dict:
     the attention loop could otherwise take even in a "preview" call. Every
     other side effect (deploy's moves/comments/stamps, ready's claim/move/
     dispatch) is already dry_run-total inside the functions this wraps.
+
+    Requested loops run CONCURRENTLY (``asyncio.gather``), not sequentially —
+    the three loops are already independent (none reads another's output;
+    none mutates ``ctx``), so the old sequential ``for`` loop paid the FULL
+    SUM of every loop's latency as this call's own critical path (deploy's
+    Notion scan + attention's board-wide scan plus up to
+    ``MAX_RUN_CHECK_PROBES`` per-candidate AP-MT run-checks + ready's sweep,
+    one after another) instead of the max of them. That sum is exactly what
+    pushed the documented default ``["deploy","attention"]`` — and the
+    ``["deploy","attention","ready"]`` combination reported in
+    bug:work-loop-multi-loop-timeout — past the caller's tool-call timeout,
+    even though each loop alone stays comfortably inside it.
+
+    Thread-safety of the shared ``ctx.board`` (``kanban_dispatch.BoardClient``)
+    across these concurrent ``asyncio.to_thread`` calls (code-review finding,
+    PR #40): verified safe, not assumed. ``BoardClient`` holds exactly one
+    instance attribute, ``self._base``, set once in ``__init__`` and never
+    reassigned; every method routes through ``_request``, which opens a brand
+    new ``urllib.request.Request``/``urlopen`` per call — no shared session,
+    connection pool, or retry/rate-limit state lives on the instance for two
+    concurrent calls to corrupt. Two threads calling it at once are two
+    independent HTTP requests, exactly as if two different ``BoardClient``
+    instances had made them.
     """
     if ctx.dry_run and ctx.reping:
         ctx = dataclasses.replace(ctx, reping=False)
@@ -371,26 +391,40 @@ async def run_work_loop(ctx: WorkLoopContext, loops: "list[str]") -> dict:
     errors: list[dict] = []
     loops_skipped: list[str] = []
     sections: dict[str, Any] = {}
-    attempted = 0
 
+    runnable: list[str] = []
     for loop_name in loops:
         if loop_name in NOT_IMPLEMENTED_LOOPS:
             loops_skipped.append(f"{loop_name}: not implemented")
             continue
-        func = LOOP_FUNCS.get(loop_name)
-        if func is None:
+        if loop_name not in LOOP_FUNCS:
             loops_skipped.append(f"{loop_name}: unknown loop")
             continue
-        attempted += 1
+        runnable.append(loop_name)
+
+    async def _run_one(loop_name: str):
         try:
-            section, orders, actions = await func(ctx)
+            return await LOOP_FUNCS[loop_name](ctx)
         except kanban_dispatch.BoardUnavailable as exc:
-            errors.append({"loop": loop_name, "error": str(exc)})
-            continue
+            return exc
         except Exception as exc:  # pragma: no cover - defensive, per loop
             log.warning("work_loop: loop %s failed", loop_name, exc_info=True)
-            errors.append({"loop": loop_name, "error": str(exc)})
+            return exc
+
+    # return_exceptions=False here would be wrong twice over: it would let
+    # one dead loop cancel every other still-in-flight loop (the very
+    # isolation guarantee this function exists to provide), and gather would
+    # raise instead of letting us report the failure in `errors` below — so
+    # every per-loop exception is caught INSIDE `_run_one` and handed back
+    # as a value, never raised out of gather.
+    outcomes = await asyncio.gather(*(_run_one(name) for name in runnable))
+
+    attempted = len(runnable)
+    for loop_name, outcome in zip(runnable, outcomes):
+        if isinstance(outcome, Exception):
+            errors.append({"loop": loop_name, "error": str(outcome)})
             continue
+        section, orders, actions = outcome
         sections[loop_name] = section
         work_orders.extend(orders)
         actions_taken.extend(actions)
