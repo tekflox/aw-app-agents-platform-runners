@@ -371,6 +371,17 @@ async def run_work_loop(ctx: WorkLoopContext, loops: "list[str]") -> dict:
     ``["deploy","attention","ready"]`` combination reported in
     bug:work-loop-multi-loop-timeout — past the caller's tool-call timeout,
     even though each loop alone stays comfortably inside it.
+
+    Thread-safety of the shared ``ctx.board`` (``kanban_dispatch.BoardClient``)
+    across these concurrent ``asyncio.to_thread`` calls (code-review finding,
+    PR #40): verified safe, not assumed. ``BoardClient`` holds exactly one
+    instance attribute, ``self._base``, set once in ``__init__`` and never
+    reassigned; every method routes through ``_request``, which opens a brand
+    new ``urllib.request.Request``/``urlopen`` per call — no shared session,
+    connection pool, or retry/rate-limit state lives on the instance for two
+    concurrent calls to corrupt. Two threads calling it at once are two
+    independent HTTP requests, exactly as if two different ``BoardClient``
+    instances had made them.
     """
     if ctx.dry_run and ctx.reping:
         ctx = dataclasses.replace(ctx, reping=False)
