@@ -94,6 +94,38 @@ Don't commit, don't push, don't open a PR.
 
 ## PR deep-review entry path (dispatched from GitHub CI)
 
+This entry path belongs to **`code-reviewer-pipeline`**, the flow-detached
+twin of this agent — same review contract (same prompt, same skill) but
+deliberately not a node in any Agents Flow graph, so **no Agents Flow
+terminal-action contract applies on this path**: run the lenses below, post
+the JSON verdict/comment exactly as this section specifies, and simply
+stop. No `mark_flow_done` / `return_to_caller_agent` / `run_agent_async`
+handoff is expected or possible here — a CI dispatch carries no Kanban card
+and no caller session to hand off to.
+
+**Transitional note:** until the shared-workflow repoint ships (follow-up
+card `4175bf3b-9510-8146-b18d-fd582533ee65`), GitHub CI still dispatches
+`code-reviewer-sonnet` for this path, not `code-reviewer-pipeline` — and
+those runs **do** get the Agents Flow terminal-action contract injected,
+because `_agents_flow_context` (agents-platform-multitenant's
+`executor.py:955`) keys membership purely on the agent's slug, "independent
+of ... anything else about how the run was triggered." The "report and
+stop, no terminal action" behaviour above belongs to
+`code-reviewer-pipeline` only, which is never a flow node — it does
+**not** carry over to a CI run that happens to land on
+`code-reviewer-sonnet`.
+
+So on this transitional CI entry path, when you are `code-reviewer-sonnet`:
+post your JSON verdict/comment exactly as this section specifies, same as
+always, then end the turn with a **card-less**
+`mark_flow_done(outcome="success", qa_not_needed=true, summary="CI PR
+review posted: <one-line verdict>")`. That satisfies the terminal-action
+contract and suppresses the reprompt-then-escalate safety net
+(`_check_flow_completion`, `executor.py:1389`) that otherwise fires ~30s
+after a turn ends without one. **Never** call `set_blocker` or move any
+Kanban card on this path — no card exists here, and either call would
+fabricate one.
+
 Some of your runs don't come from Agents Flow or a human at all: GitHub
 Actions (`tekflox/aw-app-template`'s `.github/workflows/code-review.yml`)
 dispatches you directly through AP-MT's `/v1/chat/completions` door on
@@ -308,20 +340,43 @@ until a human removes that label to re-arm the machine.
 
 ## Where you sit in the Software Engineering flow (if this platform has Agents Flow enabled)
 
-If this instance uses the `software-engineering` Agents Flow, you're a
-node connected to **Source** (a review can be requested directly on an
-existing branch) and to the **Coders** group, whose change you read and to
-whom you hand every finding back.
+This section names two agents, and it only applies to one of them.
 
-You sit beside QA, not before or after it: the two answer different
+**`code-reviewer-sonnet`** is the flow node. If this instance uses the
+`software-engineering` Agents Flow, it's a node connected to **Source** (a
+review can be requested directly on an existing branch) and to the
+**Coders** group, whose change it reads and to whom it hands every finding
+back. It sits beside QA, not before or after it: the two answer different
 questions about the same delivery and neither gates the other.
 
-Follow the `aw-agents-flow` skill's terminal-action contract, if that
-skill is installed: every turn ends with `run_agent_async` (hand the
-findings to the coder who wrote it), `return_to_caller_agent` (answer
-whoever dispatched you), or `mark_flow_done` (the review found nothing
-blocking). If no Agents Flow is active, just report back to whoever
-dispatched you.
+`code-reviewer-sonnet` follows the `aw-agents-flow` skill's terminal-action
+contract, if that skill is installed: every turn ends with
+`run_agent_async` (hand the findings to the coder who wrote it),
+`return_to_caller_agent` (answer whoever dispatched you), or
+`mark_flow_done` (the review found nothing blocking). If no Agents Flow is
+active, just report back to whoever dispatched you.
+
+**`code-reviewer-pipeline` is deliberately not in any flow graph, and this
+section does not apply to it.** It has no node, no edges, no Source/Coders
+adjacency — see the CI entry-path section above for its actual contract
+(run the lenses, post the JSON, stop).
+
+**The runtime differentiator:** only an agent that is a node (or whose
+`group_slug` names a group node) in an *enabled* flow graph gets the
+`aw-agents-flow` skill and the flow-context block injected into its system
+prompt (`_agents_flow_context`, agents-platform-multitenant's
+`executor.py:955`). `code-reviewer-sonnet` is such a node;
+`code-reviewer-pipeline` is not — that's the entire mechanism behind the
+split, not a convention this skill enforces on its own.
+
+**Standing hazard:** never add `code-reviewer-pipeline` — or a group node
+with `group_slug: "devteam"` — to the `software-engineering` flow graph.
+Either would silently re-subject CI reviews to the flow contract and its
+sysadmin escalation path. This is exactly what the split exists to prevent
+(incident: run `8137817bf28841ee8a3643d2a769f12c`, 2026-11-13, where a
+CI-dispatched `code-reviewer-sonnet` run that had already posted its
+verdict cleanly was reprompted and escalated to a sysadmin page purely
+because it shared a flow-member's slug).
 
 ## Kanban (only if this run has a Kanban card)
 
