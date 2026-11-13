@@ -719,6 +719,49 @@ def test_the_memory_descriptions_carry_the_three_rules_an_agent_needs():
     assert "ext" in read_desc
 
 
+# ---------------------------------------------------------------------------
+# Plan ASSETS (card 4175bf3b-9510-818e-bbdd-f713db1ef148, shipped as PR #66
+# on agents-platform-multitenant). A Plan asset is a presentation tagged
+# `plan:<slug>` on `aw-app-presentations` — AP-MT holds no id of its own for
+# it, so there is no update/delete route on `/plans/{slug}/assets*` to wrap;
+# `list_plan_assets` (read) and `generate_plan_asset` (the only write) are
+# the whole surface.
+# ---------------------------------------------------------------------------
+
+def test_list_plan_assets_reaches_the_assets_endpoint(monkeypatch):
+    req = _call(monkeypatch, "list_plan_assets", {"slug": "my-plan"},
+               payload={"presentations": []})
+    assert req.method == "GET"
+    assert req.url.path == "/api/plans/my-plan/assets"
+
+
+def test_generate_plan_asset_reaches_the_generate_endpoint_with_no_title(monkeypatch):
+    """`title` is optional — AP-MT defaults it server-side when omitted or
+    blank, so an absent title must send an EMPTY body, not a null."""
+    req = _call(monkeypatch, "generate_plan_asset", {"slug": "my-plan"},
+               payload={"id": "p1", "title": "my-plan — Plan report"})
+    assert req.method == "POST"
+    assert req.url.path == "/api/plans/my-plan/assets/generate"
+    assert json.loads(req.content) == {}
+
+
+def test_generate_plan_asset_forwards_an_explicit_title(monkeypatch):
+    req = _call(monkeypatch, "generate_plan_asset",
+               {"slug": "my-plan", "title": "Q4 status"},
+               payload={"id": "p1", "title": "Q4 status"})
+    assert json.loads(req.content) == {"title": "Q4 status"}
+
+
+def test_plan_assets_tools_exist_and_no_update_or_delete_tool_does(monkeypatch):
+    """No update/delete tool — AP-MT's `/plans/{slug}/assets*` surface
+    exposes only the list read and the generate write, so a tool for either
+    would call an endpoint that does not exist."""
+    names = {t.name for t in asyncio.run(mcp_server._list_tools())}
+    assert {"list_plan_assets", "generate_plan_asset"} <= names
+    assert not {"create_plan_asset", "update_plan_asset",
+                "delete_plan_asset"} & names
+
+
 def test_the_memory_tools_exist_and_no_full_replace_tool_does(monkeypatch):
     """There must be no agent-facing FULL-REPLACE tool.
 

@@ -1868,6 +1868,44 @@ async def _list_tools() -> list[Tool]:
                                        "description": ("Only when closing an iteration "
                                                        "that is not your own run's.")},
              }, "required": ["decision"]}),
+        # ---- Plan ASSETS (card 4175bf3b-9510-818e-bbdd-f713db1ef148,
+        # shipped as PR #66 on agents-platform-multitenant). A Plan asset
+        # today is a presentation tagged `plan:<slug>` on `aw-app-
+        # presentations` — AP-MT stores nothing of its own, so there is no
+        # asset id to pass back in: `list_plan_assets` is the only read and
+        # `generate_plan_asset` is the only write. There is no update/delete
+        # route to wrap — editing or removing an asset happens on the
+        # Presentation app itself, not here, and no such route exists on
+        # AP-MT's `/plans/{slug}/assets*` surface to expose. UX-Proto
+        # (mockups/prototypes) is a deliberate follow-up on that same card,
+        # not shipped yet — `type` is already a plain string so a future
+        # value is a non-breaking addition to `list_plan_assets`'s output.
+        Tool(name="list_plan_assets",
+             description=("Presentations tagged for this Plan — id, title, type "
+                          "(only `\"presentation\"` today), visible, created_at/"
+                          "updated_at (epoch seconds) and a view_url (empty string "
+                          "if a share link could not be minted for that one "
+                          "presentation). Degrades to an empty list with `error` "
+                          "set rather than failing outright if the presentations "
+                          "integration is unreachable — read `error` before "
+                          "reporting \"no assets yet\"."),
+             inputSchema={"type": "object",
+                          "properties": {"slug": {"type": "string",
+                                                  "description": "The plan's slug."}},
+                          "required": ["slug"]}),
+        Tool(name="generate_plan_asset",
+             description=("Create a presentation seeded from this Plan's own "
+                          "purpose, strategy, delivery criteria and status — "
+                          "tagged `plan:<slug>` so `list_plan_assets` picks it "
+                          "back up. `title` defaults to \"<plan name> — Plan "
+                          "report\" server-side when omitted or blank. Unlike "
+                          "`list_plan_assets`, this is an explicit write and "
+                          "fails loudly (502) if the presentations integration "
+                          "is unreachable, rather than degrading."),
+             inputSchema={"type": "object", "properties": {
+                 "slug": {"type": "string", "description": "The plan's slug."},
+                 "title": {"type": "string"},
+             }, "required": ["slug"]}),
         # ---- Plan MEMORY (Plan umbrella Slice 8, card
         # 4135bf3b-9510-819c-bef0-d50d2440cf90). The iteration prompt
         # already carries a DIGEST of this document every cycle —
@@ -3909,6 +3947,15 @@ async def _dispatch_tool(name: str, arguments: dict[str, Any] | None) -> list[Te
                                  "plan_iteration_id was given. Pass "
                                  "plan_iteration_id (it is in your iteration prompt).")
             r = await c.post(f"{BASE}/api/plans/finish-iteration", json=body)
+            return _err(r.status_code, r.text) if r.status_code != 200 else _ok(r.json())
+        if name == "list_plan_assets":
+            r = await c.get(f"{BASE}/api/plans/{args['slug']}/assets")
+            return _err(r.status_code, r.text) if r.status_code != 200 else _ok(r.json())
+        if name == "generate_plan_asset":
+            body = {}
+            if args.get("title"):
+                body["title"] = args["title"]
+            r = await c.post(f"{BASE}/api/plans/{args['slug']}/assets/generate", json=body)
             return _err(r.status_code, r.text) if r.status_code != 200 else _ok(r.json())
         if name == "get_plan_memory":
             r = await c.get(f"{BASE}/api/plans/{args['slug']}/memory")
