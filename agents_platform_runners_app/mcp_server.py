@@ -102,6 +102,7 @@ def _agents_base_transport() -> httpx.AsyncHTTPTransport:
 from . import kanban_dispatch  # noqa: E402
 from . import deploy_reconcile  # noqa: E402
 from . import work_loop as work_loop_mod  # noqa: E402
+from . import pr_scan  # noqa: E402
 from . import platform_base  # noqa: E402
 from . import telegram_report as telegram_report_mod  # noqa: E402
 
@@ -876,12 +877,14 @@ async def _list_tools() -> list[Tool]:
                           },
                           "required": []}),
         Tool(name="work_loop",
-             description=("Deterministic orchestrator that keeps Kanban cards (and, once "
-                          "phases 2/3 land, open PRs and Plans) moving — architect design, "
-                          "Kanban 4165bf3b-9510-810d. Runs every mechanical check itself and "
+             description=("Deterministic orchestrator that keeps Kanban cards and open PRs "
+                          "moving (and, once phase 3 lands, Plans too) — architect design, "
+                          "Kanban 4165bf3b-9510-810d, `prs` loop added per "
+                          "4175bf3b-9510-8163. Runs every mechanical check itself and "
                           "hands anything needing real judgment to the aw-manager agent as a "
                           "Mode B work-order list (`{page_id, reason, evidence, "
-                          "suggested_action}` — the exact contract already documented in "
+                          "suggested_action}` for a card, `{pr, url, reason, evidence, "
+                          "suggested_action}` for a PR — the card shape already documented in "
                           "aw-manager's own SKILL.md); contains NO LLM call of its own.\n\n"
                           "`loops` (default `[\"deploy\",\"attention\"]`) selects which "
                           "sections run, independently error-isolated — a dead loop reports "
@@ -905,11 +908,24 @@ async def _list_tools() -> list[Tool]:
                           "qualifying candidate becomes one `work_orders` entry. `reping` "
                           "(default true here — this IS the keep-things-in-motion entry "
                           "point) passes through to the Need-Human re-ping branch.\n"
-                          "- `ready`/`prs`/`plans`: `ready` thinly wraps the existing "
-                          "`run_ready_cards` sweep; `prs`/`plans` are reserved enum values not "
-                          "implemented yet — requesting either comes back in `loops_skipped` "
-                          "as `\"<name>: not implemented\"`, never an error, so a caller can "
-                          "opt in early.\n\n"
+                          "- `ready`: thinly wraps the existing `run_ready_cards` sweep.\n"
+                          "- `prs`: enumerates this workspace's cloned repos (repos/* with a "
+                          "`.git`, mapped to GitHub owner/repo via `git remote get-url "
+                          "origin`), finds open PRs on those repos via `gh search prs` (one "
+                          "call per distinct owner, not per repo), and flags ones stalled "
+                          "(`updatedAt` older than `PR_STALL_HOURS=6`, no live or recently-"
+                          "completed CI on HEAD, not a draft) as one `work_orders` entry each "
+                          "(`pr` identifier in place of `page_id`). Each surfaced PR is "
+                          "stamped \"viewed\" in its own back-off store (same semantics as the "
+                          "attention loop's LastSweptAt, a different store since there's no "
+                          "Notion property to stamp) so it doesn't re-surface every pass — "
+                          "re-arms once the PR's own `updatedAt` moves past the stamp. "
+                          "`page_id` names a Kanban card, not a PR, so single-card mode skips "
+                          "this loop with an explicit reason instead of running the full "
+                          "sweep anyway.\n"
+                          "- `plans`: a reserved enum value, not implemented yet — requesting "
+                          "it comes back in `loops_skipped` as `\"plans: not implemented\"`, "
+                          "never an error, so a caller can opt in early.\n\n"
                           "`page_id` restricts every requested loop to that one card. "
                           "`dry_run` is TOTAL across every loop — no moves, comments, stamps, "
                           "reping writes, QA dispatches, or Manager dispatch; report only. "
@@ -919,15 +935,15 @@ async def _list_tools() -> list[Tool]:
                           "already in-flight manager run — so a cron/Plan can call this with "
                           "no workflow glue; leave it false to consume `work_orders` yourself "
                           "(e.g. from a workflow node) instead.\n\n"
-                          "Response: `{ok, dry_run, boards, deploy?, attention?, ready?, "
+                          "Response: `{ok, dry_run, boards, deploy?, attention?, ready?, prs?, "
                           "work_orders, actions_taken, loops_skipped, manager_dispatch, "
                           "errors}` — `actions_taken` is everything this call already DID "
-                          "(moves, re-pings, QA dispatches), `work_orders` is everything it "
-                          "found but did NOT decide on its own."),
+                          "(moves, re-pings, QA dispatches, PR viewed-tags), `work_orders` is "
+                          "everything it found but did NOT decide on its own."),
              inputSchema={"type": "object",
                           "properties": {
                               "loops": {"type": "array", "items": {"type": "string"},
-                                       "description": "Which sections to run: deploy, attention, ready, prs, plans. Default [\"deploy\",\"attention\"]. prs/plans are reserved — not yet implemented."},
+                                       "description": "Which sections to run: deploy, attention, ready, prs, plans. Default [\"deploy\",\"attention\"]. plans is reserved — not yet implemented."},
                               "page_id": {"type": "string",
                                          "description": "Restrict every requested loop to this one card instead of scanning."},
                               "limit": {"type": "integer", "default": 10,
@@ -3267,7 +3283,8 @@ async def _dispatch_tool(name: str, arguments: dict[str, Any] | None) -> list[Te
             ctx = work_loop_mod.WorkLoopContext(
                 board=_board_client(), list_runs=_list_runs, now=time.time(),
                 dry_run=dry_run, page_id=page_id, limit=limit, max_cards=max_cards,
-                reping=reping, platform=kanban_dispatch.PlatformClient(c, BASE))
+                reping=reping, platform=kanban_dispatch.PlatformClient(c, BASE),
+                scanner=pr_scan.scan_prs)
             # run_work_loop never raises BoardUnavailable itself — every loop
             # catches it internally and reports it in `errors` (code-review
             # finding, PR #36: a try/except here around this call was dead

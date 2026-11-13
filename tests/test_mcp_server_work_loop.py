@@ -118,6 +118,27 @@ def test_dispatch_is_skipped_when_a_manager_run_is_already_in_flight():
     assert result == {"skipped": "manager run already in flight", "run_id": "r-live"}
 
 
+# ── work_loop tool handler: prs loop wiring ──────────────────────────────
+
+def test_work_loop_tool_wires_pr_scan_as_the_prs_loop_scanner(monkeypatch):
+    """Card instructions item #3 — the handler must hand ``ctx.scanner`` the
+    real ``pr_scan.scan_prs`` (not leave it ``None``, which would make the
+    prs loop report an error on every real call). ``run_work_loop`` itself
+    is replaced so this stays a pure wiring check — it must never shell out
+    to git/gh or hit the network."""
+    captured = {}
+
+    async def fake_run_work_loop(ctx, loops):
+        captured["ctx"] = ctx
+        return {"ok": True, "dry_run": ctx.dry_run, "work_orders": [], "actions_taken": [],
+               "loops_skipped": [], "errors": []}
+
+    monkeypatch.setattr(ms.work_loop_mod, "run_work_loop", fake_run_work_loop)
+
+    asyncio.run(ms._dispatch_tool("work_loop", {"loops": ["prs"], "dry_run": True}))
+    assert captured["ctx"].scanner is ms.pr_scan.scan_prs
+
+
 def test_dispatch_succeeds_with_a_well_formed_round_trip():
     calls = {"n": 0}
 

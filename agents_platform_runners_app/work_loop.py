@@ -43,11 +43,12 @@ from typing import Any, Awaitable, Callable
 
 from . import deploy_reconcile
 from . import kanban_dispatch
+from . import pr_scan
 
 log = logging.getLogger("aw_apps.agents_platform_runners.work_loop")
 
 DEFAULT_LOOPS = ("deploy", "attention")
-NOT_IMPLEMENTED_LOOPS = ("prs", "plans")
+NOT_IMPLEMENTED_LOOPS = ("plans",)
 
 DEFAULT_ATTENTION_LIMIT = 10
 MIN_ATTENTION_LIMIT = 1
@@ -61,12 +62,27 @@ STALE_RUN_MINUTES = 30
 # how many candidates reach the run-check (post back-off) in one pass.
 MAX_RUN_CHECK_PROBES = 25
 
+# The prs loop's own staleness clock (design §1) — GitHub's updatedAt bumps
+# on comments, pushes, reviews, and labels/reviewer changes, a conservative
+# superset of "last comment OR last push/open time". Passed explicitly into
+# every ``pr_scan.scan_prs`` call rather than letting that module default it,
+# so this stays the single source of truth for the threshold.
+PR_STALL_HOURS = 6
+
 
 ListRunsFn = Callable[..., Awaitable["tuple[list[dict] | None, str | None]"]]
 """``async (*, notion_task_id=None, category=None, limit=20) -> (rows, error)``.
 Never raises — a probe failure comes back as ``(None, "...")`` so a loop can
 fail CLOSED on that one candidate (``agent_activity: unknown``) instead of
 taking down the whole pass."""
+
+PrScanFn = Callable[..., Awaitable[dict]]
+"""``async (*, now, dry_run, limit, stall_hours) -> pr_scan.scan_prs's own
+return shape``. Injectable so work_loop tests never shell out to ``git``/
+``gh`` — the real implementation (wired by mcp_server.py) IS
+``pr_scan.scan_prs`` itself; a test replaces the whole function rather than
+faking a lower-level gh runner (that seam lives in test_pr_scan.py instead,
+see pr_scan.py's own module docstring)."""
 
 
 @dataclasses.dataclass
@@ -85,6 +101,7 @@ class WorkLoopContext:
     max_cards: int = deploy_reconcile.DEFAULT_MAX_CARDS
     reping: bool = True
     platform: "kanban_dispatch.PlatformClient | None" = None
+    scanner: "PrScanFn | None" = None
 
 
 # ── deploy loop ──────────────────────────────────────────────────────────
@@ -343,10 +360,36 @@ async def _ready_loop(ctx: WorkLoopContext) -> "tuple[dict, list[dict], list[dic
     return result, [], actions
 
 
+# ── prs loop ─────────────────────────────────────────────────────────────
+
+async def _prs_loop(ctx: WorkLoopContext) -> "tuple[dict, list[dict], list[dict]]":
+    """Thin wrapper over ``pr_scan.scan_prs`` (card instructions item #2) —
+    all the actual decision logic (two-phase gh sweep, staleness/CI gates,
+    the viewed-stamp store) lives in pr_scan.py, the same split
+    ``_deploy_loop`` has with ``check_deployed``. ``page_id`` names a Kanban
+    card, not a PR, so single-card mode has nothing to scope this loop to —
+    skipped with an explicit reason rather than silently running the full
+    board-wide sweep anyway."""
+    if ctx.page_id:
+        return ({"skipped_reason": "prs loop has no single-card mode — "
+                                   "page_id names a Kanban card, not a PR"}, [], [])
+    if ctx.scanner is None:
+        return ({"error": "prs loop requires a scanner — not wired by this caller"}, [], [])
+
+    result = await ctx.scanner(now=ctx.now, dry_run=ctx.dry_run, limit=ctx.limit,
+                               stall_hours=PR_STALL_HOURS)
+    work_orders = result.pop("work_orders", [])
+    tagged = result.pop("tagged", [])
+    actions = [{"loop": "prs", "pr": t["pr"], "action": "tagged_viewed", "detail": t["detail"]}
+              for t in tagged]
+    return result, work_orders, actions
+
+
 LOOP_FUNCS: "dict[str, Callable[[WorkLoopContext], Awaitable[tuple[dict, list[dict], list[dict]]]]]" = {
     "deploy": _deploy_loop,
     "attention": _attention_loop,
     "ready": _ready_loop,
+    "prs": _prs_loop,
 }
 
 
@@ -419,4 +462,5 @@ async def run_work_loop(ctx: WorkLoopContext, loops: "list[str]") -> dict:
 
 __all__ = ["WorkLoopContext", "run_work_loop", "DEFAULT_LOOPS",
            "NOT_IMPLEMENTED_LOOPS", "STALE_RUN_MINUTES", "MAX_RUN_CHECK_PROBES",
-           "DEFAULT_ATTENTION_LIMIT", "MIN_ATTENTION_LIMIT", "MAX_ATTENTION_LIMIT"]
+           "DEFAULT_ATTENTION_LIMIT", "MIN_ATTENTION_LIMIT", "MAX_ATTENTION_LIMIT",
+           "PR_STALL_HOURS"]
