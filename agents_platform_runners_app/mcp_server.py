@@ -2970,6 +2970,21 @@ async def _prs_scan_via_route(c: httpx.AsyncClient, *, now: float, dry_run: bool
     return r.json()
 
 
+def _work_order_line(o: dict) -> str:
+    """One Mode-B prompt line for a single work order — either a Kanban
+    card (``page_id``) or an open PR (``pr``/``url``, the ``prs`` loop's
+    shape, card 4175bf3b-9510-8163). Told apart by which identifying key is
+    present, not by assuming every order is card-shaped — that assumption
+    is exactly what crashed this function with ``KeyError: 'page_id'`` the
+    first time the ``prs`` loop handed it a PR-shaped order (card
+    4175bf3b-9510-8132). ``pr:``/``url:`` stay distinct labels from
+    ``page_id:`` so the Manager can tell which kind it's looking at."""
+    ident = (f"page_id: {o['page_id']}" if "page_id" in o
+            else f"pr: {o['pr']}\nurl: {o.get('url', '')}")
+    return (f"{ident}\nreason: {o.get('reason', '')}\n"
+           f"evidence: {o.get('evidence', '')}\nsuggested_action: {o.get('suggested_action', '')}")
+
+
 async def _dispatch_manager_once(c: httpx.AsyncClient, work_orders: list[dict]) -> dict:
     """The optional ``dispatch_manager=true`` hook (design §2) — fires the
     Manager with ``work_orders`` as a Mode B payload. AP-MT has no
@@ -3000,9 +3015,7 @@ async def _dispatch_manager_once(c: httpx.AsyncClient, work_orders: list[dict]) 
             if (row.get("source_slug") == "manager"
                     and (row.get("status") or "").lower() in ("pending", "running")):
                 return {"skipped": "manager run already in flight", "run_id": row.get("id")}
-    lines = [f"page_id: {o['page_id']}\nreason: {o.get('reason', '')}\n"
-            f"evidence: {o.get('evidence', '')}\nsuggested_action: {o.get('suggested_action', '')}"
-            for o in work_orders]
+    lines = [_work_order_line(o) for o in work_orders]
     body = {"input": {"input": "work_loop work orders:\n\n" + "\n\n".join(lines)},
             "target_slug": kanban_dispatch.DEFAULT_TARGET_SLUG, "workspace": _own_workspace()}
     try:

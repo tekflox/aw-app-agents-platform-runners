@@ -118,6 +118,50 @@ def test_dispatch_is_skipped_when_a_manager_run_is_already_in_flight():
     assert result == {"skipped": "manager run already in flight", "run_id": "r-live"}
 
 
+def test_work_order_line_handles_a_card_shaped_order():
+    line = ms._work_order_line({"page_id": "p1", "reason": "stale",
+                                "evidence": "ev", "suggested_action": "sa"})
+    assert line == "page_id: p1\nreason: stale\nevidence: ev\nsuggested_action: sa"
+
+
+def test_work_order_line_handles_a_pr_shaped_order():
+    """The ``prs`` loop's shape (card 4175bf3b-9510-8163) has no `page_id`
+    — `pr`/`url` identify it instead. Regression for the bug found live
+    (card 4175bf3b-9510-8132): this used to be a bare `o['page_id']` lookup
+    that raised ``KeyError`` on exactly this shape."""
+    line = ms._work_order_line({"pr": "owner/repo#12", "url": "https://x/12",
+                                "reason": "stalled", "evidence": "ev",
+                                "suggested_action": "sa"})
+    assert line == ("pr: owner/repo#12\nurl: https://x/12\n"
+                    "reason: stalled\nevidence: ev\nsuggested_action: sa")
+
+
+def test_dispatch_does_not_raise_on_a_pr_shaped_work_order():
+    """End-to-end regression for the live crash: ``work_loop(loops=["prs"],
+    dispatch_manager=true)`` threw ``KeyError: 'page_id'`` because this
+    function assumed every work order was card-shaped. A PR-shaped order
+    (no `page_id`) must flow through to a dispatched Manager run instead of
+    raising."""
+    calls = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return httpx.Response(200, json=[])  # dedup probe: nothing in flight
+        assert b"pr: owner/repo#12" in request.content
+        assert b"url: https://x/12" in request.content
+        return httpx.Response(200, json={"run_id": "r-new"})
+
+    async def _run():
+        async with _client(handler) as c:
+            return await ms._dispatch_manager_once(
+                c, [{"pr": "owner/repo#12", "url": "https://x/12",
+                     "reason": "stalled", "evidence": "ev", "suggested_action": "sa"}])
+
+    result = asyncio.run(_run())
+    assert result == {"run_id": "r-new"}
+
+
 # ── work_loop tool handler: prs loop wiring ──────────────────────────────
 
 # ── _prs_scan_via_route — the prs loop's real scanner (card 4175bf3b ──────
