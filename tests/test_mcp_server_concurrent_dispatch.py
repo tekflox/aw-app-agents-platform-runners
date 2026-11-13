@@ -252,6 +252,43 @@ def test_tools_call_with_non_dict_arguments_does_not_crash_before_dispatch(monke
     assert response["id"] == 9
 
 
+def test_a_bare_non_dict_top_level_request_gets_an_invalid_request_error(monkeypatch):
+    """Code-review finding, PR #50, finding a27134328d27: `_handle_one`
+    read `request.get("method")`/`request.get("id")` BEFORE the try/except
+    existed for it — a step up from the `params`/`arguments` cases above,
+    this is the TOP-LEVEL request itself not being a dict. `json.loads`
+    parses a bare array/number/string/`null` just fine (no
+    `json.JSONDecodeError`, so the read loop's own guard doesn't catch it
+    either), and a `list`/`int`/`str`/`None` has no `.get` — this used to
+    raise `AttributeError` uncaught, dying silently with no response ever
+    written and no log. A well-formed request in the same batch must still
+    get served."""
+    calls = {"n": 0}
+
+    async def fake_dispatch_tool(name, arguments):
+        calls["n"] += 1
+        return [ms.TextContent(type="text", text="ok")]
+
+    monkeypatch.setattr(ms, "_dispatch_tool", fake_dispatch_tool)
+
+    lines = [json.dumps([1, 2, 3]), json.dumps(None),
+              json.dumps(_tool_call(1, "ok"))]
+    out = asyncio.run(_drive(monkeypatch, lines))
+
+    responses = [json.loads(w) for w in out.writes]
+    # Both malformed top-level shapes come back as a proper JSON-RPC
+    # "Invalid Request" with `id: null` (no id could ever be recovered from
+    # a non-object request — JSON-RPC 2.0's own rule for exactly this
+    # case), and the well-formed request alongside them still dispatches.
+    invalid = [r for r in responses if r.get("id") is None]
+    ok = [r for r in responses if r.get("id") == 1]
+    assert len(invalid) == 2
+    for r in invalid:
+        assert r["error"]["code"] == -32600
+    assert len(ok) == 1 and "result" in ok[0]
+    assert calls["n"] == 1
+
+
 # ── (e) a writer failure crashes the process instead of being swallowed ───
 # The other code-review finding, PR #50: nothing supervised the dedicated
 # writer task. A `sys.stdout.write` failure (e.g. a broken pipe) used to die

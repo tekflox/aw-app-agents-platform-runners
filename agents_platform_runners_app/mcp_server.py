@@ -4548,10 +4548,10 @@ async def _async_main() -> None:
                               "gateway respawns this child")
                 raise
 
-    async def _handle_one(request: dict) -> None:
+    async def _handle_one(request: Any) -> None:
         nonlocal in_flight
-        method = request.get("method")
-        req_id = request.get("id")
+        method: str | None = None
+        req_id = None
         tool_name: str | None = None
         caller_run_id: str | None = None
 
@@ -4560,26 +4560,49 @@ async def _async_main() -> None:
             start = time.monotonic()
             response: dict | None = None
             try:
-                # Extracting tool_name/caller_run_id lives INSIDE this
-                # try — code-review finding, PR #50: a `tools/call` whose
-                # `params` isn't a dict (e.g. a JSON array) or whose
-                # `arguments` is a non-dict truthy value used to raise
-                # OUTSIDE the guarded block below, dying with no response
-                # ever written for that request's id and no `log.exception`
-                # either — the caller would silently hang exactly like the
-                # head-of-line-blocking bug this PR fixes, just scoped to
-                # one bad request instead of the whole process.
-                if method == "tools/call":
-                    params = request.get("params")
-                    if isinstance(params, dict):
-                        tool_name = params.get("name")
-                        arguments = params.get("arguments")
-                        caller_run_id = _caller_run_id(
-                            arguments if isinstance(arguments, dict) else {})
-                if tool_name:
-                    log.info("tools/call start name=%s caller_run_id=%s in_flight=%d",
-                              tool_name, caller_run_id, in_flight)
-                response = await handle_request(request)
+                # `request` itself might not even be a dict — code-review
+                # finding, PR #50, a27134328d27: a syntactically valid
+                # top-level JSON value that isn't an object (a bare array,
+                # number, string, or `null`) parses fine via `json.loads`
+                # but has no `.get`. `method`/`id` extraction used to run
+                # BEFORE this try existed AT ALL, so that raised
+                # `AttributeError` uncaught — same silent-hang failure mode
+                # as the malformed `params`/`arguments` case below, just one
+                # level up (a malformed top-level request shape instead of
+                # a malformed `params`). No id can be recovered from a
+                # non-object request, so per JSON-RPC 2.0 ("If it was not
+                # possible to detect the id ... it MUST be Null") the error
+                # response below carries `id: null` rather than being
+                # dropped the way a legitimately id-less failure is below.
+                if not isinstance(request, dict):
+                    log.error("mcp request is not a JSON object: %r", request)
+                    response = {"jsonrpc": "2.0", "id": None,
+                               "error": {"code": -32600,
+                                        "message": "Invalid Request: top-level value must be an object"}}
+                else:
+                    # Extracting tool_name/caller_run_id lives INSIDE this
+                    # try too — code-review finding, PR #50: a `tools/call`
+                    # whose `params` isn't a dict (e.g. a JSON array) or
+                    # whose `arguments` is a non-dict truthy value used to
+                    # raise OUTSIDE the guarded block below, dying with no
+                    # response ever written for that request's id and no
+                    # `log.exception` either — the caller would silently
+                    # hang exactly like the head-of-line-blocking bug this
+                    # PR fixes, just scoped to one bad request instead of
+                    # the whole process.
+                    method = request.get("method")
+                    req_id = request.get("id")
+                    if method == "tools/call":
+                        params = request.get("params")
+                        if isinstance(params, dict):
+                            tool_name = params.get("name")
+                            arguments = params.get("arguments")
+                            caller_run_id = _caller_run_id(
+                                arguments if isinstance(arguments, dict) else {})
+                    if tool_name:
+                        log.info("tools/call start name=%s caller_run_id=%s in_flight=%d",
+                                  tool_name, caller_run_id, in_flight)
+                    response = await handle_request(request)
             except Exception as exc:  # noqa: BLE001 — one task's bug must not
                 # strand its own caller forever (no reply ever written for
                 # its id) nor take the whole upstream down with it, now that
