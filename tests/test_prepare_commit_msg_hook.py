@@ -58,7 +58,7 @@ HOOKS_DIR = ROOT / "agent-images" / "shared" / "git-hooks"
 # GIT_CONFIG_KEY_N/VALUE_N pairs git reads — leaving a stray one behind
 # would be read as a 4th, garbled entry.
 _IDENTITY_VARS = ("AW_RUN_ID", "AW_SESSION_ID", "NOTION_TASK_ID", "AW_WARM_DIR",
-                  "AW_SOURCE_DEVICE", "AW_GATEWAY_BEARER_TOKEN")
+                  "AW_SOURCE_DEVICE", "AW_GATEWAY_BEARER_TOKEN", "AW_AGENT_SLUG")
 
 
 def _clean_env(tmp_path, **overrides) -> dict:
@@ -107,13 +107,31 @@ def test_cold_path_uses_aw_run_id_env_fallback(tmp_path):
     repo = _init_repo(tmp_path)
 
     result = _commit(repo, tmp_path, "a.txt", "first",
-                      AW_RUN_ID="coldrun123", AW_SESSION_ID="sess1", NOTION_TASK_ID="card1")
+                      AW_RUN_ID="coldrun123", AW_SESSION_ID="sess1", NOTION_TASK_ID="card1",
+                      AW_AGENT_SLUG="coder-sonnet")
 
     assert result.returncode == 0, result.stderr
     msg = _last_message(repo, tmp_path)
     assert "AW-Run-Id: coldrun123" in msg
     assert "AW-Session-Id: sess1" in msg
     assert "AW-Card: card1" in msg
+    assert "AW-Agent-Slug: coder-sonnet" in msg
+
+
+def test_agent_slug_trailer_absent_when_env_unset(tmp_path):
+    """No-op per-trailer, same contract as the other three: a run with an
+    identity but no AW_AGENT_SLUG (e.g. a monitor run, or an older
+    agents-platform caller that doesn't send agent_slug yet) must still
+    stamp AW-Run-Id without AW-Agent-Slug — not fail, not stamp an empty
+    trailer."""
+    repo = _init_repo(tmp_path)
+
+    result = _commit(repo, tmp_path, "a.txt", "third", AW_RUN_ID="r3")
+
+    assert result.returncode == 0, result.stderr
+    msg = _last_message(repo, tmp_path)
+    assert "AW-Run-Id: r3" in msg
+    assert "AW-Agent-Slug:" not in msg
 
 
 def test_a_dashed_uuid_run_id_is_normalized_to_bare_hex(tmp_path):
@@ -192,7 +210,8 @@ def test_warm_reuse_prefers_this_turns_identity_over_the_containers_stale_baked_
     result = _commit(repo, tmp_path, "a.txt", "fourth",
                       AW_WARM_DIR=str(warm_dir),
                       # Turn 1's stale, still-baked-into-this-process env:
-                      AW_RUN_ID="turn1run", AW_SESSION_ID="sess1", NOTION_TASK_ID="stale-card-1")
+                      AW_RUN_ID="turn1run", AW_SESSION_ID="sess1", NOTION_TASK_ID="stale-card-1",
+                      AW_AGENT_SLUG="coder-sonnet")
 
     assert result.returncode == 0, result.stderr
     msg = _last_message(repo, tmp_path)
@@ -204,6 +223,10 @@ def test_warm_reuse_prefers_this_turns_identity_over_the_containers_stale_baked_
     # Session id has no per-turn file (stable per warm container by design)
     # so it's still read straight from the env.
     assert "AW-Session-Id: sess1" in msg
+    # Agent slug is stable per warm container exactly like session id — the
+    # container's agent never changes mid-session, so turn_env (which never
+    # re-exports AW_AGENT_SLUG) must not clear it.
+    assert "AW-Agent-Slug: coder-sonnet" in msg
 
 
 def test_idempotent_replace_on_amend(tmp_path):

@@ -2501,6 +2501,8 @@ def _build_container_kwargs(job: dict, client=None) -> tuple[str, list[str], dic
         env["AW_SOURCE_DEVICE"] = job["source_device"]
     env["AW_SESSION_ID"] = job.get("session_id") or ""
     env["AW_RUN_ID"] = run_id
+    if job.get("agent_slug"):
+        env["AW_AGENT_SLUG"] = job["agent_slug"]
     if _perms.get("github"):
         # Activates the hooks mounted above (core.hooksPath via env is the
         # highest-precedence git config source, so it wins even over a
