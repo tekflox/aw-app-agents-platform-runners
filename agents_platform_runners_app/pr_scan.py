@@ -6,11 +6,20 @@ Architect decision, Kanban card 4175bf3b-9510-8163 (phase 2 of the work_loop
 design, 4165bf3b-9510-810d) — mirrors the ``deploy_reconcile.py`` split: all
 of the actual logic lives here, pure where possible, and ``work_loop.py``'s
 ``_prs_loop`` is a thin wrapper (same relationship ``_deploy_loop`` has with
-``check_deployed``). The one thing that differs from that split is that the
-top-level entry point here (``scan_prs``) IS the thing injected onto
-``WorkLoopContext.scanner`` (mirroring ``ListRunsFn``, work_loop.py:65) — gh
-has no existing fake-able client the way the board/platform do, so the
-scanner itself is the seam tests inject across.
+``check_deployed``).
+
+**Where this module actually runs (gateway-boundary follow-up,
+card 4175bf3b):** ``scan_prs`` is NOT the callable injected onto
+``WorkLoopContext.scanner`` — that would put it inside ``mcp_server.py``'s
+stdio-child process, which the mcp-gateway container spawns with neither
+``/opt/aw-workspace/repos`` nor ``AW_WORKSPACE_HOME`` nor any ``gh``/``git``
+credential mounted (confirmed live: it silently returned zero repos every
+call). ``scan_prs`` runs one hop further away instead, inside this app's own
+core-side ``POST /pr-scan`` route (``routes.py``), which IS where
+``/opt/aw-workspace/repos`` and ``gh`` auth genuinely exist. The actual
+``ctx.scanner`` is ``mcp_server.py``'s ``_prs_scan_via_route`` — an HTTP
+closure to that route, the same two-hop pattern ``list_warm_containers``/
+``search_execution_history`` already use for this exact container boundary.
 
 Two-phase sweep instead of one ``gh pr list`` per cloned repo (~90 of them,
 almost all returning nothing):
@@ -383,12 +392,16 @@ async def scan_prs(*, now: float, dry_run: bool = False, limit: int = 10,
                    git_remote_url: "Callable[[str], str | None]" = _git_remote_url,
                    stall_hours: float = DEFAULT_STALL_HOURS,
                    concurrency: int = GH_MAX_CONCURRENCY) -> dict:
-    """The injectable ``WorkLoopContext.scanner`` this module backs in
-    production — ``work_loop._prs_loop`` calls this with the context's own
-    ``now``/``dry_run``/``limit`` and its own ``PR_STALL_HOURS``; everything
-    else defaults to this module's real ``gh``/filesystem/store wiring, and
-    a test replaces the whole function rather than faking ``gh_runner`` (see
-    the module docstring)."""
+    """The real scan, called from the core-side ``POST /pr-scan`` route
+    (``routes.py``) — NOT directly injected onto ``WorkLoopContext.scanner``
+    any more (see the module docstring for why: that seam is one hop further
+    away, in ``mcp_server.py``'s ``_prs_scan_via_route`` HTTP closure to this
+    route). The route passes through the caller's own ``now``/``dry_run``/
+    ``limit``/``stall_hours`` (``work_loop._prs_loop`` supplies its own
+    ``PR_STALL_HOURS`` over the wire); everything else defaults to this
+    module's real ``gh``/filesystem/store wiring, and a test replaces the
+    whole function rather than faking ``gh_runner`` (see the module
+    docstring)."""
     store_path = store_path or default_store_path()
 
     cloned = await asyncio.to_thread(scan_cloned_repos, repos_dir, git_remote_url=git_remote_url)
