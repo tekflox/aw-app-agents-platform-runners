@@ -173,6 +173,29 @@ the CI job's discovered path (wrong directory, wrong naming convention, not
 in the matrix) will bit-rot the first time someone doesn't know to run it by
 hand. Point at the CI config you checked, not just the test output.
 
+**A push to a `devteam:needs-human` PR does not auto-retrigger review —
+you must force one.** This is a different gotcha from the cancelled-check
+race above, not a variant of it: `fredericowu/aw-shared-workflows`'s
+`code-review-reusable.yml` round state machine only auto-re-reviews a
+`synchronize` event when the PR is in round 2 (label
+`devteam:awaiting-fixes`). A PR carrying `devteam:needs-human` (escalated
+earlier for a finding serious enough to need a human call) does **not**
+get a fresh review just because you pushed a fix — that's intentional, to
+avoid burning review budget on every push once a PR is already escalated.
+`gh pr checks` right after such a push will still show the **previous**
+commit's "pass", not a verdict on your new one, and is indistinguishable
+from a real pass by its output alone. So:
+
+- If the PR you just pushed to carries `devteam:needs-human`, comment
+  `/aw-review` on it yourself immediately after the push — don't wait to
+  be asked.
+- Only treat the escalated finding as resolved once that forced review
+  run completes; watch the new run itself (not the stale `gh pr checks`
+  rollup) the same way the section above describes.
+- The gate removes the `devteam:needs-human` label itself on a clean
+  verdict from that forced review — no manual label cleanup needed once
+  it comes back clean.
+
 **Verify against the real target, not just CI.** A green pipeline proves
 the diff you touched builds and behaves as intended. It does not prove the
 thing works where it actually runs. Two shapes of that gap, both of which
