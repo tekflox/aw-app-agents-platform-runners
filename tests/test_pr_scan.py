@@ -597,6 +597,50 @@ def test_needs_human_pr_with_the_same_head_sha_is_not_re_reviewed(tmp_path):
     assert result["forced_reviews"] == []
 
 
+def test_needs_human_pr_on_the_ci_live_recent_path_is_still_stamped_and_not_re_reviewed(tmp_path):
+    """Regression (code-review round 2, PR #49): the forced-review branch
+    must stamp the store even when CI on HEAD is still live/recent (the
+    ``no_ci is False`` path, which returns before the work-order stamp
+    write further down). Without the stamp, the SAME head_sha gets
+    /aw-review reposted on every scan cycle for as long as CI keeps
+    completing inside the stall window."""
+    pr = _search_pr(25, updated_hours_ago=72)
+    view = {"headRefOid": "new-sha", "isDraft": False,
+           "labels": [{"name": "devteam:needs-human"}],
+           "statusCheckRollup": [{"status": "IN_PROGRESS", "conclusion": None, "completedAt": None}]}
+    stamp = {"tekflox/aw-app-kb#25": {"viewed_at": NOW - 7200, "updated_at": _iso(100),
+                                      "head_sha": "old-sha"}}
+
+    repos_dir = tmp_path / "repos"
+    (repos_dir / "aw-app-kb" / ".git").mkdir(parents=True)
+    store_path = str(tmp_path / "viewed.json")
+    ps.save_viewed_store(store_path, stamp)
+    comment_urls = []
+    runner = _fake_runner_with_comments(search_responses={"tekflox": [pr]},
+                                        view_responses={pr["url"]: view}, comment_urls=comment_urls)
+
+    result_1 = asyncio.run(ps.scan_prs(
+        now=NOW, dry_run=False, limit=10, repos_dir=str(repos_dir), gh_runner=runner,
+        store_path=store_path, git_remote_url=lambda p: "git@github.com:tekflox/aw-app-kb.git",
+        stall_hours=6))
+
+    assert comment_urls == [pr["url"]]
+    assert result_1["forced_reviews"] == [
+        {"pr": "tekflox/aw-app-kb#25", "detail": "head_sha changed old-sha -> new-sha"}]
+
+    stored = ps.load_viewed_store(store_path)
+    assert stored["tekflox/aw-app-kb#25"]["head_sha"] == "new-sha"
+
+    # Next scan cycle, same unchanged head_sha, CI still live/recent on HEAD.
+    result_2 = asyncio.run(ps.scan_prs(
+        now=NOW, dry_run=False, limit=10, repos_dir=str(repos_dir), gh_runner=runner,
+        store_path=store_path, git_remote_url=lambda p: "git@github.com:tekflox/aw-app-kb.git",
+        stall_hours=6))
+
+    assert comment_urls == [pr["url"]]  # still just the one post — no repeat
+    assert result_2["forced_reviews"] == []
+
+
 def test_pr_without_the_needs_human_label_is_never_force_reviewed(tmp_path):
     pr = _search_pr(22, updated_hours_ago=72)
     view = {"headRefOid": "new-sha", "isDraft": False, "labels": [],

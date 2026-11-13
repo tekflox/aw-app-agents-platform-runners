@@ -525,6 +525,8 @@ async def scan_prs(*, now: float, dry_run: bool = False, limit: int = 10,
                 forced_reviews.append({"pr": candidate["pr"],
                                        "detail": f"head_sha changed {stamped_head_sha} -> "
                                                 f"{candidate['head_sha']}"})
+                store[candidate["pr"]] = {"viewed_at": now, "updated_at": candidate["updated_at"],
+                                          "head_sha": candidate["head_sha"]}
 
         if view.get("isDraft"):
             candidate["is_draft"] = True
