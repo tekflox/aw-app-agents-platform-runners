@@ -4640,11 +4640,37 @@ async def _async_main() -> None:
             done, _pending = await asyncio.wait(
                 {read_future, writer_task}, return_when=asyncio.FIRST_COMPLETED)
             if writer_task in done:
-                read_future.cancel()
+                # `read_future.cancel()` here is a no-op in the steady
+                # state this races against — code-review finding, PR #50,
+                # carried over 3 review passes: by the time the writer
+                # dies, the stdin reader thread is normally ALREADY
+                # blocked inside the real `readline()` syscall (nothing
+                # new has arrived on stdin in a while), and
+                # `Future.cancel()` cannot interrupt a call that is
+                # already running. Raising and letting this propagate out
+                # of `_async_main` doesn't help either: `asyncio.run()`'s
+                # own teardown calls `shutdown_default_executor()`, which
+                # joins every thread in the default executor — including
+                # this still-blocked one — before the process can actually
+                # exit (THREAD_JOIN_TIMEOUT=300s on 3.12, only a
+                # RuntimeWarning on timeout, not a forced return). That
+                # turns "crash so aw-mcp-gateway respawns a healthy child"
+                # into a silent stall of up to 5 minutes — the exact
+                # failure mode this whole race was added to eliminate, one
+                # trigger later. `os._exit()` skips all Python-level
+                # teardown (no executor join, no atexit, no finally
+                # blocks) for an immediate process exit — safe here
+                # because the gateway is about to see this child die and
+                # respawn a fresh one regardless, and there is nothing
+                # left to flush: stdout is already broken (that's why the
+                # writer died) and stderr logging above already happened.
                 exc = writer_task.exception()
                 if exc is not None:
-                    raise exc
-                raise RuntimeError("mcp_server: writer task exited unexpectedly")
+                    log.critical("mcp_server: writer task died, exiting immediately: %s",
+                                exc, exc_info=exc)
+                else:
+                    log.critical("mcp_server: writer task exited unexpectedly, exiting immediately")
+                os._exit(1)
             line = read_future.result()
             if not line:
                 break

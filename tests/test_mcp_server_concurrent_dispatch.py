@@ -41,6 +41,7 @@ import asyncio
 import contextvars
 import json
 import sys
+import threading
 from pathlib import Path
 
 import pytest
@@ -305,15 +306,114 @@ class _FailingStdout:
         pass
 
 
+def _stub_os_exit(monkeypatch, exit_calls: list[int]) -> None:
+    """`os._exit()` never returns in production — the interpreter stops
+    executing ANY further bytecode, including every pending `finally` up
+    the call stack. A mock can prove the CALL happened promptly (that's
+    what `exit_calls` is for), but it cannot replicate "nothing after this
+    point ever runs" without actually killing the test process, so once
+    the stub's own `raise` starts propagating, this file's outer
+    `finally` (the one that `await writer_task`s on the way out) still
+    executes and can surface a DIFFERENT exception than the stub's own —
+    that's a test-harness artifact of mocking `os._exit`, not a
+    production concern. Callers below only assert on `exit_calls`, not on
+    whatever exception (if any) ultimately escapes."""
+
+    def _fake_exit(code: int) -> None:
+        exit_calls.append(code)
+        raise SystemExit(code)
+
+    monkeypatch.setattr(ms.os, "_exit", _fake_exit)
+
+
 def test_a_broken_stdout_crashes_async_main_instead_of_being_swallowed(monkeypatch):
     async def fake_dispatch_tool(name, arguments):
         return [ms.TextContent(type="text", text="ok")]
 
     monkeypatch.setattr(ms, "_dispatch_tool", fake_dispatch_tool)
+    exit_calls: list[int] = []
+    _stub_os_exit(monkeypatch, exit_calls)
 
     fake_in = _FakeStdin([json.dumps(_tool_call(1, "x"))])
     monkeypatch.setattr(sys, "stdin", fake_in)
     monkeypatch.setattr(sys, "stdout", _FailingStdout())
 
-    with pytest.raises(OSError, match="simulated broken pipe"):
+    with pytest.raises(BaseException):
         asyncio.run(ms._async_main())
+    assert exit_calls == [1]
+
+
+# ── (e2) the crash path exits immediately even while the stdin read is
+#         genuinely, indefinitely blocked ─────────────────────────────────
+# Finding carried over 3 review passes on 82eada1: (e)'s `_FakeStdin` never
+# actually blocks (`next()` on an exhausted iterator returns immediately via
+# `""`), so it can't tell "the writer's death propagates" apart from "the
+# reader thread was also already free to unblock on its own" — exactly the
+# two cases that differ in production. `read_future.cancel()` is a no-op
+# once the underlying executor thread is already running (parked in the
+# real blocking `readline()` syscall, the normal steady state — nothing new
+# has arrived on stdin in a while), so cancelling it does not release the
+# thread. The OLD code (`raise exc`) depended on `asyncio.run()`'s own
+# teardown to exit, but that teardown JOINS the default executor's threads
+# first — including this still-blocked one — which is exactly the up-to-
+# 300s (3.12) stall `os._exit()` exists to skip. This test drives a stdin
+# fake whose SECOND call blocks for real (on a `threading.Event`, released
+# only in the test's own cleanup so the worker thread doesn't leak into
+# the rest of the pytest process) and proves the fix reaches `os._exit`
+# without ever needing that second call to return.
+#
+# Deliberately does NOT use `asyncio.run()`: `asyncio.run()`'s teardown
+# calls `shutdown_default_executor()` unconditionally in its own `finally`,
+# which would try to join the still-blocked thread regardless of whether
+# `_async_main()` itself returned or raised — reintroducing in the TEST
+# the exact stall this fix removes from PRODUCTION. A bare event loop
+# (`run_until_complete` + `close()`) does not do that extra join, isolating
+# the assertion to "did our own code call `os._exit` promptly" rather than
+# "did Python's stdlib teardown also finish promptly", which is not what
+# this test is about.
+
+class _BlockingThenReleasedStdin:
+    """Serves one real line, then blocks for real on the next `readline()`
+    call — a `threading.Event().wait()` with no timeout, same shape as the
+    real syscall this mimics. Only returns (EOF) once `release()` is
+    called, so the worker thread can actually finish instead of leaking."""
+
+    def __init__(self, first_line: str) -> None:
+        self._served_first = False
+        self._first_line = first_line
+        self._unblock = threading.Event()
+
+    def readline(self) -> str:
+        if not self._served_first:
+            self._served_first = True
+            return self._first_line + "\n"
+        self._unblock.wait()
+        return ""
+
+    def release(self) -> None:
+        self._unblock.set()
+
+
+def test_a_broken_stdout_crash_exits_immediately_even_with_stdin_blocked(monkeypatch):
+    async def fake_dispatch_tool(name, arguments):
+        return [ms.TextContent(type="text", text="ok")]
+
+    monkeypatch.setattr(ms, "_dispatch_tool", fake_dispatch_tool)
+    exit_calls: list[int] = []
+    _stub_os_exit(monkeypatch, exit_calls)
+
+    fake_in = _BlockingThenReleasedStdin(json.dumps(_tool_call(1, "x")))
+    monkeypatch.setattr(sys, "stdin", fake_in)
+    monkeypatch.setattr(sys, "stdout", _FailingStdout())
+
+    loop = asyncio.new_event_loop()
+    try:
+        with pytest.raises(BaseException):
+            loop.run_until_complete(ms._async_main())
+    finally:
+        fake_in.release()
+        loop.close()
+
+    assert exit_calls == [1], (
+        "the crash path must call os._exit immediately, without waiting "
+        "for the still-blocked second readline() to ever return")
