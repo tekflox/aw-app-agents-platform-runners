@@ -14,6 +14,7 @@ from __future__ import annotations
 import asyncio
 import datetime as dt
 import sys
+import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -172,6 +173,36 @@ def test_ok_is_false_only_when_every_attempted_loop_failed():
     result = _run(_ctx(ExplodingBoard()), ["deploy", "attention"])
     assert len(result["errors"]) == 2
     assert result["ok"] is False
+
+
+def test_loops_run_concurrently_not_sequentially(monkeypatch):
+    """The whole point of the ``asyncio.gather`` rewrite (bug:work-loop-
+    multi-loop-timeout): wall-clock cost for N independent loops must be the
+    SLOWEST one, not the SUM of all of them — the sequential ``for`` loop
+    this replaces paid the full sum as its own critical path, which is what
+    pushed ``work_loop(loops=["deploy","attention","ready"])`` past the
+    caller's tool-call timeout even though each loop alone was fast."""
+    SLEEP_S = 0.05
+
+    async def _slow_a(ctx):
+        await asyncio.sleep(SLEEP_S)
+        return {"name": "a"}, [], []
+
+    async def _slow_b(ctx):
+        await asyncio.sleep(SLEEP_S)
+        return {"name": "b"}, [], []
+
+    monkeypatch.setitem(wl.LOOP_FUNCS, "deploy", _slow_a)
+    monkeypatch.setitem(wl.LOOP_FUNCS, "attention", _slow_b)
+
+    start = time.monotonic()
+    result = _run(_ctx(FakeBoard()), ["deploy", "attention"])
+    elapsed = time.monotonic() - start
+
+    assert result["deploy"] == {"name": "a"}
+    assert result["attention"] == {"name": "b"}
+    # Sequential would cost >= 2 * SLEEP_S; concurrent costs ~= 1 * SLEEP_S.
+    assert elapsed < SLEEP_S * 1.5, f"loops ran sequentially (elapsed={elapsed})"
 
 
 def test_ok_stays_true_when_only_reserved_loops_were_requested():
