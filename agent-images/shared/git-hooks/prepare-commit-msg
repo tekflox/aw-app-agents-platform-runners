@@ -70,6 +70,12 @@ fi
 # whole life, so unlike the run id this needs no per-turn refresh.
 session_id="${AW_SESSION_ID:-}"
 
+# Stable per (agent, session) too — a warm container is keyed on agent_id as
+# well as session_id, so the slug cannot change mid-container. Read before
+# turn_env sourcing below, same as session_id, so a future turn_env key
+# never shadows it.
+agent_slug="${AW_AGENT_SLUG:-}"
+
 # turn_env is rewritten every turn by warm_pool.dispatch_turn and is
 # authoritative over whatever NOTION_TASK_ID this container's env was
 # created with, which goes stale on turn 2+ of a reused warm container
@@ -90,4 +96,8 @@ fi
 if [ -n "$card_id" ]; then
     git interpret-trailers --if-exists replace \
         --trailer "AW-Card: ${card_id}" --in-place "$msg_file"
+fi
+if [ -n "$agent_slug" ]; then
+    git interpret-trailers --if-exists replace \
+        --trailer "AW-Agent-Slug: ${agent_slug}" --in-place "$msg_file"
 fi
