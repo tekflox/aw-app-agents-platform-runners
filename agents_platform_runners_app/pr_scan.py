@@ -316,10 +316,22 @@ def save_viewed_store(path: str, store: dict) -> None:
         raise
 
 
-def prune_viewed_store(store: dict, open_pr_keys: "set[str]") -> dict:
+def prune_viewed_store(store: dict, open_pr_keys: "set[str]", *,
+                       searched_owners: "set[str] | None" = None) -> dict:
     """Keys no longer in the open-PR set are dropped — keeps the file
-    bounded (design §2 "Prune")."""
-    return {k: v for k, v in store.items() if k in open_pr_keys}
+    bounded (design §2 "Prune"). A key is only eligible for pruning when
+    its OWN owner is in ``searched_owners`` (code-review finding, PR #41):
+    pruning unconditionally against whatever `gh search prs` happened to
+    return would delete a PR's back-off stamp the moment its owner's
+    search call fails (rate limit, timeout) — even though the per-owner
+    error isolation this module already has is built to tolerate exactly
+    that failure without losing state. ``None`` keeps every key's owner
+    implicitly "searched", for callers that already know their input is
+    complete (e.g. a direct unit test of pruning alone)."""
+    if searched_owners is None:
+        return {k: v for k, v in store.items() if k in open_pr_keys}
+    return {k: v for k, v in store.items()
+           if k in open_pr_keys or k.split("/", 1)[0] not in searched_owners}
 
 
 # ── the full sweep ────────────────────────────────────────────────────────
@@ -375,11 +387,13 @@ async def scan_prs(*, now: float, dry_run: bool = False, limit: int = 10,
 
     errors: list = []
     all_prs: list = []
+    searched_owners: set = set()
     async def _search(owner: str) -> None:
         rows, error = await search_open_prs_for_owner(owner, gh_runner)
         if error is not None:
             errors.append({"owner": owner, "error": error})
             return
+        searched_owners.add(owner)
         all_prs.extend(filter_prs_to_cloned_repos(rows, cloned_full_names))
 
     await _bounded_gather(cloned["owners"], _search, concurrency=concurrency)
@@ -466,7 +480,7 @@ async def scan_prs(*, now: float, dry_run: bool = False, limit: int = 10,
     await _bounded_gather(probe_batch, _probe, concurrency=concurrency)
 
     if not dry_run:
-        pruned = prune_viewed_store(store, open_pr_keys)
+        pruned = prune_viewed_store(store, open_pr_keys, searched_owners=searched_owners)
         save_viewed_store(store_path, pruned)
 
     return {

@@ -445,14 +445,32 @@ def test_per_owner_search_failure_is_isolated_and_other_owners_continue(tmp_path
     view = {"headRefOid": "sha", "isDraft": False,
            "statusCheckRollup": [{"status": "COMPLETED", "conclusion": "SUCCESS",
                                   "completedAt": _iso(50)}]}
+    store_path = str(tmp_path / "viewed.json")
+    # tekflox/aw-app-kb#99 was viewed by a PRIOR pass and is still genuinely
+    # open — but THIS pass's tekflox search fails, so scan_prs never learns
+    # that from gh. Pruning must not treat "not returned by a failed search"
+    # as "closed".
+    ps.save_viewed_store(store_path, {
+        "tekflox/aw-app-kb#99": {"viewed_at": NOW - 7200, "updated_at": _iso(100), "head_sha": "z"}})
     runner = _fake_runner(search_responses={"someone-else": [pr]}, view_responses={pr["url"]: view},
                           search_errors={"tekflox": "gh: rate limited"})
-    store_path = str(tmp_path / "viewed.json")
     result = asyncio.run(ps.scan_prs(now=NOW, dry_run=False, limit=10, repos_dir=str(repos_dir),
                                      gh_runner=runner, store_path=store_path,
                                      git_remote_url=git_remote_url, stall_hours=6))
     assert result["errors"] == [{"owner": "tekflox", "error": "gh: rate limited"}]
     assert len(result["work_orders"]) == 1  # someone-else's owner search still succeeded
+    stored = ps.load_viewed_store(store_path)
+    assert "tekflox/aw-app-kb#99" in stored, (
+        "code-review finding, PR #41: a failed owner search must not be read as "
+        "'this owner now has zero open PRs' and wipe that owner's back-off state")
+
+
+def test_prune_viewed_store_only_drops_keys_whose_owner_was_actually_searched():
+    store = {"a/x#1": {"updated_at": "t"}, "b/y#2": {"updated_at": "t"}}
+    pruned = ps.prune_viewed_store(store, set(), searched_owners={"a"})
+    assert pruned == {"b/y#2": {"updated_at": "t"}}, (
+        "a#1's owner WAS searched and is no longer open -> pruned; "
+        "b#2's owner was NOT searched this pass -> left untouched")
 
 
 def test_pruning_drops_a_pr_that_is_no_longer_open(tmp_path):
