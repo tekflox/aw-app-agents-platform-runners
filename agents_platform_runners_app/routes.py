@@ -781,6 +781,11 @@ def build_routes(config: dict | None = None, *, kanban_sweep_status: dict | None
             "notion_task_id": body.get("notion_task_id"),
             "source_device": body.get("source_device"),
             "agent_slug": body.get("agent_slug"),
+            # Additive reader: this app ships first (Kanban card
+            # 4175bf3b-9510-8122-b69a-dcc11804d479). Reads as None until
+            # agents-platform-multitenant's own RunnerLLM._dispatch ships the
+            # matching payload field — that's a separate PR/deploy, tracked
+            # on the same card, not a bug in this diff.
             "parent_run_id": body.get("parent_run_id"),
             # This turn is a bare CLI slash command ("/compact") and must reach
             # the container at position 0 — the warm path's own per-turn
