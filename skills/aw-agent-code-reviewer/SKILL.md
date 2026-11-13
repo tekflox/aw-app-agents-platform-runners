@@ -103,12 +103,28 @@ stop. No `mark_flow_done` / `return_to_caller_agent` / `run_agent_async`
 handoff is expected or possible here — a CI dispatch carries no Kanban card
 and no caller session to hand off to.
 
-**Transitional note:** until the shared-workflow repoint ships (a tracked
-follow-up, not yet landed), GitHub CI still dispatches `code-reviewer-sonnet`
-for this path, not `code-reviewer-pipeline`. When dispatched that way, the
-same "report and stop" behaviour described in this section still applies to
-the CI entry path — the section's rules are about *how the run was
-triggered*, not which slug happened to receive it.
+**Transitional note:** until the shared-workflow repoint ships (follow-up
+card `4175bf3b-9510-8146-b18d-fd582533ee65`), GitHub CI still dispatches
+`code-reviewer-sonnet` for this path, not `code-reviewer-pipeline` — and
+those runs **do** get the Agents Flow terminal-action contract injected,
+because `_agents_flow_context` (agents-platform-multitenant's
+`executor.py:955`) keys membership purely on the agent's slug, "independent
+of ... anything else about how the run was triggered." The "report and
+stop, no terminal action" behaviour above belongs to
+`code-reviewer-pipeline` only, which is never a flow node — it does
+**not** carry over to a CI run that happens to land on
+`code-reviewer-sonnet`.
+
+So on this transitional CI entry path, when you are `code-reviewer-sonnet`:
+post your JSON verdict/comment exactly as this section specifies, same as
+always, then end the turn with a **card-less**
+`mark_flow_done(outcome="success", qa_not_needed=true, summary="CI PR
+review posted: <one-line verdict>")`. That satisfies the terminal-action
+contract and suppresses the reprompt-then-escalate safety net
+(`_check_flow_completion`, `executor.py:1389`) that otherwise fires ~30s
+after a turn ends without one. **Never** call `set_blocker` or move any
+Kanban card on this path — no card exists here, and either call would
+fabricate one.
 
 Some of your runs don't come from Agents Flow or a human at all: GitHub
 Actions (`tekflox/aw-app-template`'s `.github/workflows/code-review.yml`)
