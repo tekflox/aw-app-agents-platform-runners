@@ -182,16 +182,22 @@ race above, not a variant of it: `fredericowu/aw-shared-workflows`'s
 earlier for a finding serious enough to need a human call) does **not**
 get a fresh review just because you pushed a fix — that's intentional, to
 avoid burning review budget on every push once a PR is already escalated.
-`gh pr checks` right after such a push will still show the **previous**
-commit's "pass", not a verdict on your new one, and is indistinguishable
-from a real pass by its output alone. So:
+`gh pr checks` right after such a push will not show any verdict on that
+context at all — a refused `synchronize` never runs the review job, so no
+`devteam/code-review` status is posted for the new SHA (GitHub's commit
+status is per-SHA, there's nothing to carry over from the old one).
+Verified live on AP-MT PR #72: `gh api .../commits/<sha>/status` shows
+zero `devteam/code-review` entries for that push commit until `/aw-review`
+was commented, well after the push. The absence reads as "not configured"
+rather than "nobody looked" — easy to miss for the opposite reason the
+cancelled-check race above is easy to miss. So:
 
 - If the PR you just pushed to carries `devteam:needs-human`, comment
   `/aw-review` on it yourself immediately after the push — don't wait to
   be asked.
 - Only treat the escalated finding as resolved once that forced review
-  run completes; watch the new run itself (not the stale `gh pr checks`
-  rollup) the same way the section above describes.
+  run completes; watch the new run itself (not an absent/missing check)
+  the same way the section above describes watching for a stale one.
 - The gate removes the `devteam:needs-human` label itself on a clean
   verdict from that forced review — no manual label cleanup needed once
   it comes back clean.
