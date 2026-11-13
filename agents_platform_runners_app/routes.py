@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import logging
 import os
+import time
 import uuid
 
 import httpx
@@ -29,6 +30,7 @@ from . import notion_token_sync as notion_token_sync_mod
 from . import observability_push as observability_push_mod
 from . import otel_env as otel_env_mod
 from . import platform_base as platform_base_mod
+from . import pr_scan as pr_scan_mod
 from . import runner_registration as runner_registration_mod
 from . import shared_redis
 from . import telegram_report as telegram_report_mod
@@ -267,6 +269,34 @@ def build_routes(config: dict | None = None, *, kanban_sweep_status: dict | None
         if response.status_code >= 400:
             raise HTTPException(response.status_code, response.text)
         return response.json()
+
+    @app.post("/pr-scan")
+    async def pr_scan_route(data: dict = Body(...)) -> dict:
+        """The core-side half of the work_loop `prs` loop — the actual
+        repo enumeration + `git`/`gh` subprocess sweep + viewed-stamp store
+        write, run HERE because this process (unlike `mcp_server.py`, a
+        stdio child of the mcp-gateway's OWN container) is the one that
+        actually has `/opt/aw-workspace/repos`, `gh`/`git` credentials, and
+        `AW_WORKSPACE_HOME` mounted. Same topology reason as
+        `/execution-index/search` and `/warm-containers` above — the MCP
+        tool comes in through the published workspace API, this route does
+        the last hop (card 4175bf3b's gateway-boundary gap: the prs loop
+        used to run `pr_scan.scan_prs` directly inside the MCP stdio child
+        and silently saw zero repos every single call).
+
+        Thin and verbatim on purpose: returns `pr_scan.scan_prs`'s own dict
+        unreshaped, including `work_orders`/`tagged` — the MCP-side
+        `_prs_loop` (work_loop.py) is what pops those into the tool's
+        envelope, and that contract stays owned there, not duplicated here.
+
+        `now` is accepted from the caller (so a dry-run test seam stays
+        reproducible across the hop) and defaults to this route's own
+        clock when omitted — e.g. a direct manual call."""
+        return await pr_scan_mod.scan_prs(
+            now=data.get("now") or time.time(),
+            dry_run=bool(data.get("dry_run")),
+            limit=int(data.get("limit") or 10),
+            stall_hours=float(data.get("stall_hours") or pr_scan_mod.DEFAULT_STALL_HOURS))
 
     @app.get("/execution-index/status")
     async def execution_index_status() -> dict:

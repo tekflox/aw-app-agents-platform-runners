@@ -170,8 +170,18 @@ def scan_cloned_repos(repos_dir: str = REPOS_DIR, *,
     ``map_cloned_repos``."""
     try:
         entries = sorted(os.listdir(repos_dir))
-    except OSError:
-        return map_cloned_repos({})
+    except OSError as exc:
+        # Code-review finding (card 4175bf3b gateway-boundary follow-up): a
+        # silent {"repos": [], "owners": [], "unmapped": []} here is
+        # indistinguishable from "this workspace genuinely has zero cloned
+        # repos" — exactly the shape that let the gateway-boundary gap run
+        # in production reporting ok:true with nothing to show for it, with
+        # no error anywhere to say why. Carry the failure forward so
+        # ``scan_prs`` can put it in the section's own ``errors`` instead
+        # of lying about an empty-but-healthy scan.
+        result = map_cloned_repos({})
+        result["error"] = f"{repos_dir} unreadable: {exc}"
+        return result
     remotes: dict = {}
     for name in entries:
         full = os.path.join(repos_dir, name)
@@ -386,6 +396,8 @@ async def scan_prs(*, now: float, dry_run: bool = False, limit: int = 10,
     cloned_full_names = set(repos_by_full_name)
 
     errors: list = []
+    if cloned.get("error"):
+        errors.append({"owner": None, "error": cloned["error"]})
     all_prs: list = []
     searched_owners: set = set()
     async def _search(owner: str) -> None:
