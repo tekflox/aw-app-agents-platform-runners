@@ -102,7 +102,6 @@ def _agents_base_transport() -> httpx.AsyncHTTPTransport:
 from . import kanban_dispatch  # noqa: E402
 from . import deploy_reconcile  # noqa: E402
 from . import work_loop as work_loop_mod  # noqa: E402
-from . import pr_scan  # noqa: E402
 from . import platform_base  # noqa: E402
 from . import telegram_report as telegram_report_mod  # noqa: E402
 
@@ -2929,6 +2928,48 @@ async def _work_loop_list_runs(c: httpx.AsyncClient, *, notion_task_id: str | No
         return None, f"malformed /api/runs response: {exc}"
 
 
+async def _prs_scan_via_route(c: httpx.AsyncClient, *, now: float, dry_run: bool = False,
+                              limit: int = 10, stall_hours: float = 6.0) -> dict:
+    """The ``prs`` loop's real ``WorkLoopContext.scanner`` — a two-hop route
+    call, same reason and same discipline as ``list_warm_containers``/
+    ``search_execution_history`` below: this process is a stdio child of the
+    mcp-gateway's OWN container, which mounts neither
+    ``/opt/aw-workspace/repos`` nor ``AW_WORKSPACE_HOME`` (where the viewed-
+    stamp store lives) nor any ``gh``/``git`` credential — confirmed live in
+    production (card 4175bf3b: the scan silently returned ``owners: []``
+    every time). The actual scan has to happen core-side, reached over the
+    published workspace API exactly like the board and the exec-index
+    service already are, via this app's own ``POST /pr-scan`` route.
+
+    Unlike ``_work_loop_list_runs`` above, this RAISES on a transport error
+    or non-200 rather than failing closed to an empty/error dict — a dict
+    return here would come back out of ``ctx.scanner`` indistinguishable
+    from a real empty scan, and ``run_work_loop``'s per-loop guard already
+    exists to turn an exception into a proper `errors` entry without
+    flipping `ok` for the other loops. An unreachable core must surface as
+    an error, never as a silent empty success — that silence is exactly
+    what made the gateway-boundary gap invisible in production."""
+    own_base = kanban_dispatch.board_base_url()
+    key = (os.environ.get(kanban_dispatch.API_KEY_VAR)
+           or kanban_dispatch._from_env_file(kanban_dispatch.API_KEY_VAR))
+    if not key:
+        raise RuntimeError(
+            f"{kanban_dispatch.API_KEY_VAR} is not set for this MCP upstream. It is "
+            "baked into the stdio env by the app's plugin.build_mcp_servers() — an "
+            "upstream missing it was registered by an older version of this app, so "
+            "restart the workspace (which rewrites mcp.json) and then the mcp-gateway.")
+    try:
+        r = await c.post(f"{own_base}/api/apps/agents-platform-runners/pr-scan",
+                         json={"now": now, "dry_run": dry_run, "limit": limit,
+                               "stall_hours": stall_hours},
+                         headers={"X-Api-Key": key}, timeout=120.0)
+    except httpx.HTTPError as exc:
+        raise RuntimeError(f"could not reach this workspace's own API at {own_base}: {exc}") from exc
+    if r.status_code != 200:
+        raise RuntimeError(f"{r.status_code} {r.text[:200]}")
+    return r.json()
+
+
 async def _dispatch_manager_once(c: httpx.AsyncClient, work_orders: list[dict]) -> dict:
     """The optional ``dispatch_manager=true`` hook (design §2) — fires the
     Manager with ``work_orders`` as a Mode B payload. AP-MT has no
@@ -3318,11 +3359,14 @@ async def _dispatch_tool(name: str, arguments: dict[str, Any] | None) -> list[Te
             async def _list_runs(**kw):
                 return await _work_loop_list_runs(c, **kw)
 
+            async def _scanner(**kw):
+                return await _prs_scan_via_route(c, **kw)
+
             ctx = work_loop_mod.WorkLoopContext(
                 board=_board_client(), list_runs=_list_runs, now=time.time(),
                 dry_run=dry_run, page_id=page_id, limit=limit, max_cards=max_cards,
                 reping=reping, platform=kanban_dispatch.PlatformClient(c, BASE),
-                scanner=pr_scan.scan_prs)
+                scanner=_scanner)
             # run_work_loop never raises BoardUnavailable itself — every loop
             # catches it internally and reports it in `errors` (code-review
             # finding, PR #36: a try/except here around this call was dead

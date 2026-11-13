@@ -120,12 +120,111 @@ def test_dispatch_is_skipped_when_a_manager_run_is_already_in_flight():
 
 # ── work_loop tool handler: prs loop wiring ──────────────────────────────
 
-def test_work_loop_tool_wires_pr_scan_as_the_prs_loop_scanner(monkeypatch):
-    """Card instructions item #3 — the handler must hand ``ctx.scanner`` the
-    real ``pr_scan.scan_prs`` (not leave it ``None``, which would make the
-    prs loop report an error on every real call). ``run_work_loop`` itself
-    is replaced so this stays a pure wiring check — it must never shell out
-    to git/gh or hit the network."""
+# ── _prs_scan_via_route — the prs loop's real scanner (card 4175bf3b ──────
+# gateway-boundary follow-up: mcp_server.py is a stdio child of the
+# mcp-gateway's OWN container, which mounts neither /opt/aw-workspace/repos
+# nor AW_WORKSPACE_HOME nor any gh/git credential, so pr_scan.scan_prs
+# cannot run in-process here any more — it has to go over the published
+# workspace API to this app's own core-side /pr-scan route.
+
+def test_prs_scan_via_route_returns_the_response_body_on_success(monkeypatch):
+    monkeypatch.setenv(ms.kanban_dispatch.API_KEY_VAR, "test-key")
+    fake_result = {"owners": ["tekflox"], "candidates": [{"pr": "tekflox/aw-app-kb#7"}],
+                  "work_orders": [], "tagged": [], "repos_unmapped": [], "counts": {},
+                  "truncated": False, "errors": []}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path.endswith("/api/apps/agents-platform-runners/pr-scan")
+        assert request.headers["X-Api-Key"] == "test-key"
+        return httpx.Response(200, json=fake_result)
+
+    async def _run():
+        async with _client(handler) as c:
+            return await ms._prs_scan_via_route(c, now=123.0, dry_run=True, limit=5,
+                                                stall_hours=6.0)
+
+    result = asyncio.run(_run())
+    assert result == fake_result
+
+
+def test_prs_scan_via_route_raises_on_a_non_200_instead_of_returning_an_empty_dict(monkeypatch):
+    """The exact finding this hardening exists for: a dict return here
+    (even an error dict) would come back out of ``ctx.scanner``
+    indistinguishable from a real, successful-but-empty scan. This must
+    RAISE so ``run_work_loop``'s per-loop guard turns it into a real
+    ``errors`` entry — never a silent ``owners: []`` success."""
+    monkeypatch.setenv(ms.kanban_dispatch.API_KEY_VAR, "test-key")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(502, text="core unreachable")
+
+    async def _run():
+        async with _client(handler) as c:
+            return await ms._prs_scan_via_route(c, now=123.0, dry_run=False, limit=10,
+                                                stall_hours=6.0)
+
+    try:
+        asyncio.run(_run())
+        assert False, "expected a RuntimeError"
+    except RuntimeError as exc:
+        assert "502" in str(exc)
+
+
+def test_prs_scan_via_route_raises_on_a_transport_error(monkeypatch):
+    """Same reasoning as the 502 case — a core that is simply unreachable
+    must not look like a scan that ran and found nothing."""
+    monkeypatch.setenv(ms.kanban_dispatch.API_KEY_VAR, "test-key")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("connection refused")
+
+    async def _run():
+        async with _client(handler) as c:
+            return await ms._prs_scan_via_route(c, now=123.0, dry_run=False, limit=10,
+                                                stall_hours=6.0)
+
+    try:
+        asyncio.run(_run())
+        assert False, "expected a RuntimeError"
+    except RuntimeError as exc:
+        assert "could not reach this workspace's own API" in str(exc)
+
+
+def test_prs_scan_via_route_raises_when_the_api_key_is_unset(monkeypatch):
+    monkeypatch.delenv(ms.kanban_dispatch.API_KEY_VAR, raising=False)
+    # This test runs inside a real workspace container that genuinely has
+    # AW_WORKSPACE_HOME/.env with a real key — the env-var check above
+    # alone isn't enough to simulate "unset", since the real code falls
+    # back to that file exactly like the live upstream does.
+    monkeypatch.setattr(ms.kanban_dispatch, "_from_env_file", lambda name: None)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise AssertionError("must not even attempt the call without a key")
+
+    async def _run():
+        async with _client(handler) as c:
+            return await ms._prs_scan_via_route(c, now=123.0, dry_run=False, limit=10,
+                                                stall_hours=6.0)
+
+    try:
+        asyncio.run(_run())
+        assert False, "expected a RuntimeError"
+    except RuntimeError as exc:
+        assert ms.kanban_dispatch.API_KEY_VAR in str(exc)
+
+
+# ── work_loop tool handler: prs loop wiring ──────────────────────────────
+
+def test_work_loop_tool_wires_a_scanner_that_calls_the_pr_scan_route(monkeypatch):
+    """The handler must hand ``ctx.scanner`` a callable that forwards to
+    ``_prs_scan_via_route`` — not ``pr_scan.scan_prs`` directly any more
+    (that import is gone from this gateway-side module entirely, card
+    4175bf3b's gateway-boundary follow-up). ``run_work_loop`` itself is
+    replaced so this stays a pure wiring check that never hits the
+    network."""
+    assert not hasattr(ms, "pr_scan"), (
+        "mcp_server.py must not import pr_scan any more — the scan runs "
+        "core-side now, reached over HTTP via _prs_scan_via_route")
     captured = {}
 
     async def fake_run_work_loop(ctx, loops):
@@ -135,8 +234,19 @@ def test_work_loop_tool_wires_pr_scan_as_the_prs_loop_scanner(monkeypatch):
 
     monkeypatch.setattr(ms.work_loop_mod, "run_work_loop", fake_run_work_loop)
 
-    asyncio.run(ms._dispatch_tool("work_loop", {"loops": ["prs"], "dry_run": True}))
-    assert captured["ctx"].scanner is ms.pr_scan.scan_prs
+    route_calls = []
+
+    async def fake_via_route(c, **kw):
+        route_calls.append(kw)
+        return {"owners": [], "candidates": [], "work_orders": [], "tagged": [],
+               "repos_unmapped": [], "counts": {}, "truncated": False, "errors": []}
+
+    monkeypatch.setattr(ms, "_prs_scan_via_route", fake_via_route)
+
+    asyncio.run(ms._dispatch_tool("work_loop", {"loops": ["prs"], "dry_run": True, "limit": 5}))
+    scanner = captured["ctx"].scanner
+    asyncio.run(scanner(now=42.0, dry_run=True, limit=5, stall_hours=6.0))
+    assert route_calls == [{"now": 42.0, "dry_run": True, "limit": 5, "stall_hours": 6.0}]
 
 
 def test_dispatch_succeeds_with_a_well_formed_round_trip():

@@ -105,9 +105,17 @@ def test_scan_cloned_repos_only_considers_dirs_with_a_dot_git(tmp_path):
     assert result["unmapped"] == []
 
 
-def test_scan_cloned_repos_tolerates_a_missing_repos_dir(tmp_path):
-    result = ps.scan_cloned_repos(str(tmp_path / "does-not-exist"))
-    assert result == {"repos": [], "owners": [], "unmapped": []}
+def test_scan_cloned_repos_carries_a_missing_repos_dir_as_an_error_not_a_clean_empty(tmp_path):
+    """Code-review finding (gateway-boundary follow-up, card 4175bf3b): a
+    bare {"repos": [], "owners": [], "unmapped": []} here is
+    indistinguishable from "this workspace genuinely has zero cloned
+    repos" — exactly the shape that let the prs loop report ok:true with
+    nothing to show for it, with no error anywhere to say why, for a full
+    day in production."""
+    missing = str(tmp_path / "does-not-exist")
+    result = ps.scan_cloned_repos(missing)
+    assert result["repos"] == [] and result["owners"] == [] and result["unmapped"] == []
+    assert missing in result["error"]
 
 
 # ── filter_prs_to_cloned_repos ───────────────────────────────────────────
@@ -429,6 +437,26 @@ def test_cap_is_applied_before_phase_b_probing_and_reports_truncated(tmp_path):
     assert result["truncated"] is True
     assert len(probed_urls) == 2
     assert result["counts"]["probed"] == 2
+
+
+def test_scan_prs_surfaces_an_unreadable_repos_dir_as_an_error_not_a_clean_empty(tmp_path):
+    """Same finding as scan_cloned_repos's own unit test, exercised through
+    the full ``scan_prs`` entry point — this is the shape ``work_loop.py``'s
+    ``_prs_loop`` actually sees (``section["errors"]``), the one that used
+    to come back empty with no error at all."""
+    missing = str(tmp_path / "does-not-exist")
+
+    async def exploding_runner(args):
+        raise AssertionError("no owners were ever found — gh must never be called")
+
+    result = asyncio.run(ps.scan_prs(now=NOW, dry_run=False, limit=10, repos_dir=missing,
+                                     gh_runner=exploding_runner,
+                                     store_path=str(tmp_path / "viewed.json")))
+    assert result["owners"] == []
+    assert result["candidates"] == []
+    assert len(result["errors"]) == 1
+    assert missing in result["errors"][0]["error"]
+    assert result["errors"][0]["owner"] is None
 
 
 def test_per_owner_search_failure_is_isolated_and_other_owners_continue(tmp_path):
