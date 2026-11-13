@@ -121,6 +121,25 @@ def test_filter_keeps_only_cloned_repos():
     assert [p["number"] for p in kept] == [1]
 
 
+def test_search_sorts_oldest_updated_first_with_a_high_limit():
+    """Code-review finding (PR #41): `gh search prs` defaults to 30 results
+    sorted by best-match relevance, not updatedAt — an owner with more open
+    PRs than that could silently lose exactly the most-neglected ones.
+    Sorting updated/asc means a PR cut off by any limit is, by
+    construction, one of the LEAST stale ones."""
+    captured = {}
+
+    async def runner(args):
+        captured["args"] = args
+        return 0, "[]", ""
+
+    asyncio.run(ps.search_open_prs_for_owner("tekflox", runner))
+    args = captured["args"]
+    assert args[args.index("--sort") + 1] == "updated"
+    assert args[args.index("--order") + 1] == "asc"
+    assert int(args[args.index("--limit") + 1]) >= 1000
+
+
 # ── no_live_or_recent_ci — staleness/CI matrix ──────────────────────────
 
 def test_no_rollup_at_all_passes_as_no_ci():

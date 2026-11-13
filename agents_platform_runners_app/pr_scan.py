@@ -64,6 +64,19 @@ DEFAULT_STALL_HOURS = 6
 SEARCH_FIELDS = "number,repository,title,url,updatedAt,isDraft,createdAt,author"
 VIEW_FIELDS = "headRefOid,updatedAt,isDraft,statusCheckRollup"
 
+# Code-review finding (PR #41): `gh search prs` defaults to 30 results
+# sorted by best-match relevance, not `updatedAt` — for an owner with more
+# open PRs than that (across ALL their repos, not just the cloned ones; the
+# cloned-repo filter happens client-side after this fetch), the oldest/
+# most-neglected ones are exactly the ones most likely to fall outside that
+# window, undermining the whole point of a staleness sweep, silently (no
+# error, and the response's own `truncated` flag only covers the Phase B
+# probe cap, not this one). Sorting oldest-updated-first means a PR that
+# DOES get cut off by the limit is, by construction, one of the LEAST
+# stale ones in the owner's queue — the opposite of what this loop cares
+# about. 1000 is `gh`'s own practical ceiling for one search call.
+SEARCH_LIMIT = 1000
+
 # GitHub's *live* check states — "status", never "conclusion": a SKIPPED or
 # NEUTRAL check is status=COMPLETED, so a conclusion-based "is CI running"
 # read would misclassify it as still running (design §7, risk #2).
@@ -172,7 +185,8 @@ def scan_cloned_repos(repos_dir: str = REPOS_DIR, *,
 
 async def search_open_prs_for_owner(owner: str, gh_runner: GhRunner) -> "tuple[list | None, str | None]":
     code, out, err = await gh_runner(["search", "prs", "--owner", owner, "--state", "open",
-                                      "--json", SEARCH_FIELDS])
+                                      "--sort", "updated", "--order", "asc",
+                                      "--limit", str(SEARCH_LIMIT), "--json", SEARCH_FIELDS])
     if code != 0:
         return None, (err or out or f"gh search prs --owner {owner} exited {code}").strip()
     try:
@@ -472,4 +486,4 @@ __all__ = ["GhRunner", "default_gh_runner", "parse_github_remote", "map_cloned_r
            "scan_cloned_repos", "search_open_prs_for_owner", "view_pr",
            "filter_prs_to_cloned_repos", "no_live_or_recent_ci", "backoff_state",
            "is_stale_enough", "load_viewed_store", "save_viewed_store", "prune_viewed_store",
-           "default_store_path", "scan_prs", "DEFAULT_STALL_HOURS", "REPOS_DIR"]
+           "default_store_path", "scan_prs", "DEFAULT_STALL_HOURS", "REPOS_DIR", "SEARCH_LIMIT"]
