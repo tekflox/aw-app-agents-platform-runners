@@ -19,11 +19,29 @@ What this gives the model:
 ``$AGENTS_BASE`` (default ``http://127.0.0.1:8765``) points at a separately
 managed agents-platform-multitenant instance — this client never spawns or
 owns that process.
+
+Concurrency (card 4175bf3b-9510-811f): ``_async_main`` dispatches every
+JSON-RPC request as its own ``asyncio.Task`` instead of ``await``ing it
+inline. Before this, a single slow call (confirmed live: ``run_monitor_sync``
+blocked 997.9s polling another run) monopolized this one stdio child for its
+whole duration — every other caller sharing this upstream (aw-mcp-gateway
+keeps exactly one of this process alive for the whole workspace) queued
+silently behind it in the OS pipe buffer, with no error, no log, and no
+SigNoz trace, because the request never even left stdin. See
+``_async_main``'s own docstring for the dispatch/write-serialization
+mechanism. **The invariant this changes: tool handlers may now run
+concurrently with each other**, bounded by a semaphore — anyone adding new
+module-level mutable state after this point must design for that. A lazy
+``if x is None: x = Foo()`` check-and-set is still atomic (CPython's
+cooperative scheduling means no other task runs until the current
+synchronous statement hits an ``await``), but an in-place mutation
+(``.append``/``.clear()``/slice-assignment) that spans an ``await`` is not.
 """
 from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import re
 import sys
@@ -137,6 +155,15 @@ from . import mcp_otel  # noqa: E402
 # carries `bot_slug` for a tenant running more than one.
 DEFAULT_GALLERY_BOT_SLUG = ""
 
+# Lazy-init check-and-set, safe under real concurrent dispatch (card
+# 4175bf3b-9510-811f): `BoardClient.__init__` only does `self._base = ...`
+# — no I/O, no `await` — so this whole function body is one uninterruptible
+# synchronous statement sequence even with many `_dispatch_tool` tasks live
+# at once. Two tasks calling `_board_client()` "simultaneously" can only
+# mean one runs to completion (or to its next `await`, and there isn't one
+# here) before the other gets a turn; the second one simply sees `_BOARD`
+# already set. Would need a lock only if `BoardClient()` construction ever
+# grew an `await` of its own.
 _BOARD: "kanban_dispatch.BoardClient | None" = None
 
 
@@ -156,8 +183,16 @@ def _board_client() -> "kanban_dispatch.BoardClient":
 # THROUGH this connector: two agents each calling `record_plan_criterion` on
 # the SAME plan concurrently, which is exactly the review finding's own
 # example. `setdefault` is safe with no `await` between the dict read and
-# write — this module is single-threaded asyncio, so nothing can interleave
-# inside one synchronous statement.
+# write — restated for card 4175bf3b-9510-811f, which made tool dispatch
+# genuinely concurrent (`_async_main` now runs every request as its own
+# task, not the old one-at-a-time model this comment originally described):
+# the reasoning still holds. CPython's cooperative asyncio scheduling means
+# no other task can run until the CURRENT task hits an `await` — and
+# `_PLAN_CRITERIA_LOCKS.setdefault(...)` contains none — so this dict's
+# read-check-insert is still one uninterruptible step regardless of how many
+# OTHER tasks are concurrently in flight. The lock this dict hands out is
+# what then serializes the actual cross-`await` read-modify-write inside
+# `record_plan_criterion` itself.
 _PLAN_CRITERIA_LOCKS: dict[str, asyncio.Lock] = {}
 
 
@@ -176,6 +211,14 @@ AUTH_HEADERS = {"Authorization": f"Bearer {_TOKEN}"} if _TOKEN else {}
 # Last-successful /api/agents and /api/workflows payloads, used by _list_tools()
 # to keep the dynamic agent_<slug>/workflow_<slug> runners around (stale but
 # present) across an AP-MT outage instead of dropping them from tools/list.
+#
+# Safe under concurrent dispatch (card 4175bf3b-9510-811f): every write site
+# is a whole-object reassignment (`_LAST_GOOD_AGENTS, _LAST_GOOD_WORKFLOWS =
+# agents, workflows` in `_list_tools()`), never an in-place mutation
+# (`.append`/`.clear()`/slice-assignment) — a concurrent reader sees either
+# the old list object or the new one in full, never a torn one, regardless
+# of how many `_list_tools()` calls race each other. An in-place mutation
+# spanning an `await` would NOT be safe the same way; there is none here.
 _LAST_GOOD_AGENTS: list[dict] = []
 _LAST_GOOD_WORKFLOWS: list[dict] = []
 
@@ -403,7 +446,16 @@ def _target_patch_schema() -> dict:
 
 @server.list_tools()
 async def _list_tools() -> list[Tool]:
-    _ensure_running()
+    # Shared-state audit gap found alongside card 4175bf3b-9510-811f's
+    # concurrency fix: `_ensure_running()` -> `_running()` makes a
+    # SYNCHRONOUS `httpx.get(..., timeout=1.5)` call. Called bare (no
+    # `asyncio.to_thread`), this blocks the WHOLE event loop for up to 1.5s
+    # on every `tools/list` — not just this task, every other concurrently
+    # in-flight tool call too, which defeats the point of dispatching
+    # requests as separate tasks. `asyncio.to_thread` moves the blocking
+    # socket call off the loop, same pattern already used for every
+    # `kanban_dispatch.BoardClient` call site in this file.
+    await asyncio.to_thread(_ensure_running)
     global _LAST_GOOD_AGENTS, _LAST_GOOD_WORKFLOWS
     try:
         async with httpx.AsyncClient(timeout=10, headers=AUTH_HEADERS,
@@ -4390,23 +4442,266 @@ async def handle_request(request: dict) -> dict | None:
     return None
 
 
+# stderr-only, dedicated logger (card 4175bf3b-9510-811f) — NOT the root
+# logger. `sys.stdout` is the JSON-RPC protocol channel (see `_async_main`
+# below); a stray log line on it would corrupt every response sharing this
+# stdio upstream. A bare `logging.getLogger(__name__)` with no handler of
+# its own would, by default, propagate to the root logger — which this
+# process's `mcp_otel.setup()` sometimes configures (when OTel export is
+# on) and sometimes leaves untouched (when it's off, in which case Python's
+# `logging.lastResort` handler already puts WARNING+ on stderr for us).
+# Attaching a handler directly to THIS logger, with `propagate = False`,
+# keeps that interaction simple: this module's own stderr output no longer
+# depends on whether `mcp_otel` has run yet or what it decided, and it
+# can't accidentally add a handler to the root logger that some other
+# imported module (httpx, opentelemetry's own instrumentation) wasn't
+# expecting.
+log = logging.getLogger(__name__)
+log.setLevel(logging.INFO)
+log.propagate = False
+if not log.handlers:
+    _stderr_handler = logging.StreamHandler(sys.stderr)
+    _stderr_handler.setFormatter(
+        logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
+    log.addHandler(_stderr_handler)
+
+# Bounds how many `tools/call`/`tools/list`/etc. requests this process
+# dispatches at once (card 4175bf3b-9510-811f). Without a cap, the burst of
+# queued calls that drains the instant a long blocker finishes (ten calls in
+# 20s was the measured live incident) would spawn ten tasks instantly — fine
+# today, but a future caller sending hundreds at once should degrade to
+# "some wait their turn" rather than "spawn hundreds of concurrent httpx
+# clients against AP-MT". 32 is generous headroom over any burst seen live
+# so far, not a tuned ceiling.
+_MAX_CONCURRENT_TOOL_CALLS = 32
+
+
 async def _async_main() -> None:
+    """Read JSON-RPC requests off stdin, dispatch each CONCURRENTLY.
+
+    Before this (card 4175bf3b-9510-811f): one `await handle_request(...)`
+    per line, strictly sequential for the whole process's life. A single
+    slow call (confirmed live: `run_monitor_sync` blocked 997.9s) held the
+    only stdio child this workspace shares across every caller, and every
+    other tool call — from any agent, any run — queued silently in the OS
+    pipe buffer behind it: no error, no log, no trace, because the request
+    never even reached `readline()`.
+
+    Now: every complete line read from stdin is handed to its own
+    `asyncio.Task` via `asyncio.create_task` — the readline loop itself
+    never awaits a request's own completion, so it keeps reading and
+    dispatching new requests while earlier ones are still in flight.
+    Concurrency is bounded by `_MAX_CONCURRENT_TOOL_CALLS` via a semaphore so
+    a burst can't spawn unbounded tasks/httpx clients at once.
+
+    Serializing stdout: a JSON-RPC response line can comfortably exceed
+    `PIPE_BUF` (a large `tools/call` result, easily), so a plain
+    `sys.stdout.write()` call is not guaranteed atomic at the OS level —
+    with multiple tasks writing concurrently, two responses' bytes could
+    interleave mid-line, corrupting the protocol stream for EVERY caller
+    sharing this one upstream (strictly worse than the head-of-line
+    blocking this PR fixes). This uses design (a) from the card's own
+    options — one `asyncio.Queue` that every task pushes its finished
+    response string onto, drained by a single dedicated writer task that is
+    the ONLY thing that ever touches `sys.stdout` — over design (b) (one
+    `asyncio.Lock` held across each write): a queue fits this function's
+    existing shape (a loop that already owns its own background task) more
+    directly than threading a lock through every exit path of
+    `_handle_one`, and it decouples "a task finished" from "stdout is free
+    right now" without that task having to wait on a lock itself.
+
+    ``notifications/initialized`` returns ``None`` from `handle_request`
+    (no response to send) — `_handle_one` still runs it through the same
+    semaphore/in-flight bookkeeping as everything else; only the "write a
+    response" step is skipped, exactly as it was in the old sequential code.
+    """
     loop = asyncio.get_running_loop()
-    while True:
-        line = await loop.run_in_executor(None, sys.stdin.readline)
-        if not line:
-            break
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            request = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        response = await handle_request(request)
+    semaphore = asyncio.Semaphore(_MAX_CONCURRENT_TOOL_CALLS)
+    write_queue: asyncio.Queue[str | None] = asyncio.Queue()
+    in_flight = 0
+    tasks: set[asyncio.Task] = set()
+
+    async def _writer() -> None:
+        # The only coroutine that ever touches sys.stdout for a response —
+        # that exclusivity IS the serialization; no lock needed on this
+        # side. A write/flush failure (e.g. a broken pipe if the gateway
+        # closes/respawns this child while stdin is still readable) is
+        # deliberately NOT swallowed (code-review finding, PR #50):
+        # catching and continuing here would leave every future response
+        # queued into `write_queue` forever with nothing draining it —
+        # unbounded memory growth and total silent response loss for every
+        # caller, a quieter, whole-process version of the exact
+        # head-of-line-blocking failure this PR exists to fix. Logging then
+        # re-raising instead lets the exception propagate out of this task;
+        # the read loop below races stdin against this task specifically so
+        # it notices and re-raises too, crashing the whole process so
+        # aw-mcp-gateway respawns a fresh child with a working stdout.
+        while True:
+            item = await write_queue.get()
+            if item is None:
+                break
+            try:
+                sys.stdout.write(item)
+                sys.stdout.flush()
+            except Exception:
+                log.exception("mcp writer: sys.stdout write failed — crashing so the "
+                              "gateway respawns this child")
+                raise
+
+    async def _handle_one(request: Any) -> None:
+        nonlocal in_flight
+        method: str | None = None
+        req_id = None
+        tool_name: str | None = None
+        caller_run_id: str | None = None
+
+        async with semaphore:
+            in_flight += 1
+            start = time.monotonic()
+            response: dict | None = None
+            try:
+                # `request` itself might not even be a dict — code-review
+                # finding, PR #50, a27134328d27: a syntactically valid
+                # top-level JSON value that isn't an object (a bare array,
+                # number, string, or `null`) parses fine via `json.loads`
+                # but has no `.get`. `method`/`id` extraction used to run
+                # BEFORE this try existed AT ALL, so that raised
+                # `AttributeError` uncaught — same silent-hang failure mode
+                # as the malformed `params`/`arguments` case below, just one
+                # level up (a malformed top-level request shape instead of
+                # a malformed `params`). No id can be recovered from a
+                # non-object request, so per JSON-RPC 2.0 ("If it was not
+                # possible to detect the id ... it MUST be Null") the error
+                # response below carries `id: null` rather than being
+                # dropped the way a legitimately id-less failure is below.
+                if not isinstance(request, dict):
+                    log.error("mcp request is not a JSON object: %r", request)
+                    response = {"jsonrpc": "2.0", "id": None,
+                               "error": {"code": -32600,
+                                        "message": "Invalid Request: top-level value must be an object"}}
+                else:
+                    # Extracting tool_name/caller_run_id lives INSIDE this
+                    # try too — code-review finding, PR #50: a `tools/call`
+                    # whose `params` isn't a dict (e.g. a JSON array) or
+                    # whose `arguments` is a non-dict truthy value used to
+                    # raise OUTSIDE the guarded block below, dying with no
+                    # response ever written for that request's id and no
+                    # `log.exception` either — the caller would silently
+                    # hang exactly like the head-of-line-blocking bug this
+                    # PR fixes, just scoped to one bad request instead of
+                    # the whole process.
+                    method = request.get("method")
+                    req_id = request.get("id")
+                    if method == "tools/call":
+                        params = request.get("params")
+                        if isinstance(params, dict):
+                            tool_name = params.get("name")
+                            arguments = params.get("arguments")
+                            caller_run_id = _caller_run_id(
+                                arguments if isinstance(arguments, dict) else {})
+                    if tool_name:
+                        log.info("tools/call start name=%s caller_run_id=%s in_flight=%d",
+                                  tool_name, caller_run_id, in_flight)
+                    response = await handle_request(request)
+            except Exception as exc:  # noqa: BLE001 — one task's bug must not
+                # strand its own caller forever (no reply ever written for
+                # its id) nor take the whole upstream down with it, now that
+                # a crash here no longer stops every OTHER in-flight task
+                # the way the old sequential loop's own crash-and-respawn
+                # did. `handle_request`'s "tools/call" branch already
+                # catches tool-handler exceptions itself; this is the
+                # backstop for anything else (tools/list, a future method,
+                # or the malformed-request shapes described above).
+                log.exception("mcp request crashed: method=%s id=%s", method, req_id)
+                response = ({"jsonrpc": "2.0", "id": req_id,
+                            "error": {"code": -32603, "message": f"{type(exc).__name__}: {exc}"}}
+                           if req_id is not None else None)
+            finally:
+                in_flight -= 1
+                if tool_name:
+                    log.info(
+                        "tools/call done name=%s caller_run_id=%s elapsed=%.3fs in_flight=%d",
+                        tool_name, caller_run_id, time.monotonic() - start, in_flight)
+
         if response is not None:
-            sys.stdout.write(json.dumps(response) + "\n")
-            sys.stdout.flush()
+            await write_queue.put(json.dumps(response) + "\n")
+
+    writer_task = asyncio.create_task(_writer())
+    try:
+        while True:
+            # Races the blocking stdin read against the writer task
+            # (code-review finding, PR #50) rather than just reading in a
+            # tight loop: if `_writer` dies (see its own docstring above),
+            # this notices as soon as it happens — not whenever the NEXT
+            # stdin line happens to arrive, which could be an arbitrary
+            # delay — and re-raises immediately instead of continuing to
+            # accept requests into a `write_queue` nothing drains.
+            read_future = loop.run_in_executor(None, sys.stdin.readline)
+            done, _pending = await asyncio.wait(
+                {read_future, writer_task}, return_when=asyncio.FIRST_COMPLETED)
+            if writer_task in done:
+                # `read_future.cancel()` here is a no-op in the steady
+                # state this races against — code-review finding, PR #50,
+                # carried over 3 review passes: by the time the writer
+                # dies, the stdin reader thread is normally ALREADY
+                # blocked inside the real `readline()` syscall (nothing
+                # new has arrived on stdin in a while), and
+                # `Future.cancel()` cannot interrupt a call that is
+                # already running. Raising and letting this propagate out
+                # of `_async_main` doesn't help either: `asyncio.run()`'s
+                # own teardown calls `shutdown_default_executor()`, which
+                # joins every thread in the default executor — including
+                # this still-blocked one — before the process can actually
+                # exit (THREAD_JOIN_TIMEOUT=300s on 3.12, only a
+                # RuntimeWarning on timeout, not a forced return). That
+                # turns "crash so aw-mcp-gateway respawns a healthy child"
+                # into a silent stall of up to 5 minutes — the exact
+                # failure mode this whole race was added to eliminate, one
+                # trigger later. `os._exit()` skips all Python-level
+                # teardown (no executor join, no atexit, no finally
+                # blocks) for an immediate process exit — safe here
+                # because the gateway is about to see this child die and
+                # respawn a fresh one regardless, and there is nothing
+                # left to flush: stdout is already broken (that's why the
+                # writer died) and stderr logging above already happened.
+                exc = writer_task.exception()
+                if exc is not None:
+                    log.critical("mcp_server: writer task died, exiting immediately: %s",
+                                exc, exc_info=exc)
+                else:
+                    log.critical("mcp_server: writer task exited unexpectedly, exiting immediately")
+                os._exit(1)
+            line = read_future.result()
+            if not line:
+                break
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                request = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            task = asyncio.create_task(_handle_one(request))
+            tasks.add(task)
+            task.add_done_callback(tasks.discard)
+    finally:
+        pending = list(tasks)
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
+        # Always resolve `writer_task`, never just "if it isn't done yet" —
+        # the write failure this whole function races against can land
+        # during THIS drain too (a handler queued its response, then the
+        # writer failed writing it, while we were still gathering `tasks`
+        # above). Checking `.done()` first and skipping the await when it's
+        # already True would retrieve nothing, leaving that exception to
+        # vanish as an unretrieved-task-exception log line instead of
+        # propagating — exactly the silent-loss failure mode this whole
+        # supervision exists to prevent. `await`ing an already-finished
+        # task is a no-op (or re-raises) either way, so there is no reason
+        # to special-case it.
+        if not writer_task.done():
+            await write_queue.put(None)
+        await writer_task
 
 
 def main() -> None:
