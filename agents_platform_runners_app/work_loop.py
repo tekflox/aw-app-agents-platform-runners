@@ -377,8 +377,11 @@ async def _prs_loop(ctx: WorkLoopContext) -> "tuple[dict, list[dict], list[dict]
                                stall_hours=PR_STALL_HOURS)
     work_orders = result.pop("work_orders", [])
     tagged = result.pop("tagged", [])
+    forced_reviews = result.pop("forced_reviews", [])
     actions = [{"loop": "prs", "pr": t["pr"], "action": "tagged_viewed", "detail": t["detail"]}
               for t in tagged]
+    actions += [{"loop": "prs", "pr": f["pr"], "action": "forced_review_needs_human",
+                "detail": f["detail"]} for f in forced_reviews]
     return result, work_orders, actions
 
 

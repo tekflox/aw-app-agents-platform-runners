@@ -488,6 +488,16 @@ def test_prs_loop_turns_tagged_prs_into_actions_taken():
                                         "action": "tagged_viewed", "detail": "updated_at=x"}]
 
 
+def test_prs_loop_turns_forced_reviews_into_actions_taken():
+    scanner = make_scanner({"candidates": [], "work_orders": [], "tagged": [],
+                            "forced_reviews": [{"pr": "tekflox/aw-app-kb#20",
+                                                "detail": "head_sha changed old-sha -> new-sha"}]})
+    result = _run(_ctx(FakeBoard(), scanner=scanner), ["prs"])
+    assert result["actions_taken"] == [{"loop": "prs", "pr": "tekflox/aw-app-kb#20",
+                                        "action": "forced_review_needs_human",
+                                        "detail": "head_sha changed old-sha -> new-sha"}]
+
+
 def test_prs_loop_page_id_mode_skips_with_an_explicit_reason_and_never_calls_the_scanner():
     scanner = make_scanner({"candidates": [], "work_orders": [], "tagged": []})
     result = _run(_ctx(FakeBoard(), scanner=scanner, page_id="p1"), ["prs"])

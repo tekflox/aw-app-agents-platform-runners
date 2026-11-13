@@ -71,7 +71,17 @@ GH_MAX_CONCURRENCY = 4
 DEFAULT_STALL_HOURS = 6
 
 SEARCH_FIELDS = "number,repository,title,url,updatedAt,isDraft,createdAt,author"
-VIEW_FIELDS = "headRefOid,updatedAt,isDraft,statusCheckRollup"
+VIEW_FIELDS = "headRefOid,updatedAt,isDraft,statusCheckRollup,labels"
+
+# `fredericowu/aw-shared-workflows`'s code-review round state machine only
+# auto-re-reviews a `synchronize` push when the PR is in round 2
+# (`devteam:awaiting-fixes`) — a PR already escalated to this label does
+# NOT get a fresh review just because someone pushed a fix (see
+# skills/aw-agent-coder/SKILL.md, "A push to a devteam:needs-human PR does
+# not auto-retrigger review"). Card 4175bf3b: rather than touching that
+# 45-repo-wide shared workflow, force the review mechanically from here,
+# something this module already fully controls.
+NEEDS_HUMAN_LABEL = "devteam:needs-human"
 
 # Code-review finding (PR #41): `gh search prs` defaults to 30 results
 # sorted by best-match relevance, not `updatedAt` — for an owner with more
@@ -224,6 +234,16 @@ async def view_pr(url: str, gh_runner: GhRunner) -> "tuple[dict | None, str | No
     except ValueError as exc:
         return None, f"malformed gh pr view output: {exc}"
     return (row if isinstance(row, dict) else {}), None
+
+
+async def post_review_comment(url: str, gh_runner: GhRunner) -> "str | None":
+    """Posts ``/aw-review`` as a PR comment to force a review run. Returns
+    ``None`` on success, or an error string on failure — same shape as
+    ``view_pr``/``search_open_prs_for_owner``."""
+    code, out, err = await gh_runner(["pr", "comment", url, "--body", "/aw-review"])
+    if code != 0:
+        return (err or out or f"gh pr comment {url} exited {code}").strip()
+    return None
 
 
 async def _bounded_gather(items: list, worker, *, concurrency: int) -> list:
@@ -477,6 +497,7 @@ async def scan_prs(*, now: float, dry_run: bool = False, limit: int = 10,
 
     work_orders: list = []
     tagged: list = []
+    forced_reviews: list = []
 
     async def _probe(item) -> None:
         candidate, full_name, path = item
@@ -485,6 +506,26 @@ async def scan_prs(*, now: float, dry_run: bool = False, limit: int = 10,
             candidate["reason"] = f"gh pr view failed: {error}"
             return
         candidate["head_sha"] = view.get("headRefOid")
+
+        # Mechanical force-review check (card 4175bf3b) — independent of the
+        # draft/CI gates below, gated ONLY on the devteam:needs-human label
+        # and on head_sha having moved since the last stamp this module has
+        # for the PR. No prior stamp -> first time seeing it, let the normal
+        # round-1 review handle it rather than forcing on day one.
+        stamp = store.get(candidate["pr"])
+        labels = {(lbl.get("name") or "") for lbl in (view.get("labels") or [])}
+        stamped_head_sha = stamp.get("head_sha") if stamp else None
+        if (NEEDS_HUMAN_LABEL in labels and stamped_head_sha
+                and stamped_head_sha != candidate["head_sha"] and not dry_run):
+            comment_error = await post_review_comment(candidate["url"], gh_runner)
+            if comment_error is not None:
+                errors.append({"owner": None, "error":
+                              f"gh pr comment {candidate['url']} failed: {comment_error}"})
+            else:
+                forced_reviews.append({"pr": candidate["pr"],
+                                       "detail": f"head_sha changed {stamped_head_sha} -> "
+                                                f"{candidate['head_sha']}"})
+
         if view.get("isDraft"):
             candidate["is_draft"] = True
             candidate["reason"] = "draft — parked by the author (confirmed at probe time)"
@@ -518,11 +559,13 @@ async def scan_prs(*, now: float, dry_run: bool = False, limit: int = 10,
         "errors": errors,
         "work_orders": work_orders,
         "tagged": tagged,
+        "forced_reviews": forced_reviews,
     }
 
 
 __all__ = ["GhRunner", "default_gh_runner", "parse_github_remote", "map_cloned_repos",
-           "scan_cloned_repos", "search_open_prs_for_owner", "view_pr",
+           "scan_cloned_repos", "search_open_prs_for_owner", "view_pr", "post_review_comment",
            "filter_prs_to_cloned_repos", "no_live_or_recent_ci", "backoff_state",
            "is_stale_enough", "load_viewed_store", "save_viewed_store", "prune_viewed_store",
-           "default_store_path", "scan_prs", "DEFAULT_STALL_HOURS", "REPOS_DIR", "SEARCH_LIMIT"]
+           "default_store_path", "scan_prs", "DEFAULT_STALL_HOURS", "REPOS_DIR", "SEARCH_LIMIT",
+           "NEEDS_HUMAN_LABEL"]
