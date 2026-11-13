@@ -211,6 +211,36 @@ verb/command should degrade with a clear "unsupported — update to vX.Y.Z"
 rather than an opaque error; if it doesn't, fix that alongside the new verb
 rather than filing it separately.
 
+## Tag the PR with its dispatching run's parent
+
+If this run's own dispatch carried a parent (another agent dispatched you —
+a conductor, a workflow, a Telegram-sourced flow hop), tag the PR you open
+with that lineage. Read the value from whichever channel is live for your
+CLI/container:
+
+- **codex, or a cold/ephemeral claude container:** the `$AW_PARENT_RUN_ID`
+  env var.
+- **a warm claude container:** the `[SYSTEM] Execution context for this
+  turn:` prompt header, not the env var — claude's OS env is frozen at
+  container creation, so a warm container's env can be stale by the time a
+  later turn runs; the per-turn header is authoritative, the same rule that
+  already applies to `$AW_RUN_ID`/`$NOTION_TASK_ID` there.
+
+When present, add a trailer-style line in the **PR body footer**, next to
+the existing "🤖 Generated with Claude Code" footer:
+
+```
+AW-Parent-Run-Id: <value of AW_PARENT_RUN_ID>
+```
+
+Omit the line entirely when the breadcrumb is absent — root runs, a human
+opening the PR, or a run dispatched before both sides of this feature have
+deployed. This is a **documentation convention, not a CI gate** — PR
+authors here are heterogeneous (claude CLI, codex CLI, humans) and root
+runs legitimately have no parent, so nothing enforces the line's presence.
+It exists so a PR can be traced back to the run chain that produced it via
+`gh api`/`gh pr view`, grep-able on demand.
+
 ## Handing off to QA
 
 **QA reviews MERGED work only.** A review of an open PR verifies claims about

@@ -751,7 +751,7 @@ def _sh(s: str | None) -> str:
 
 
 def _with_claude_turn_context(prompt: str, run_id: str, notion_task_id: str | None,
-                              source_device: str | None) -> str:
+                              source_device: str | None, parent_run_id: str | None = None) -> str:
     """Prepend the CURRENT turn's identity to the prompt text itself, for claude only.
 
     Codex's per-turn staleness (card 3d25bf3b-9510-814a-acd9-d06f9c28d10b) was fixed
@@ -789,6 +789,8 @@ def _with_claude_turn_context(prompt: str, run_id: str, notion_task_id: str | No
         parts.append(f"AW_SOURCE_DEVICE={source_device}")
     if run_id:
         parts.append(f"AW_RUN_ID={run_id}")
+    if parent_run_id:
+        parts.append(f"AW_PARENT_RUN_ID={parent_run_id}")
     if not parts:
         return prompt
     return (
@@ -802,6 +804,7 @@ def _with_claude_turn_context(prompt: str, run_id: str, notion_task_id: str | No
 def dispatch_turn(*, client, name: str, run_id: str, prompt: str, cli: str = "claude",
                   notion_task_id: str | None = None,
                   source_device: str | None = None,
+                  parent_run_id: str | None = None,
                   raw_prompt: bool = False,
                   gateway_bearer_token: str | None = None) -> None:
     """Feed one turn's prompt into the warm container's FIFO.
@@ -846,7 +849,10 @@ def dispatch_turn(*, client, name: str, run_id: str, prompt: str, cli: str = "cl
     """
     c = client.containers.get(name)
 
-    turn_env = f"export AW_RUN_ID={_sh(run_id)}\nexport NOTION_TASK_ID={_sh(notion_task_id)}\nexport AW_SOURCE_DEVICE={_sh(source_device)}\n"
+    turn_env = (
+        f"export AW_RUN_ID={_sh(run_id)}\nexport NOTION_TASK_ID={_sh(notion_task_id)}\n"
+        f"export AW_SOURCE_DEVICE={_sh(source_device)}\nexport AW_PARENT_RUN_ID={_sh(parent_run_id)}\n"
+    )
     if gateway_bearer_token:
         # Must match execute.py's CODEX_GATEWAY_TOKEN_ENV_VAR — see this
         # function's own docstring on why it rides in here, per turn.
@@ -870,7 +876,7 @@ def dispatch_turn(*, client, name: str, run_id: str, prompt: str, cli: str = "cl
         payload = (json.dumps({"prompt": prompt}) + "\n").encode("utf-8")
     else:
         content = prompt if raw_prompt else _with_claude_turn_context(
-            prompt, run_id, notion_task_id, source_device)
+            prompt, run_id, notion_task_id, source_device, parent_run_id)
         payload = (json.dumps({"type": "user", "message": {"role": "user", "content": content}}) + "\n").encode("utf-8")
     exec_id = client.api.exec_create(
         c.id, ["sh", "-c", "cat > /home/ubuntu/.aw-warm/fifo_in"], stdin=True,
