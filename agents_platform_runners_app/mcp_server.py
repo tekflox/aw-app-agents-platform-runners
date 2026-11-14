@@ -2143,7 +2143,8 @@ async def _list_tools() -> list[Tool]:
              description=("List all lessons for one Target (scoped). Use this when running "
                           "a retro on a Target — see what's already been recorded."),
              inputSchema={"type": "object",
-                          "properties": {"slug": {"type": "string"},
+                          "properties": {"slug": {"type": "string",
+                                                   "description": "Slug of the EXISTING Target this lesson belongs to (see list_targets, or your run's target_slug) — NOT a slug for the lesson; lessons are keyed by UUID."},
                                          "include_superseded": {"type": "boolean"}},
                           "required": ["slug"]}),
         Tool(name="create_target_lesson",
@@ -2155,7 +2156,8 @@ async def _list_tools() -> list[Tool]:
                           "`applicable_tags`: tags future searches will match on (e.g. "
                           "`['cat-2','acsb','cookiecutter']`)."),
              inputSchema={"type": "object",
-                          "properties": {"slug": {"type": "string"},
+                          "properties": {"slug": {"type": "string",
+                                                   "description": "Slug of the EXISTING Target this lesson belongs to (see list_targets, or your run's target_slug) — NOT a slug for the lesson; lessons are keyed by UUID."},
                                          "category": {"type": "string"},
                                          "title": {"type": "string"},
                                          "content": {"type": "string"},
@@ -2172,7 +2174,8 @@ async def _list_tools() -> list[Tool]:
                           "the body, or raise `confidence` as more deliveries confirm the pattern. "
                           "Pass `superseded_by` to mark a lesson replaced by a newer one."),
              inputSchema={"type": "object",
-                          "properties": {"slug": {"type": "string"},
+                          "properties": {"slug": {"type": "string",
+                                                   "description": "Slug of the EXISTING Target this lesson belongs to (see list_targets, or your run's target_slug) — NOT a slug for the lesson; lessons are keyed by UUID."},
                                          "lesson_id": {"type": "string"},
                                          "category": {"type": "string"},
                                          "title": {"type": "string"},
@@ -2187,7 +2190,8 @@ async def _list_tools() -> list[Tool]:
         Tool(name="delete_target_lesson",
              description="Soft-delete a lesson (or `hard:true` for irreversible).",
              inputSchema={"type": "object",
-                          "properties": {"slug": {"type": "string"},
+                          "properties": {"slug": {"type": "string",
+                                                   "description": "Slug of the EXISTING Target this lesson belongs to (see list_targets, or your run's target_slug) — NOT a slug for the lesson; lessons are keyed by UUID."},
                                          "lesson_id": {"type": "string"},
                                          "hard": {"type": "boolean"}},
                           "required": ["slug", "lesson_id"]}),
@@ -3089,6 +3093,29 @@ async def _poll_run(c: httpx.AsyncClient, run_id: str, *, timeout_s: int = 900) 
         if run["status"] in ("success", "error", "cancelled"):
             return run
     return {"status": "timeout", "run_id": run_id}
+
+
+async def _lesson_404_hint(c: httpx.AsyncClient, created_in_run_id: str | None) -> str:
+    """On a lessons-endpoint 404 (card 4115bf3b — ``slug`` is the TARGET's
+    slug, not the lesson's, and callers keep confusing the two), resolve
+    ``created_in_run_id`` to the target it actually belongs to and offer it
+    as a one-step retry. Deterministic, not auto-applied — see the card's
+    REJECTED alternatives for why this must not silently resolve the target
+    itself. Any failure resolving the run (network error, run not found)
+    must fall back to no hint rather than mask the original 404."""
+    if not created_in_run_id:
+        return ""
+    try:
+        r = await c.get(f"{BASE}/api/runs/{created_in_run_id}")
+        if r.status_code != 200:
+            return ""
+        target_slug = r.json().get("target_slug")
+    except Exception:
+        return ""
+    if not target_slug:
+        return ""
+    return (f" — that run belongs to target {target_slug!r}; retry with "
+            f"slug={target_slug!r} if that's where this lesson belongs.")
 
 
 @server.call_tool()
@@ -4198,10 +4225,16 @@ async def _dispatch_tool(name: str, arguments: dict[str, Any] | None) -> list[Te
         if name == "create_target_lesson":
             slug = args.pop("slug")
             r = await c.post(f"{BASE}/api/targets/{slug}/lessons", json=args)
+            if r.status_code == 404:
+                hint = await _lesson_404_hint(c, args.get("created_in_run_id"))
+                return _err(r.status_code, r.text + hint)
             return _err(r.status_code, r.text) if r.status_code != 200 else _ok(r.json())
         if name == "update_target_lesson":
             slug = args.pop("slug"); lesson_id = args.pop("lesson_id")
             r = await c.put(f"{BASE}/api/targets/{slug}/lessons/{lesson_id}", json=args)
+            if r.status_code == 404:
+                hint = await _lesson_404_hint(c, args.get("created_in_run_id"))
+                return _err(r.status_code, r.text + hint)
             return _err(r.status_code, r.text) if r.status_code != 200 else _ok(r.json())
         if name == "delete_target_lesson":
             slug = args["slug"]; lesson_id = args["lesson_id"]
