@@ -103,21 +103,31 @@ stop. No `mark_flow_done` / `return_to_caller_agent` / `run_agent_async`
 handoff is expected or possible here — a CI dispatch carries no Kanban card
 and no caller session to hand off to.
 
-**Transitional note:** until the shared-workflow repoint ships (follow-up
-card `4175bf3b-9510-8146-b18d-fd582533ee65`), GitHub CI still dispatches
-`code-reviewer-sonnet` for this path, not `code-reviewer-pipeline` — and
-those runs **do** get the Agents Flow terminal-action contract injected,
-because `_agents_flow_context` (agents-platform-multitenant's
-`executor.py:955`) keys membership purely on the agent's slug, "independent
-of ... anything else about how the run was triggered." The "report and
-stop, no terminal action" behaviour above belongs to
-`code-reviewer-pipeline` only, which is never a flow node — it does
-**not** carry over to a CI run that happens to land on
+**Rollout status:** `fredericowu/aw-shared-workflows`' `code-review-reusable.yml`
+has carried an optional `agent_slug` input since `v1.11.0` (card
+`4175bf3b-9510-8146-b18d-fd582533ee65`), letting a caller's
+`code-review.yml` dispatch `code-reviewer-pipeline` directly instead of
+`code-reviewer-sonnet`. Canary-proven live on `tekflox/aw-app-template`
+(the first caller bumped): that dispatch carries no `flow_run_id`/
+`flow_slug` at all, confirming no Agents Flow context is attached. Bumping
+the rest of the fleet's pins and setting `agent_slug: code-reviewer-pipeline`
+on each is tracked as separate, deliberately deferred follow-on work — most
+callers still default to `code-reviewer-sonnet` for this path until their
+own caller is individually updated.
+
+So until a given caller is bumped, its CI dispatch still lands on
+`code-reviewer-sonnet` — and that run **does** get the Agents Flow
+terminal-action contract injected, because `_agents_flow_context`
+(agents-platform-multitenant's `executor.py:955`) keys membership purely on
+the agent's slug, "independent of ... anything else about how the run was
+triggered." The "report and stop, no terminal action" behaviour above
+belongs to `code-reviewer-pipeline` only, which is never a flow node — it
+does **not** carry over to a CI run that happens to land on
 `code-reviewer-sonnet`.
 
-So on this transitional CI entry path, when you are `code-reviewer-sonnet`:
-post your JSON verdict/comment exactly as this section specifies, same as
-always, then end the turn with a **card-less**
+So on an as-yet-un-bumped caller's CI entry path, when you are
+`code-reviewer-sonnet`: post your JSON verdict/comment exactly as this
+section specifies, same as always, then end the turn with a **card-less**
 `mark_flow_done(outcome="success", qa_not_needed=true, summary="CI PR
 review posted: <one-line verdict>")`. That satisfies the terminal-action
 contract and suppresses the reprompt-then-escalate safety net
