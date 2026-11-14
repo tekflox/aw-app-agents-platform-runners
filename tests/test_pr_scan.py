@@ -493,6 +493,230 @@ def test_per_owner_search_failure_is_isolated_and_other_owners_continue(tmp_path
         "'this owner now has zero open PRs' and wipe that owner's back-off state")
 
 
+def test_post_review_comment_posts_aw_review_and_returns_none_on_success():
+    captured = {}
+
+    async def runner(args):
+        captured["args"] = args
+        return 0, "", ""
+
+    error = asyncio.run(ps.post_review_comment("https://github.com/tekflox/aw-app-kb/pull/7", runner))
+    assert error is None
+    assert captured["args"] == ["pr", "comment", "https://github.com/tekflox/aw-app-kb/pull/7",
+                                "--body", "/aw-review"]
+
+
+def test_post_review_comment_returns_the_error_on_failure():
+    async def runner(args):
+        return 1, "", "gh: not authenticated"
+
+    error = asyncio.run(ps.post_review_comment("https://github.com/tekflox/aw-app-kb/pull/7", runner))
+    assert error == "gh: not authenticated"
+
+
+# ── force-review on a needs-human PR with a new head_sha (card 4175bf3b) ──
+
+def _fake_runner_with_comments(search_responses=None, view_responses=None, comment_urls=None):
+    """Same as ``_fake_runner`` but also handles ``gh pr comment`` calls,
+    recording each commented URL into ``comment_urls`` (a list the caller
+    passes in so it can inspect it after the run)."""
+    search_responses = search_responses or {}
+    view_responses = view_responses or {}
+    comment_urls = comment_urls if comment_urls is not None else []
+
+    async def runner(args):
+        if args[:2] == ["search", "prs"]:
+            owner = args[args.index("--owner") + 1]
+            return 0, json.dumps(search_responses.get(owner, [])), ""
+        if args[:2] == ["pr", "view"]:
+            url = args[2]
+            return 0, json.dumps(view_responses.get(url, {})), ""
+        if args[:2] == ["pr", "comment"]:
+            comment_urls.append(args[2])
+            return 0, "", ""
+        raise AssertionError(f"unexpected gh invocation: {args}")
+
+    return runner
+
+
+def test_needs_human_pr_with_a_new_head_sha_gets_a_forced_review(tmp_path):
+    pr = _search_pr(20, updated_hours_ago=72)
+    view = {"headRefOid": "new-sha", "isDraft": False,
+           "labels": [{"name": "devteam:needs-human"}],
+           "statusCheckRollup": [{"status": "COMPLETED", "conclusion": "SUCCESS",
+                                  "completedAt": _iso(50)}]}
+    # Stamped BEFORE the PR's current updatedAt (the push that moved
+    # head_sha also bumps updatedAt) -> backoff re-arms to "eligible",
+    # same construction as test_new_activity_since_the_stamp_re_arms_eligibility.
+    stamp = {"tekflox/aw-app-kb#20": {"viewed_at": NOW - 7200, "updated_at": _iso(100),
+                                      "head_sha": "old-sha"}}
+
+    repos_dir = tmp_path / "repos"
+    (repos_dir / "aw-app-kb" / ".git").mkdir(parents=True)
+    store_path = str(tmp_path / "viewed.json")
+    ps.save_viewed_store(store_path, stamp)
+    comment_urls = []
+    runner = _fake_runner_with_comments(search_responses={"tekflox": [pr]},
+                                        view_responses={pr["url"]: view}, comment_urls=comment_urls)
+
+    result = asyncio.run(ps.scan_prs(
+        now=NOW, dry_run=False, limit=10, repos_dir=str(repos_dir), gh_runner=runner,
+        store_path=store_path, git_remote_url=lambda p: "git@github.com:tekflox/aw-app-kb.git",
+        stall_hours=6))
+
+    assert comment_urls == [pr["url"]]
+    assert result["forced_reviews"] == [
+        {"pr": "tekflox/aw-app-kb#20", "detail": "head_sha changed old-sha -> new-sha"}]
+
+
+def test_needs_human_pr_with_the_same_head_sha_is_not_re_reviewed(tmp_path):
+    """Dedup: the same head_sha the store already has for this PR must
+    never be force-reviewed twice."""
+    pr = _search_pr(21, updated_hours_ago=72)
+    view = {"headRefOid": "same-sha", "isDraft": False,
+           "labels": [{"name": "devteam:needs-human"}],
+           "statusCheckRollup": [{"status": "COMPLETED", "conclusion": "SUCCESS",
+                                  "completedAt": _iso(50)}]}
+    stamp = {"tekflox/aw-app-kb#21": {"viewed_at": NOW - 7200, "updated_at": _iso(100),
+                                      "head_sha": "same-sha"}}
+
+    repos_dir = tmp_path / "repos"
+    (repos_dir / "aw-app-kb" / ".git").mkdir(parents=True)
+    store_path = str(tmp_path / "viewed.json")
+    ps.save_viewed_store(store_path, stamp)
+    comment_urls = []
+    runner = _fake_runner_with_comments(search_responses={"tekflox": [pr]},
+                                        view_responses={pr["url"]: view}, comment_urls=comment_urls)
+
+    result = asyncio.run(ps.scan_prs(
+        now=NOW, dry_run=False, limit=10, repos_dir=str(repos_dir), gh_runner=runner,
+        store_path=store_path, git_remote_url=lambda p: "git@github.com:tekflox/aw-app-kb.git",
+        stall_hours=6))
+
+    assert comment_urls == []
+    assert result["forced_reviews"] == []
+
+
+def test_needs_human_pr_on_the_ci_live_recent_path_is_still_stamped_and_not_re_reviewed(tmp_path):
+    """Regression (code-review round 2, PR #49): the forced-review branch
+    must stamp the store even when CI on HEAD is still live/recent (the
+    ``no_ci is False`` path, which returns before the work-order stamp
+    write further down). Without the stamp, the SAME head_sha gets
+    /aw-review reposted on every scan cycle for as long as CI keeps
+    completing inside the stall window."""
+    pr = _search_pr(25, updated_hours_ago=72)
+    view = {"headRefOid": "new-sha", "isDraft": False,
+           "labels": [{"name": "devteam:needs-human"}],
+           "statusCheckRollup": [{"status": "IN_PROGRESS", "conclusion": None, "completedAt": None}]}
+    stamp = {"tekflox/aw-app-kb#25": {"viewed_at": NOW - 7200, "updated_at": _iso(100),
+                                      "head_sha": "old-sha"}}
+
+    repos_dir = tmp_path / "repos"
+    (repos_dir / "aw-app-kb" / ".git").mkdir(parents=True)
+    store_path = str(tmp_path / "viewed.json")
+    ps.save_viewed_store(store_path, stamp)
+    comment_urls = []
+    runner = _fake_runner_with_comments(search_responses={"tekflox": [pr]},
+                                        view_responses={pr["url"]: view}, comment_urls=comment_urls)
+
+    result_1 = asyncio.run(ps.scan_prs(
+        now=NOW, dry_run=False, limit=10, repos_dir=str(repos_dir), gh_runner=runner,
+        store_path=store_path, git_remote_url=lambda p: "git@github.com:tekflox/aw-app-kb.git",
+        stall_hours=6))
+
+    assert comment_urls == [pr["url"]]
+    assert result_1["forced_reviews"] == [
+        {"pr": "tekflox/aw-app-kb#25", "detail": "head_sha changed old-sha -> new-sha"}]
+
+    stored = ps.load_viewed_store(store_path)
+    assert stored["tekflox/aw-app-kb#25"]["head_sha"] == "new-sha"
+
+    # Next scan cycle, same unchanged head_sha, CI still live/recent on HEAD.
+    result_2 = asyncio.run(ps.scan_prs(
+        now=NOW, dry_run=False, limit=10, repos_dir=str(repos_dir), gh_runner=runner,
+        store_path=store_path, git_remote_url=lambda p: "git@github.com:tekflox/aw-app-kb.git",
+        stall_hours=6))
+
+    assert comment_urls == [pr["url"]]  # still just the one post — no repeat
+    assert result_2["forced_reviews"] == []
+
+
+def test_pr_without_the_needs_human_label_is_never_force_reviewed(tmp_path):
+    pr = _search_pr(22, updated_hours_ago=72)
+    view = {"headRefOid": "new-sha", "isDraft": False, "labels": [],
+           "statusCheckRollup": [{"status": "COMPLETED", "conclusion": "SUCCESS",
+                                  "completedAt": _iso(50)}]}
+    stamp = {"tekflox/aw-app-kb#22": {"viewed_at": NOW - 7200, "updated_at": _iso(100),
+                                      "head_sha": "old-sha"}}
+
+    repos_dir = tmp_path / "repos"
+    (repos_dir / "aw-app-kb" / ".git").mkdir(parents=True)
+    store_path = str(tmp_path / "viewed.json")
+    ps.save_viewed_store(store_path, stamp)
+    comment_urls = []
+    runner = _fake_runner_with_comments(search_responses={"tekflox": [pr]},
+                                        view_responses={pr["url"]: view}, comment_urls=comment_urls)
+
+    result = asyncio.run(ps.scan_prs(
+        now=NOW, dry_run=False, limit=10, repos_dir=str(repos_dir), gh_runner=runner,
+        store_path=store_path, git_remote_url=lambda p: "git@github.com:tekflox/aw-app-kb.git",
+        stall_hours=6))
+
+    assert comment_urls == []
+    assert result["forced_reviews"] == []
+
+
+def test_needs_human_pr_with_no_prior_stamp_is_not_force_reviewed_on_day_one(tmp_path):
+    """First time scan_prs ever sees this PR -> no stamp yet -> let the
+    normal round-1 review handle it, don't force on day one."""
+    pr = _search_pr(23, updated_hours_ago=72)
+    view = {"headRefOid": "first-sha", "isDraft": False,
+           "labels": [{"name": "devteam:needs-human"}],
+           "statusCheckRollup": [{"status": "COMPLETED", "conclusion": "SUCCESS",
+                                  "completedAt": _iso(50)}]}
+
+    repos_dir = tmp_path / "repos"
+    (repos_dir / "aw-app-kb" / ".git").mkdir(parents=True)
+    store_path = str(tmp_path / "viewed.json")
+    comment_urls = []
+    runner = _fake_runner_with_comments(search_responses={"tekflox": [pr]},
+                                        view_responses={pr["url"]: view}, comment_urls=comment_urls)
+
+    result = asyncio.run(ps.scan_prs(
+        now=NOW, dry_run=False, limit=10, repos_dir=str(repos_dir), gh_runner=runner,
+        store_path=store_path, git_remote_url=lambda p: "git@github.com:tekflox/aw-app-kb.git",
+        stall_hours=6))
+
+    assert comment_urls == []
+    assert result["forced_reviews"] == []
+
+
+def test_dry_run_never_posts_a_forced_review_comment(tmp_path):
+    pr = _search_pr(24, updated_hours_ago=72)
+    view = {"headRefOid": "new-sha", "isDraft": False,
+           "labels": [{"name": "devteam:needs-human"}],
+           "statusCheckRollup": [{"status": "COMPLETED", "conclusion": "SUCCESS",
+                                  "completedAt": _iso(50)}]}
+    stamp = {"tekflox/aw-app-kb#24": {"viewed_at": NOW - 7200, "updated_at": _iso(100),
+                                      "head_sha": "old-sha"}}
+
+    repos_dir = tmp_path / "repos"
+    (repos_dir / "aw-app-kb" / ".git").mkdir(parents=True)
+    store_path = str(tmp_path / "viewed.json")
+    ps.save_viewed_store(store_path, stamp)
+    comment_urls = []
+    runner = _fake_runner_with_comments(search_responses={"tekflox": [pr]},
+                                        view_responses={pr["url"]: view}, comment_urls=comment_urls)
+
+    result = asyncio.run(ps.scan_prs(
+        now=NOW, dry_run=True, limit=10, repos_dir=str(repos_dir), gh_runner=runner,
+        store_path=store_path, git_remote_url=lambda p: "git@github.com:tekflox/aw-app-kb.git",
+        stall_hours=6))
+
+    assert comment_urls == []
+    assert result["forced_reviews"] == []
+
+
 def test_prune_viewed_store_only_drops_keys_whose_owner_was_actually_searched():
     store = {"a/x#1": {"updated_at": "t"}, "b/y#2": {"updated_at": "t"}}
     pruned = ps.prune_viewed_store(store, set(), searched_owners={"a"})
