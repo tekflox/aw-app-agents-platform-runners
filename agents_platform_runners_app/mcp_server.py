@@ -928,15 +928,20 @@ async def _list_tools() -> list[Tool]:
                           },
                           "required": []}),
         Tool(name="work_loop",
-             description=("Deterministic orchestrator that keeps Kanban cards and open PRs "
-                          "moving (and, once phase 3 lands, Plans too) — architect design, "
-                          "Kanban 4165bf3b-9510-810d, `prs` loop added per "
-                          "4175bf3b-9510-8163. Runs every mechanical check itself and "
+             description=("Deterministic orchestrator that keeps Kanban cards moving (and, "
+                          "once phase 3 lands, Plans too) — architect design, Kanban "
+                          "4165bf3b-9510-810d. Runs every mechanical check itself and "
                           "hands anything needing real judgment to the aw-manager agent as a "
                           "Mode B work-order list (`{page_id, reason, evidence, "
-                          "suggested_action}` for a card, `{pr, url, reason, evidence, "
-                          "suggested_action}` for a PR — the card shape already documented in "
+                          "suggested_action}` — the card shape already documented in "
                           "aw-manager's own SKILL.md); contains NO LLM call of its own.\n\n"
+                          "Open-PR maintenance moved out of this tool: the former `prs` loop "
+                          "(two-phase `gh` sweep + viewed-stamp back-off, card "
+                          "4175bf3b-9510-8163) was superseded and retired (card "
+                          "4185bf3b-9510-81a7) by aw-app-git's `GET /api/apps/git/github/"
+                          "maintenance` gate + the AP-MT `github-maintenance` Plan, which fixed "
+                          "this loop's own blind spot for PRs on the root `aw-workspace` "
+                          "checkout (design: card 4185bf3b-9510-81fc, section 3).\n\n"
                           "`loops` (default `[\"deploy\",\"attention\"]`) selects which "
                           "sections run, independently error-isolated — a dead loop reports "
                           "in `errors` and every other requested loop still runs:\n"
@@ -960,20 +965,6 @@ async def _list_tools() -> list[Tool]:
                           "(default true here — this IS the keep-things-in-motion entry "
                           "point) passes through to the Need-Human re-ping branch.\n"
                           "- `ready`: thinly wraps the existing `run_ready_cards` sweep.\n"
-                          "- `prs`: enumerates this workspace's cloned repos (repos/* with a "
-                          "`.git`, mapped to GitHub owner/repo via `git remote get-url "
-                          "origin`), finds open PRs on those repos via `gh search prs` (one "
-                          "call per distinct owner, not per repo), and flags ones stalled "
-                          "(`updatedAt` older than `PR_STALL_HOURS=6`, no live or recently-"
-                          "completed CI on HEAD, not a draft) as one `work_orders` entry each "
-                          "(`pr` identifier in place of `page_id`). Each surfaced PR is "
-                          "stamped \"viewed\" in its own back-off store (same semantics as the "
-                          "attention loop's LastSweptAt, a different store since there's no "
-                          "Notion property to stamp) so it doesn't re-surface every pass — "
-                          "re-arms once the PR's own `updatedAt` moves past the stamp. "
-                          "`page_id` names a Kanban card, not a PR, so single-card mode skips "
-                          "this loop with an explicit reason instead of running the full "
-                          "sweep anyway.\n"
                           "- `plans`: a reserved enum value, not implemented yet — requesting "
                           "it comes back in `loops_skipped` as `\"plans: not implemented\"`, "
                           "never an error, so a caller can opt in early.\n\n"
@@ -986,15 +977,15 @@ async def _list_tools() -> list[Tool]:
                           "already in-flight manager run — so a cron/Plan can call this with "
                           "no workflow glue; leave it false to consume `work_orders` yourself "
                           "(e.g. from a workflow node) instead.\n\n"
-                          "Response: `{ok, dry_run, boards, deploy?, attention?, ready?, prs?, "
+                          "Response: `{ok, dry_run, boards, deploy?, attention?, ready?, "
                           "work_orders, actions_taken, loops_skipped, manager_dispatch, "
                           "errors}` — `actions_taken` is everything this call already DID "
-                          "(moves, re-pings, QA dispatches, PR viewed-tags), `work_orders` is "
+                          "(moves, re-pings, QA dispatches), `work_orders` is "
                           "everything it found but did NOT decide on its own."),
              inputSchema={"type": "object",
                           "properties": {
                               "loops": {"type": "array", "items": {"type": "string"},
-                                       "description": "Which sections to run: deploy, attention, ready, prs, plans. Default [\"deploy\",\"attention\"]. plans is reserved — not yet implemented."},
+                                       "description": "Which sections to run: deploy, attention, ready, plans. Default [\"deploy\",\"attention\"]. plans is reserved — not yet implemented."},
                               "page_id": {"type": "string",
                                          "description": "Restrict every requested loop to this one card instead of scanning."},
                               "limit": {"type": "integer", "default": 10,
@@ -2980,48 +2971,6 @@ async def _work_loop_list_runs(c: httpx.AsyncClient, *, notion_task_id: str | No
         return None, f"malformed /api/runs response: {exc}"
 
 
-async def _prs_scan_via_route(c: httpx.AsyncClient, *, now: float, dry_run: bool = False,
-                              limit: int = 10, stall_hours: float = 6.0) -> dict:
-    """The ``prs`` loop's real ``WorkLoopContext.scanner`` — a two-hop route
-    call, same reason and same discipline as ``list_warm_containers``/
-    ``search_execution_history`` below: this process is a stdio child of the
-    mcp-gateway's OWN container, which mounts neither
-    ``/opt/aw-workspace/repos`` nor ``AW_WORKSPACE_HOME`` (where the viewed-
-    stamp store lives) nor any ``gh``/``git`` credential — confirmed live in
-    production (card 4175bf3b: the scan silently returned ``owners: []``
-    every time). The actual scan has to happen core-side, reached over the
-    published workspace API exactly like the board and the exec-index
-    service already are, via this app's own ``POST /pr-scan`` route.
-
-    Unlike ``_work_loop_list_runs`` above, this RAISES on a transport error
-    or non-200 rather than failing closed to an empty/error dict — a dict
-    return here would come back out of ``ctx.scanner`` indistinguishable
-    from a real empty scan, and ``run_work_loop``'s per-loop guard already
-    exists to turn an exception into a proper `errors` entry without
-    flipping `ok` for the other loops. An unreachable core must surface as
-    an error, never as a silent empty success — that silence is exactly
-    what made the gateway-boundary gap invisible in production."""
-    own_base = kanban_dispatch.board_base_url()
-    key = (os.environ.get(kanban_dispatch.API_KEY_VAR)
-           or kanban_dispatch._from_env_file(kanban_dispatch.API_KEY_VAR))
-    if not key:
-        raise RuntimeError(
-            f"{kanban_dispatch.API_KEY_VAR} is not set for this MCP upstream. It is "
-            "baked into the stdio env by the app's plugin.build_mcp_servers() — an "
-            "upstream missing it was registered by an older version of this app, so "
-            "restart the workspace (which rewrites mcp.json) and then the mcp-gateway.")
-    try:
-        r = await c.post(f"{own_base}/api/apps/agents-platform-runners/pr-scan",
-                         json={"now": now, "dry_run": dry_run, "limit": limit,
-                               "stall_hours": stall_hours},
-                         headers={"X-Api-Key": key}, timeout=120.0)
-    except httpx.HTTPError as exc:
-        raise RuntimeError(f"could not reach this workspace's own API at {own_base}: {exc}") from exc
-    if r.status_code != 200:
-        raise RuntimeError(f"{r.status_code} {r.text[:200]}")
-    return r.json()
-
-
 def _work_order_line(o: dict) -> str:
     """One Mode-B prompt line for a single work order — either a Kanban
     card (``page_id``) or an open PR (``pr``/``url``, the ``prs`` loop's
@@ -3424,14 +3373,10 @@ async def _dispatch_tool(name: str, arguments: dict[str, Any] | None) -> list[Te
             async def _list_runs(**kw):
                 return await _work_loop_list_runs(c, **kw)
 
-            async def _scanner(**kw):
-                return await _prs_scan_via_route(c, **kw)
-
             ctx = work_loop_mod.WorkLoopContext(
                 board=_board_client(), list_runs=_list_runs, now=time.time(),
                 dry_run=dry_run, page_id=page_id, limit=limit, max_cards=max_cards,
-                reping=reping, platform=kanban_dispatch.PlatformClient(c, BASE),
-                scanner=_scanner)
+                reping=reping, platform=kanban_dispatch.PlatformClient(c, BASE))
             # run_work_loop never raises BoardUnavailable itself — every loop
             # catches it internally and reports it in `errors` (code-review
             # finding, PR #36: a try/except here around this call was dead

@@ -146,6 +146,18 @@ def test_unknown_loop_name_is_skipped_with_its_own_reason():
     assert "deploy" in result  # the other requested loop still ran
 
 
+def test_retired_prs_loop_name_is_skipped_as_unknown_not_an_error():
+    """The ``prs`` loop (card 4175bf3b-9510-8163) was retired in card
+    4185bf3b-9510-81a7, superseded by aw-app-git's github-maintenance gate +
+    Plan. A caller still requesting it by name must degrade gracefully, the
+    same as any other unrecognized loop name — never a crash or a KeyError."""
+    result = _run(_ctx(FakeBoard()), ["deploy", "prs"])
+    assert "prs: unknown loop" in result["loops_skipped"]
+    assert "prs" not in result
+    assert "deploy" in result
+    assert result["errors"] == []
+
+
 def test_a_dead_loop_does_not_take_down_the_others():
     class ExplodingBoard(FakeBoard):
         def ready_cards(self, status="ready", limit=50):
@@ -443,73 +455,6 @@ def test_ready_loop_without_a_platform_client_reports_an_error_not_a_crash():
     result = _run(_ctx(FakeBoard()), ["ready"])
     assert "error" in result["ready"]
     assert result["errors"] == []  # an explainable per-loop section, not a crashed loop
-
-
-# ── prs loop ──────────────────────────────────────────────────────────────
-
-def make_scanner(result: dict, *, calls: list | None = None):
-    calls = calls if calls is not None else []
-
-    async def _scanner(**kwargs):
-        calls.append(kwargs)
-        return dict(result)
-
-    _scanner.calls = calls
-    return _scanner
-
-
-def test_prs_loop_is_no_longer_in_not_implemented_loops():
-    assert "prs" not in wl.NOT_IMPLEMENTED_LOOPS
-    assert wl.NOT_IMPLEMENTED_LOOPS == ("plans",)
-
-
-def test_prs_loop_passes_through_work_orders_from_the_scanner():
-    scanner = make_scanner({"candidates": [{"pr": "tekflox/aw-app-kb#7"}],
-                            "work_orders": [{"pr": "tekflox/aw-app-kb#7", "reason": "stalled"}],
-                            "tagged": []})
-    result = _run(_ctx(FakeBoard(), scanner=scanner), ["prs"])
-    assert "prs" in result
-    assert result["prs"]["candidates"] == [{"pr": "tekflox/aw-app-kb#7"}]
-    assert "work_orders" not in result["prs"]  # popped out into the envelope, not duplicated
-    assert result["work_orders"] == [{"pr": "tekflox/aw-app-kb#7", "reason": "stalled"}]
-
-
-def test_prs_loop_calls_the_scanner_with_ctx_values_and_its_own_stall_hours():
-    scanner = make_scanner({"candidates": [], "work_orders": [], "tagged": []})
-    _run(_ctx(FakeBoard(), scanner=scanner, dry_run=True, limit=5), ["prs"])
-    assert scanner.calls == [{"now": NOW, "dry_run": True, "limit": 5, "stall_hours": wl.PR_STALL_HOURS}]
-
-
-def test_prs_loop_turns_tagged_prs_into_actions_taken():
-    scanner = make_scanner({"candidates": [], "work_orders": [],
-                            "tagged": [{"pr": "tekflox/aw-app-kb#7", "detail": "updated_at=x"}]})
-    result = _run(_ctx(FakeBoard(), scanner=scanner), ["prs"])
-    assert result["actions_taken"] == [{"loop": "prs", "pr": "tekflox/aw-app-kb#7",
-                                        "action": "tagged_viewed", "detail": "updated_at=x"}]
-
-
-def test_prs_loop_page_id_mode_skips_with_an_explicit_reason_and_never_calls_the_scanner():
-    scanner = make_scanner({"candidates": [], "work_orders": [], "tagged": []})
-    result = _run(_ctx(FakeBoard(), scanner=scanner, page_id="p1"), ["prs"])
-    assert "skipped_reason" in result["prs"]
-    assert scanner.calls == []
-    assert result["work_orders"] == []
-
-
-def test_prs_loop_without_a_scanner_reports_an_error_not_a_crash():
-    result = _run(_ctx(FakeBoard()), ["prs"])
-    assert "error" in result["prs"]
-    assert result["errors"] == []  # an explainable per-loop section, not a crashed loop
-
-
-def test_a_dead_prs_loop_does_not_take_down_the_others():
-    async def exploding_scanner(**kwargs):
-        raise RuntimeError("gh exploded")
-
-    result = _run(_ctx(FakeBoard(), scanner=exploding_scanner), ["attention", "prs"])
-    assert result["errors"] == [{"loop": "prs", "error": "gh exploded"}]
-    assert "attention" in result
-    assert result["ok"] is True
 
 
 # ── deploy loop / aliasing ────────────────────────────────────────────────
