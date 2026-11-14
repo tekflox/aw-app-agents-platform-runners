@@ -2972,17 +2972,13 @@ async def _work_loop_list_runs(c: httpx.AsyncClient, *, notion_task_id: str | No
 
 
 def _work_order_line(o: dict) -> str:
-    """One Mode-B prompt line for a single work order — either a Kanban
-    card (``page_id``) or an open PR (``pr``/``url``, the ``prs`` loop's
-    shape, card 4175bf3b-9510-8163). Told apart by which identifying key is
-    present, not by assuming every order is card-shaped — that assumption
-    is exactly what crashed this function with ``KeyError: 'page_id'`` the
-    first time the ``prs`` loop handed it a PR-shaped order (card
-    4175bf3b-9510-8132). ``pr:``/``url:`` stay distinct labels from
-    ``page_id:`` so the Manager can tell which kind it's looking at."""
-    ident = (f"page_id: {o['page_id']}" if "page_id" in o
-            else f"pr: {o['pr']}\nurl: {o.get('url', '')}")
-    return (f"{ident}\nreason: {o.get('reason', '')}\n"
+    """One Mode-B prompt line for a single Kanban-card work order. Every
+    surviving loop (``deploy``, ``attention``, ``ready``) only ever emits a
+    ``page_id``-keyed order — the PR-shaped (``pr``/``url``) branch this
+    function used to also support existed solely for the now-retired
+    ``prs`` loop (card 4175bf3b-9510-8163, superseded by card
+    4185bf3b-9510-81a7) and is gone with it."""
+    return (f"page_id: {o['page_id']}\nreason: {o.get('reason', '')}\n"
            f"evidence: {o.get('evidence', '')}\nsuggested_action: {o.get('suggested_action', '')}")
 
 
