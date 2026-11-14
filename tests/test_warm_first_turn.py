@@ -70,7 +70,9 @@ def test_minted_session_keeps_the_rest_of_the_warm_argv(tmp_path, monkeypatch):
                        "_warm_minted_session": True,
                        "append_system_prompt": "extra rules"}, tmp_path, monkeypatch)
     assert "--dangerously-skip-permissions" in argv
-    assert "--append-system-prompt" in argv
+    # By file since card 4185bf3b-9510-812e-831e-f160c2f26a37 — an argv-borne
+    # system prompt E2BIGs the spawn once it crosses 128 KiB.
+    assert "--append-system-prompt-file" in argv
     assert "--input-format" in argv
 
 
