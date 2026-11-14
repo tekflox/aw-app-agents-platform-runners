@@ -102,7 +102,8 @@ def test_every_cli_declares_each_gated_flag_explicitly():
     from agents_platform_runners_app.execute import CLI_SPECS
     for cli, spec in CLI_SPECS.items():
         for key in ("allowed_tools_flag", "disallowed_tools_flag",
-                    "tools_flag_style", "append_system_prompt_flag"):
+                    "tools_flag_style", "append_system_prompt_flag",
+                    "append_system_prompt_file_flag"):
             assert key in spec, f"{cli} does not declare {key}"
 
 

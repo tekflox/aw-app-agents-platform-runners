@@ -596,6 +596,13 @@ CLI_SPECS: dict[str, dict] = {
         "disallowed_tools_flag": "--disallowed-tools",
         "tools_flag_style": "csv",          # --allowed-tools a,b,c
         "append_system_prompt_flag": "--append-system-prompt",
+        # Same value, read from a file instead of an argv string — the form
+        # that keeps a large system prompt + skill set off the kernel's
+        # per-argument execve limit (see MAX_ARG_STRLEN). Not advertised in
+        # `claude --help`'s option list on 2.1.226 (only in --bare's prose),
+        # but accepted: a bad path reports "Error reading append system
+        # prompt file", i.e. the flag parsed and the file was opened.
+        "append_system_prompt_file_flag": "--append-system-prompt-file",
         # Auth reaches the container as CLAUDE_CODE_OAUTH_TOKEN, so the CLI
         # never has to READ the mounted creds — which is the only reason the
         # uid mismatch below doesn't bite claude.
@@ -628,6 +635,7 @@ CLI_SPECS: dict[str, dict] = {
         "disallowed_tools_flag": None,
         "tools_flag_style": None,
         "append_system_prompt_flag": None,
+        "append_system_prompt_file_flag": None,
         # auth_mode "chatgpt" has no API key to inject — codex MUST read
         # auth.json off disk, and write its session state back.
         "env_token_auth": False,
@@ -658,6 +666,7 @@ CLI_SPECS: dict[str, dict] = {
         "tools_flag_style": "repeat",
         # No --append-system-prompt equivalent — prompt-prepended instead.
         "append_system_prompt_flag": None,
+        "append_system_prompt_file_flag": None,
         "creds_dir": ".copilot", "creds_file": None,
     },
     "cursor-agent": {
@@ -676,6 +685,7 @@ CLI_SPECS: dict[str, dict] = {
         "disallowed_tools_flag": None,
         "tools_flag_style": None,
         "append_system_prompt_flag": None,
+        "append_system_prompt_file_flag": None,
         "creds_dir": ".cursor", "creds_file": None,
     },
 }
@@ -1967,6 +1977,105 @@ def _build_raw_kwargs(job: dict) -> tuple[str, list[str], dict]:
     return image, argv, kwargs
 
 
+#: Linux's per-argument cap on ``execve()``: ``MAX_ARG_STRLEN`` is a hardcoded
+#: ``32 * PAGE_SIZE`` = 131,072 bytes, and it applies to EACH argv string on
+#: its own — entirely separate from (and far smaller than) the total ARG_MAX
+#: budget for argv+envp. One string past it and the kernel refuses the exec
+#: with E2BIG before the binary's first instruction runs.
+#:
+#: That is not hypothetical here. Card 4185bf3b-9510-812e-831e-f160c2f26a37:
+#: every `manager` agent dispatch failed 3/3 with zero tokens and
+#: ``exec container process `/opt/agent-npm/bin/claude`: Argument list too
+#: long`` from runc, because the agent's ``--append-system-prompt`` value —
+#: its own system prompt plus the full text of every skill
+#: agents-platform-multitenant's executor.py loads for it — had grown to
+#: ~150 KB (the `aw-manager` SKILL.md alone reached 129,123 bytes). argv was
+#: acting as an implicit payload-size cap on agent instructions, which is the
+#: defect; the skill's size merely decided the day it tripped.
+#:
+#: Nothing reads this to decide a transport (the file flag below is used
+#: whenever the CLI has one, regardless of size — one code path, always
+#: exercised). It exists so the remaining argv-bound payloads can be
+#: WARNED about in advance instead of dying as an opaque zero-token run.
+MAX_ARG_STRLEN = 32 * 4096
+
+#: Written into the run's own isolated scratch dir (already bind-mounted) and
+#: handed to the CLI by path. Read once, at CLI startup — so the per-run dir
+#: being reaped later (``_reap_isolated_dirs``) cannot pull it out from under
+#: a long-lived warm container.
+APPEND_SYSTEM_PROMPT_FILENAME = "append-system-prompt.md"
+
+
+def _direct_home_mount(spec: dict) -> bool:
+    """Whether this CLI's creds reach the container as a live $HOME mount.
+
+    Extracted so ``_append_system_prompt_args`` can resolve the same isolated
+    run dir ``_build_container_kwargs`` mounts, without a second, drifting
+    copy of the rule. See ``_build_container_kwargs``'s own comment for why
+    the live mount is preferred when the host $HOME path is known.
+    """
+    return bool(WORKSPACE_HOME_HOST_DIR) and (Path(REAL_HOME) / spec["creds_dir"]).is_dir()
+
+
+def _isolated_run_paths(spec: dict, run_id: str, direct_home_mount: bool) -> tuple["Path", str, str]:
+    """(host dir, workspace-relative path, container path) of this run's
+    isolated scratch dir — the single definition both the mount in
+    ``_build_container_kwargs`` and ``_append_system_prompt_args`` resolve.
+    """
+    isolated_rel = f"{spec['creds_dir']}/isolated/{run_id}"
+    isolated_base = Path(REAL_HOME) if direct_home_mount else Path(WORKSPACE_CONTAINER_DIR)
+    return isolated_base / isolated_rel, isolated_rel, f"/home/ubuntu/{isolated_rel}"
+
+
+def _append_system_prompt_args(job: dict, spec: dict) -> list[str]:
+    """Render this job's system prompt as CLI args — by FILE where possible.
+
+    The same two args the cold spawn and the warm-container spawn both need,
+    in one place, because both were passing the whole prompt as a single argv
+    string and both therefore hit the ``MAX_ARG_STRLEN`` wall above (the cold
+    path on turn 1, the warm path at container creation for turns 2+).
+
+    claude takes ``--append-system-prompt-file <path>`` (verified against the
+    CLI shipped in this app's own agent image, claude 2.1.226), so the prompt
+    travels as a file in the run's isolated dir — already bind-mounted at
+    ``container_path`` for every branch of the credential resolution, the same
+    way ``mcp.json`` already rides in. Size then stops being a transport
+    concern entirely rather than being pushed to a larger limit.
+
+    Falls back to the inline flag when the CLI has no file form, or when the
+    write fails: the persona arriving over a transport that MIGHT be too big
+    beats a run that is silently a different agent (the reason codex gets the
+    prompt prepended into its prompt text at all). The fallback logs, loudly
+    when the value cannot fit in argv, so the next occurrence is diagnosable
+    from the runner's own log instead of a bare runc E2BIG.
+    """
+    sys_prompt = job.get("append_system_prompt")
+    inline_flag = spec.get("append_system_prompt_flag")
+    if not sys_prompt or not inline_flag:
+        return []
+
+    file_flag = spec.get("append_system_prompt_file_flag")
+    if file_flag:
+        try:
+            host_dir, _rel, container_path = _isolated_run_paths(
+                spec, job["run_id"], _direct_home_mount(spec))
+            host_dir.mkdir(parents=True, exist_ok=True)
+            (host_dir / APPEND_SYSTEM_PROMPT_FILENAME).write_text(sys_prompt, encoding="utf-8")
+            return [file_flag, f"{container_path}/{APPEND_SYSTEM_PROMPT_FILENAME}"]
+        except OSError:
+            log.exception(
+                "execute: could not stage the system prompt for run=%s — falling back "
+                "to the inline %s flag", job.get("run_id"), inline_flag)
+
+    if len(sys_prompt.encode("utf-8")) >= MAX_ARG_STRLEN:
+        log.error(
+            "execute: run=%s system prompt is %d bytes, at or past the kernel's "
+            "%d-byte per-argument execve limit — this container will fail to start "
+            "with 'Argument list too long' and consume no tokens",
+            job.get("run_id"), len(sys_prompt.encode("utf-8")), MAX_ARG_STRLEN)
+    return [inline_flag, sys_prompt]
+
+
 def _build_container_kwargs(job: dict, client=None) -> tuple[str, list[str], dict, str | None]:
     """Return (image, command_argv, docker-SDK run kwargs) for this job.
 
@@ -2025,7 +2134,7 @@ def _build_container_kwargs(job: dict, client=None) -> tuple[str, list[str], dic
     # has no separate host bind-mount. (Root cause fixed:
     # aw-workspace-runner-claude-oauth-token-not-refreshed-relogin-20260807.)
     _real_home = Path(REAL_HOME)
-    direct_home_mount = bool(WORKSPACE_HOME_HOST_DIR) and (_real_home / spec["creds_dir"]).is_dir()
+    direct_home_mount = _direct_home_mount(spec)
 
     # Isolated per-RUN (not per-session) scratch dir — matches legacy exactly
     # (docker_agent.py always keys by agent_id/run_id, never session_id). In
@@ -2042,12 +2151,10 @@ def _build_container_kwargs(job: dict, client=None) -> tuple[str, list[str], dic
     # .codex/ starts fine. Only bites once a CLI has creds on disk (that is
     # what turns direct_home_mount on), so codex "worked" — as a 401 — right
     # up until someone logged it in.
-    isolated_rel = f"{spec['creds_dir']}/isolated/{run_id}"
-    isolated_base = _real_home if direct_home_mount else Path(WORKSPACE_CONTAINER_DIR)
-    isolated_host_dir = isolated_base / isolated_rel
+    isolated_host_dir, isolated_rel, isolated_container_path = _isolated_run_paths(
+        spec, run_id, direct_home_mount)
     _reap_isolated_dirs(isolated_host_dir.parent)
     isolated_host_dir.mkdir(parents=True, exist_ok=True)
-    isolated_container_path = f"/home/ubuntu/{isolated_rel}"
 
     # MCP config: agents-platform-multitenant's executor.py resolves the
     # agent's configured MCP servers (incl. gateway-token injection and the
@@ -2474,8 +2581,7 @@ def _build_container_kwargs(job: dict, client=None) -> tuple[str, list[str], dic
 
     argv += _tool_flags(job.get("allowed_tools") or [], spec.get("allowed_tools_flag"))
     argv += _tool_flags(job.get("disallowed_tools") or [], spec.get("disallowed_tools_flag"))
-    if job.get("append_system_prompt") and spec.get("append_system_prompt_flag"):
-        argv += [spec["append_system_prompt_flag"], job["append_system_prompt"]]
+    argv += _append_system_prompt_args(job, spec)
     if mcp_config_container_path:
         argv += [spec["mcp_config_flag"], mcp_config_container_path]
         if spec.get("strict_mcp_flag"):
@@ -2899,8 +3005,11 @@ def _build_warm_kwargs_claude(job: dict, epoch_hash: str, redis_url: str, client
     disallowed = job.get("disallowed_tools") or []
     if disallowed:
         claude_argv += ["--disallowed-tools", ",".join(disallowed)]
-    if job.get("append_system_prompt"):
-        claude_argv += ["--append-system-prompt", job["append_system_prompt"]]
+    # Same file-vs-inline resolution the cold path uses — shared, because a
+    # warm container's `docker run` argv hits the identical per-argument
+    # execve limit (see MAX_ARG_STRLEN). A warm spawn that E2BIGs takes out
+    # every turn of that session, not just turn 1.
+    claude_argv += _append_system_prompt_args(job, spec)
     # Same default-True + per-job-override contract as the cold path (see
     # _build_container_kwargs's comment on this same check).
     if job.get("dangerous_skip_permissions", True) and spec.get("skip_perms_flag"):

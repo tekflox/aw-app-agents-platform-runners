@@ -64,9 +64,17 @@ def test_allowed_and_disallowed_tools_forwarded_in_warm_mode(tmp_path, monkeypat
 
 
 def test_append_system_prompt_forwarded_in_warm_mode(tmp_path, monkeypatch):
+    """The persona must reach the warm container — by FILE since card
+    4185bf3b-9510-812e-831e-f160c2f26a37, because a large one passed as an
+    argv string E2BIGs the spawn (see MAX_ARG_STRLEN and
+    tests/test_append_system_prompt_file.py). What this test pins is that it
+    is forwarded at all, which is the divergence that caused the original
+    bug; the transport itself is that other suite's subject.
+    """
     argv = _warm_argv({**BASE_JOB, "append_system_prompt": "extra rules"}, tmp_path, monkeypatch)
-    assert "--append-system-prompt" in argv
-    assert argv[argv.index("--append-system-prompt") + 1] == "extra rules"
+    assert "--append-system-prompt-file" in argv
+    assert argv[argv.index("--append-system-prompt-file") + 1].endswith(
+        execute_mod.APPEND_SYSTEM_PROMPT_FILENAME)
 
 
 def test_secure_mode_style_job_gets_no_bypass_flag_and_keeps_bash_disallowed(tmp_path, monkeypatch):
